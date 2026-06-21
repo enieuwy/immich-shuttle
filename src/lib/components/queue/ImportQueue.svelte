@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ListChecks, Inbox, X, AlertTriangle } from "@lucide/svelte";
+  import { ListChecks, Inbox, X, AlertTriangle, RotateCcw, Trash2 } from "@lucide/svelte";
 
   import { queueState } from "$lib/state/queue";
   import { Card, CardHeader, CardTitle, CardContent } from "$lib/components/ui/card";
@@ -43,15 +43,37 @@
       default: return "secondary";
     }
   }
+
+  function isFinished(status: string) {
+    return status === "completed" || status === "failed" || status === "cancelled";
+  }
+
+  function fmtEta(s: number) {
+    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+  }
 </script>
 
 <Card>
   <CardHeader class="flex flex-row items-center gap-2">
     <ListChecks class="h-4 w-4 text-muted-foreground" aria-hidden="true" />
     <CardTitle class="text-sm font-semibold">Import queue</CardTitle>
-    {#if $queueState.jobs.length > 0}
-      <Badge variant="secondary" class="ml-auto tabular-nums">{$queueState.jobs.length}</Badge>
-    {/if}
+    <div class="ml-auto flex items-center gap-2">
+      {#if $queueState.jobs.some((job) => isFinished(job.status))}
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-label="Clear finished imports"
+          onclick={() => {
+            void queueState.clearFinished();
+          }}
+        >
+          <Trash2 class="h-4 w-4" /> Clear finished
+        </Button>
+      {/if}
+      {#if $queueState.jobs.length > 0}
+        <Badge variant="secondary" class="tabular-nums">{$queueState.jobs.length}</Badge>
+      {/if}
+    </div>
   </CardHeader>
 
   <CardContent class="flex flex-col gap-3">
@@ -70,11 +92,12 @@
         </p>
       </div>
     {:else}
-      <div class="flex flex-col gap-2">
+      <div class="flex flex-col gap-2" role="status" aria-live="polite">
         {#each $queueState.jobs as job (job.id)}
           {@const pct = job.progress.total
             ? Math.round((job.progress.uploaded / job.progress.total) * 100)
             : 0}
+          {@const rate = $queueState.rates[job.id]}
           <div class="flex flex-col gap-2 rounded-lg border border-border bg-card p-3">
             <div class="flex items-center gap-2">
               <span
@@ -94,11 +117,42 @@
                   <X class="h-4 w-4" /> Cancel
                 </Button>
               {/if}
+              {#if job.status === "failed"}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  class="ml-auto"
+                  aria-label="Retry import"
+                  onclick={() => {
+                    void queueState.retry(job.id);
+                  }}
+                >
+                  <RotateCcw class="h-4 w-4" /> Retry
+                </Button>
+              {/if}
+              {#if isFinished(job.status)}
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  class={job.status === "failed" ? "" : "ml-auto"}
+                  aria-label="Dismiss job"
+                  onclick={() => {
+                    void queueState.dismiss(job.id);
+                  }}
+                >
+                  <X class="h-4 w-4" />
+                </Button>
+              {/if}
             </div>
 
             {#if job.status === "running" || job.status === "pending"}
               <div class="flex items-center gap-2">
                 <Progress value={pct} class="h-2 flex-1" />
+                {#if rate && rate.itemsPerSec > 0}
+                  <span class="text-xs tabular-nums text-muted-foreground">
+                    ~{Math.round(rate.itemsPerSec)}/s{#if rate.etaSeconds != null} · ETA {fmtEta(rate.etaSeconds)}{/if}
+                  </span>
+                {/if}
                 <span class="w-9 text-right text-xs tabular-nums text-muted-foreground">{pct}%</span>
               </div>
             {/if}

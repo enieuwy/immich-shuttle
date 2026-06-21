@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 
 import * as api from "$lib/api";
@@ -16,6 +16,10 @@ vi.mock("$lib/api", () => ({
 
 import { sourceState } from "./source";
 
+beforeEach(() => {
+  vi.clearAllMocks();
+  sourceState.clearSource();
+});
 describe("sourceState", () => {
   it("selects sources and stores scan result", async () => {
     await sourceState.selectSources(["/tmp/photos"]);
@@ -35,5 +39,18 @@ describe("sourceState", () => {
     const state = get(sourceState);
     expect(state.selectedPaths).toEqual([]);
     expect(state.scanResult).toBeNull();
+  });
+
+  it("removes one selected source and clears when removing the last", async () => {
+    await sourceState.selectSources(["/a", "/b"]);
+    await sourceState.removePath("/a");
+    let state = get(sourceState);
+    expect(state.selectedPaths).toEqual(["/b"]);
+    expect(vi.mocked(api.scanSources)).toHaveBeenLastCalledWith(["/b"]);
+    await sourceState.removePath("/b");
+    state = get(sourceState);
+    expect(state.selectedPaths).toEqual([]);
+    expect(state.scanResult).toBeNull();
+    expect(vi.mocked(api.scanSources)).toHaveBeenCalledTimes(2);
   });
 });

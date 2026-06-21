@@ -54,7 +54,11 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
         ),
         format!(
             "--manage-burst={}",
-            if request.stack_burst { "Stack" } else { "NoStack" }
+            if request.stack_burst {
+                "Stack"
+            } else {
+                "NoStack"
+            }
         ),
         "--folder-as-album=NONE".to_string(),
         "--device-uuid".to_string(),

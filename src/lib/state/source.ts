@@ -64,6 +64,34 @@ export const sourceState = {
       }));
     }
   },
+  async removePath(path: string) {
+    let remaining: string[] = [];
+    state.subscribe((s) => {
+      remaining = s.selectedPaths.filter((selectedPath) => selectedPath !== path);
+    })();
+    if (remaining.length === 0) {
+      state.update((s) => ({ ...s, selectedPaths: [], scanResult: null, error: null }));
+      return;
+    }
+    state.update((s) => ({
+      ...s,
+      selectedPaths: remaining,
+      scanning: true,
+      error: null,
+    }));
+    try {
+      const scanResult = await scanSources(remaining);
+      state.update((s) => ({ ...s, scanResult, scanning: false }));
+    } catch (error) {
+      errorsState.addError("Could not scan selected source.");
+      state.update((s) => ({
+        ...s,
+        scanResult: null,
+        scanning: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  },
   clearSource() {
     state.update((s) => ({ ...s, selectedPaths: [], scanResult: null, error: null }));
   },

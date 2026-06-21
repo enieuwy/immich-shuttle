@@ -28,6 +28,8 @@ static PENDING_WIPE: Lazy<Mutex<HashMap<String, Vec<String>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static RUNNING_IMPORTS: Lazy<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static JOB_INPUTS: Lazy<Mutex<HashMap<String, ImportInput>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn get_job(job_id: &str) -> Result<ImportJob, String> {
     let jobs = JOBS
@@ -62,6 +64,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         .ok_or_else(|| format!("No API key found for profile: {}", input.profile_id))?;
 
     let job_id = Uuid::new_v4().to_string();
+    if let Ok(mut inputs) = JOB_INPUTS.lock() {
+        inputs.insert(job_id.clone(), input.clone());
+    }
     let initial = ImportJob {
         id: job_id.clone(),
         status: JobStatus::Running,
@@ -189,10 +194,16 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 error: {
                     let mut error: Option<String> = None;
                     if had_error_line {
-                        let last_errors: Vec<&str> = error_lines.iter().rev().take(3).map(|s| s.as_str()).collect();
+                        let last_errors: Vec<&str> = error_lines
+                            .iter()
+                            .rev()
+                            .take(3)
+                            .map(|s| s.as_str())
+                            .collect();
                         let last_errors: Vec<&str> = last_errors.into_iter().rev().collect();
                         if last_errors.is_empty() {
-                            error = Some("immich-go reported error output during upload".to_string());
+                            error =
+                                Some("immich-go reported error output during upload".to_string());
                         } else {
                             error = Some(last_errors.join(" | "));
                         }
@@ -415,4 +426,70 @@ pub async fn import_list_jobs() -> Result<Vec<ImportJob>, String> {
         .lock()
         .map_err(|_| "Could not lock import job state".to_string())?;
     Ok(jobs.clone())
+}
+
+#[tauri::command]
+pub async fn import_retry(app: tauri::AppHandle, job_id: String) -> Result<String, String> {
+    let input = {
+        let inputs = JOB_INPUTS
+            .lock()
+            .map_err(|_| "Could not lock import inputs".to_string())?;
+        inputs.get(&job_id).cloned()
+    };
+    let input = input.ok_or_else(|| format!("No saved input to retry for job: {job_id}"))?;
+    import_start(app, input).await
+}
+
+#[tauri::command]
+pub async fn import_dismiss(job_id: String) -> Result<Vec<ImportJob>, String> {
+    {
+        let mut jobs = JOBS
+            .lock()
+            .map_err(|_| "Could not lock import job state".to_string())?;
+        if let Some(job) = jobs.iter().find(|j| j.id == job_id) {
+            if matches!(&job.status, JobStatus::Running | JobStatus::Pending) {
+                return Err("Cannot dismiss a running import".to_string());
+            }
+        }
+        jobs.retain(|j| j.id != job_id);
+    }
+    if let Ok(mut inputs) = JOB_INPUTS.lock() {
+        inputs.remove(&job_id);
+    }
+    if let Ok(mut pending) = PENDING_WIPE.lock() {
+        pending.remove(&job_id);
+    }
+    import_list_jobs().await
+}
+
+#[tauri::command]
+pub async fn import_clear_finished() -> Result<Vec<ImportJob>, String> {
+    let removed_ids: Vec<String> = {
+        let mut jobs = JOBS
+            .lock()
+            .map_err(|_| "Could not lock import job state".to_string())?;
+        let removed: Vec<String> = jobs
+            .iter()
+            .filter(|j| {
+                matches!(
+                    &j.status,
+                    JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled
+                )
+            })
+            .map(|j| j.id.clone())
+            .collect();
+        jobs.retain(|j| matches!(&j.status, JobStatus::Running | JobStatus::Pending));
+        removed
+    };
+    if let Ok(mut inputs) = JOB_INPUTS.lock() {
+        for id in &removed_ids {
+            inputs.remove(id);
+        }
+    }
+    if let Ok(mut pending) = PENDING_WIPE.lock() {
+        for id in &removed_ids {
+            pending.remove(id);
+        }
+    }
+    import_list_jobs().await
 }

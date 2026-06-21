@@ -4,6 +4,9 @@ vi.mock("$lib/api", () => ({
   importListJobs: vi.fn(async () => []),
   importStart: vi.fn(async () => "job-1"),
   importCancel: vi.fn(async () => undefined),
+  importRetry: vi.fn(async () => "job-2"),
+  importDismiss: vi.fn(async () => []),
+  importClearFinished: vi.fn(async () => []),
   importConfirmWipe: vi.fn(async () => ({
     id: "job-1",
     status: "completed",
@@ -32,6 +35,8 @@ import * as api from "$lib/api";
 import { queueState } from "./queue";
 import { profilesState } from "./profiles";
 import { sourceState } from "./source";
+import { get } from "svelte/store";
+import type { ImportJob } from "$lib/types";
 
 describe("queueState", () => {
   it("rejects startImport when profile/source not set", async () => {
@@ -66,5 +71,38 @@ describe("queueState", () => {
   it("confirmWipe forwards args to importConfirmWipe", async () => {
     await queueState.confirmWipe("job-1", true);
     expect(vi.mocked(api.importConfirmWipe)).toHaveBeenCalledWith("job-1", true);
+  });
+
+  it("dismiss removes a job and replaces state.jobs with the returned list", async () => {
+    const remaining: ImportJob[] = [
+      {
+        id: "job-2",
+        status: "running",
+        progress: { total: 4, uploaded: 1, duplicates: 0, errors: 0 },
+        awaiting_wipe_confirmation: false,
+        pending_wipe_count: 0,
+      },
+    ];
+    vi.mocked(api.importDismiss).mockResolvedValueOnce(remaining);
+
+    await queueState.dismiss("job-1");
+
+    expect(vi.mocked(api.importDismiss)).toHaveBeenCalledWith("job-1");
+    expect(get(queueState).jobs).toEqual(remaining);
+  });
+
+  it("clearFinished drops finished jobs and updates state.jobs", async () => {
+    vi.mocked(api.importClearFinished).mockResolvedValueOnce([]);
+
+    await queueState.clearFinished();
+
+    expect(vi.mocked(api.importClearFinished)).toHaveBeenCalled();
+    expect(get(queueState).jobs).toEqual([]);
+  });
+
+  it("retry re-runs the import for the given job id", async () => {
+    await queueState.retry("job-1");
+
+    expect(vi.mocked(api.importRetry)).toHaveBeenCalledWith("job-1");
   });
 });

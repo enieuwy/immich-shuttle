@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Job lifecycle & queue
+- Retry failed imports, dismiss individual finished jobs, and clear all finished jobs (new `import_retry`/`import_dismiss`/`import_clear_finished` commands; the original input is persisted per job for retry)
+- Live throughput (items/sec) and ETA on running imports
+
+### Source & options
+- Remove individual selected source paths (not just clear-all), with a re-scan of the remainder
+- Import options now use proper Switch toggles via a new `ui/switch` primitive
+
+### Onboarding & window
+- Onboarding is now a real two-step wizard (connect → "you're connected" → get started) instead of force-closing on first save
+- Set a minimum window size (720×560) so the layout stays usable when resized small
+
+### Accessibility
+- Added descriptive `aria-label`s to icon-only controls and `aria-live` status regions for the import queue and toasts
+
 - Redesigned the entire UI around an Immich-indigo brand identity (light/dark/system themes)
 - Surfaced the import queue as a dedicated panel with per-job progress bars and duplicate/error stats
 - Reworked the app shell: header brand mark, sticky footer action bar (live status + Start Import), and a clearer two-column layout

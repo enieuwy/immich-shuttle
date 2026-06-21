@@ -73,6 +73,7 @@
                 size="icon-sm"
                 class="h-4 w-4 rounded-full p-0 text-primary hover:bg-primary/20"
                 onclick={() => albumsState.deselectAlbum(album.id)}
+                aria-label={`Remove ${album.album_name} from selection`}
               >
                 <X class="h-3 w-3" />
               </Button>
@@ -112,11 +113,12 @@
           <Search class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
           <input
             bind:value={search}
+            aria-label="Search albums"
             placeholder="Search albums..."
             class="w-full bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
           />
           {#if search}
-            <button type="button" class="text-muted-foreground transition-colors hover:text-foreground" onclick={() => (search = "")}>
+            <button type="button" class="text-muted-foreground transition-colors hover:text-foreground" aria-label="Clear search" onclick={() => (search = "")}>
               <X class="h-3.5 w-3.5" />
             </button>
           {/if}

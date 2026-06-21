@@ -69,6 +69,18 @@ export function importConfirmWipe(jobId: string, confirm: boolean): Promise<Impo
   return invokeCommand<ImportJob>("import_confirm_wipe", { jobId, confirm });
 }
 
+export function importRetry(jobId: string): Promise<string> {
+  return invokeCommand<string>("import_retry", { jobId });
+}
+
+export function importDismiss(jobId: string): Promise<ImportJob[]> {
+  return invokeCommand<ImportJob[]>("import_dismiss", { jobId });
+}
+
+export function importClearFinished(): Promise<ImportJob[]> {
+  return invokeCommand<ImportJob[]>("import_clear_finished");
+}
+
 export function importListJobs(): Promise<ImportJob[]> {
   return invokeCommand<ImportJob[]>("import_list_jobs");
 }

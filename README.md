@@ -8,7 +8,7 @@ Immich Shuttle is a cross-platform desktop importer for Immich built with Tauri 
 - Secure key storage using system keychain backends
 - Source picker with a drag-and-drop dropzone, removable-media detection (with free-space and DCIM hints), folder/file selection, and a live media scan summary
 - Album multi-select with inline album creation and sharing options
-- Import queue panel with per-job progress bars, duplicate/error stats, and cancel support
+- Import queue panel with per-job progress bars, live throughput/ETA, duplicate/error stats, and cancel, retry, dismiss, and clear-finished actions
 - Optional wipe mode that deletes only confirmed uploaded files, with an in-app safety warning
 - Immich-branded UI with light, dark, and system themes
 - LAN/WAN URL resolution using TCP probe

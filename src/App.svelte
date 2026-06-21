@@ -16,7 +16,7 @@
   import SourcePicker from "$lib/components/source/SourcePicker.svelte";
   import { Button } from "$lib/components/ui/button";
   import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "$lib/components/ui/dialog";
-  import { profilesState } from "$lib/state/profiles";
+  import { getProfilesSnapshot, profilesState } from "$lib/state/profiles";
   import { queueState } from "$lib/state/queue";
 
   let showManager = $state(false);
@@ -43,7 +43,11 @@
 
   onMount(() => {
     let unlistenClose: (() => void) | undefined;
-    void profilesState.loadProfiles();
+    void profilesState.loadProfiles().then(() => {
+      if (getProfilesSnapshot().profiles.length === 0) {
+        showOnboarding = true;
+      }
+    });
     void queueState.loadJobs();
     queueState.startPolling();
 
@@ -72,9 +76,6 @@
     };
   });
 
-  $effect(() => {
-    showOnboarding = $profilesState.profiles.length === 0;
-  });
 </script>
 
 <AppLayout>

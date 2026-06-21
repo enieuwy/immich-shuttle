@@ -100,6 +100,10 @@
     return `${paths.length} sources selected`;
   }
 
+  function isLikelyFolderPath(path: string): boolean {
+    return path.endsWith("/") || !/\.[^/\\]+$/.test(path);
+  }
+
   function fmtGb(bytes: number): string {
     return `${Math.round(bytes / 1024 ** 3)} GB`;
   }
@@ -133,6 +137,31 @@
           >
             {sourceLabel($sourceState.selectedPaths)}
           </p>
+          {#if $sourceState.selectedPaths.length > 1}
+            <div class="flex flex-col gap-1">
+              {#each $sourceState.selectedPaths as path}
+                <div class="flex items-center gap-2 rounded-md bg-background/60 px-2 py-1">
+                  {#if isLikelyFolderPath(path)}
+                    <FolderOpen class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  {:else}
+                    <FileImage class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  {/if}
+                  <span class="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" title={path}>
+                    {path}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    onclick={() => void sourceState.removePath(path)}
+                    class="h-5 w-5 shrink-0 rounded-full"
+                    aria-label={`Remove ${path}`}
+                  >
+                    <X class="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              {/each}
+            </div>
+          {/if}
           {#if $sourceState.scanning}
             <p class="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Loader2 class="h-3.5 w-3.5 animate-spin" />
@@ -162,6 +191,7 @@
           size="icon-sm"
           onclick={() => sourceState.clearSource()}
           class="h-6 w-6 shrink-0 rounded-full"
+          aria-label="Clear selected sources"
         >
           <X class="h-4 w-4" />
         </Button>

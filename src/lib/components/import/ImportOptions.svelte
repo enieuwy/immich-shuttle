@@ -2,6 +2,8 @@
   import { AlertTriangle, SlidersHorizontal } from "@lucide/svelte";
   import { Alert, AlertDescription, AlertTitle } from "$lib/components/ui/alert";
   import { Card, CardContent, CardHeader } from "$lib/components/ui/card";
+  import { Label } from "$lib/components/ui/label";
+  import { Switch } from "$lib/components/ui/switch";
   import { importOptionsState } from "$lib/state/import-options";
 </script>
 
@@ -12,50 +14,53 @@
   </CardHeader>
 
   <CardContent class="flex flex-col gap-1">
-    <label
-      class="flex cursor-pointer items-center justify-between gap-3 rounded-lg p-3 transition-colors hover:bg-muted/50"
-    >
-      <span class="flex min-w-0 flex-col gap-1">
+    <div class="flex items-center justify-between gap-3 rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <Label
+        for="import-option-stack-raw-jpeg"
+        class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
+      >
         <span class="text-sm font-medium text-foreground">Stack RAW+JPEG pairs</span>
         <span class="text-xs text-muted-foreground">Group matching RAW and JPEG shots into one stack.</span>
-      </span>
-      <input
-        type="checkbox"
-        class="h-4 w-4 rounded border-border accent-primary"
+      </Label>
+      <Switch
+        id="import-option-stack-raw-jpeg"
+        aria-label="Stack RAW+JPEG pairs"
         checked={$importOptionsState.stackRawJpeg}
-        onchange={(event) => importOptionsState.setStackRawJpeg((event.target as HTMLInputElement).checked)}
+        onCheckedChange={(v) => importOptionsState.setStackRawJpeg(v)}
       />
-    </label>
+    </div>
 
-    <label
-      class="flex cursor-pointer items-center justify-between gap-3 rounded-lg p-3 transition-colors hover:bg-muted/50"
-    >
-      <span class="flex min-w-0 flex-col gap-1">
+    <div class="flex items-center justify-between gap-3 rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <Label
+        for="import-option-stack-burst"
+        class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
+      >
         <span class="text-sm font-medium text-foreground">Stack burst photos</span>
         <span class="text-xs text-muted-foreground">Combine rapid burst sequences into a single stack.</span>
-      </span>
-      <input
-        type="checkbox"
-        class="h-4 w-4 rounded border-border accent-primary"
+      </Label>
+      <Switch
+        id="import-option-stack-burst"
+        aria-label="Stack burst photos"
         checked={$importOptionsState.stackBurst}
-        onchange={(event) => importOptionsState.setStackBurst((event.target as HTMLInputElement).checked)}
+        onCheckedChange={(v) => importOptionsState.setStackBurst(v)}
       />
-    </label>
+    </div>
 
-    <label
-      class="flex cursor-pointer items-center justify-between gap-3 rounded-lg p-3 transition-colors hover:bg-muted/50"
-    >
-      <span class="flex min-w-0 flex-col gap-1">
+    <div class="flex items-center justify-between gap-3 rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <Label
+        for="import-option-delete-uploaded"
+        class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
+      >
         <span class="text-sm font-medium text-foreground">Delete uploaded files after import</span>
         <span class="text-xs text-muted-foreground">Removes source files only after a confirmed upload.</span>
-      </span>
-      <input
-        type="checkbox"
-        class="h-4 w-4 rounded border-border accent-destructive"
+      </Label>
+      <Switch
+        id="import-option-delete-uploaded"
+        aria-label="Delete uploaded files after import"
         checked={!$importOptionsState.keepFiles}
-        onchange={(event) => importOptionsState.setKeepFiles(!(event.target as HTMLInputElement).checked)}
+        onCheckedChange={(v) => importOptionsState.setKeepFiles(!v)}
       />
-    </label>
+    </div>
 
     {#if !$importOptionsState.keepFiles}
       <Alert variant="destructive" class="mt-2">

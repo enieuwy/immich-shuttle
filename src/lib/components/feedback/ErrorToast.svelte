@@ -28,7 +28,7 @@
   }
 </script>
 
-<div class="fixed bottom-4 right-4 z-50 flex w-[min(420px,90vw)] flex-col gap-2">
+<div class="fixed bottom-4 right-4 z-50 flex w-[min(420px,90vw)] flex-col gap-2" role="status" aria-live="polite" aria-atomic="false">
   {#each $errorsState as item (item.id)}
     {@const meta = getToastMeta(item.level)}
     {@const Icon = meta.Icon}

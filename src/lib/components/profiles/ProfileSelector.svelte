@@ -36,7 +36,7 @@
 <DropdownMenu>
   <DropdownMenuTrigger>
     {#snippet child({ props })}
-      <Button variant="outline" size="sm" class="min-w-0 justify-between gap-2" {...props}>
+      <Button variant="outline" size="sm" class="min-w-0 justify-between gap-2" {...props} aria-label={$activeProfile ? `Switch profile (current: ${$activeProfile.display_name})` : "Select profile"}>
         {#if $activeProfile}
           <span class="grid size-5 shrink-0 place-items-center rounded-full bg-primary text-[10px] text-primary-foreground">
             {$activeProfile.display_name.charAt(0).toUpperCase()}

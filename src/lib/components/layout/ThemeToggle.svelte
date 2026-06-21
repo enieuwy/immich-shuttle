@@ -22,7 +22,7 @@
   <Tooltip>
     <TooltipTrigger>
       {#snippet child({ props })}
-        <Button variant="ghost" size="icon-sm" {...props} onclick={() => themeState.cycle()}>
+        <Button variant="ghost" size="icon-sm" {...props} aria-label={nextLabel} onclick={() => themeState.cycle()}>
           {#if $themeState === "light"}
             <Sun class="size-4" />
           {:else if $themeState === "dark"}

@@ -1,7 +1,15 @@
 import { get, writable } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-import { importCancel, importConfirmWipe, importListJobs, importStart } from "$lib/api";
+import {
+  importCancel,
+  importClearFinished,
+  importConfirmWipe,
+  importDismiss,
+  importListJobs,
+  importRetry,
+  importStart,
+} from "$lib/api";
 import { errorsState } from "$lib/state/errors";
 import type { ImportJob } from "$lib/types";
 
@@ -14,12 +22,14 @@ type QueueState = {
   jobs: ImportJob[];
   loading: boolean;
   error: string | null;
+  rates: Record<string, { itemsPerSec: number; etaSeconds: number | null }>;
 };
 
 const state = writable<QueueState>({
   jobs: [],
   loading: false,
   error: null,
+  rates: {},
 });
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -31,10 +41,44 @@ type ImportProgressEvent = {
   parsed_progress?: ImportJob["progress"];
 };
 
+const firstSamples = new Map<string, { time: number; uploaded: number }>();
+
+function recomputeRates(
+  jobs: ImportJob[],
+): Record<string, { itemsPerSec: number; etaSeconds: number | null }> {
+  const rates: Record<string, { itemsPerSec: number; etaSeconds: number | null }> = {};
+  const present = new Set<string>();
+  for (const job of jobs) {
+    present.add(job.id);
+    if (job.status !== "running") {
+      firstSamples.delete(job.id);
+      continue;
+    }
+    let sample = firstSamples.get(job.id);
+    if (!sample) {
+      sample = { time: Date.now(), uploaded: job.progress.uploaded };
+      firstSamples.set(job.id, sample);
+    }
+    const elapsed = (Date.now() - sample.time) / 1000;
+    const delta = job.progress.uploaded - sample.uploaded;
+    const itemsPerSec = elapsed > 0 && delta > 0 ? delta / elapsed : 0;
+    const remaining = Math.max(0, job.progress.total - job.progress.uploaded);
+    const etaSeconds = itemsPerSec > 0 ? Math.round(remaining / itemsPerSec) : null;
+    rates[job.id] = { itemsPerSec, etaSeconds };
+  }
+  for (const id of firstSamples.keys()) {
+    if (!present.has(id)) {
+      firstSamples.delete(id);
+    }
+  }
+  return rates;
+}
+
 async function refreshJobs() {
   try {
     const jobs = await importListJobs();
-    state.update((s) => ({ ...s, jobs, error: null }));
+    const rates = recomputeRates(jobs);
+    state.update((s) => ({ ...s, jobs, rates, error: null }));
   } catch (error) {
     errorsState.addError("Could not refresh import queue.");
     state.update((s) => ({ ...s, error: error instanceof Error ? error.message : String(error) }));
@@ -62,12 +106,13 @@ export const queueState = {
         if (!progress) {
           return;
         }
-        state.update((s) => ({
-          ...s,
-          jobs: s.jobs.map((job) =>
+        state.update((s) => {
+          const jobs: ImportJob[] = s.jobs.map((job) =>
             job.id === payload.job_id ? { ...job, status: "running", progress } : job,
-          ),
-        }));
+          );
+          const rates = recomputeRates(jobs);
+          return { ...s, jobs, rates };
+        });
       }).then((unlisten) => {
         progressUnlisten = unlisten;
       });
@@ -115,6 +160,33 @@ export const queueState = {
       await refreshJobs();
     } catch (error) {
       errorsState.addError("Could not cancel import.");
+      throw error;
+    }
+  },
+  async retry(jobId: string) {
+    try {
+      await importRetry(jobId);
+      await refreshJobs();
+    } catch (error) {
+      errorsState.addError("Could not retry import.");
+      throw error;
+    }
+  },
+  async dismiss(jobId: string) {
+    try {
+      const jobs = await importDismiss(jobId);
+      state.update((s) => ({ ...s, jobs }));
+    } catch (error) {
+      errorsState.addError("Could not dismiss job.");
+      throw error;
+    }
+  },
+  async clearFinished() {
+    try {
+      const jobs = await importClearFinished();
+      state.update((s) => ({ ...s, jobs }));
+    } catch (error) {
+      errorsState.addError("Could not clear finished jobs.");
       throw error;
     }
   },

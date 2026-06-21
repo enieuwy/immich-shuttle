@@ -65,6 +65,16 @@ function handle(cmd: string, args: InvokeArgs): unknown {
       return `job-${Date.now()}`;
     case "import_confirm_wipe":
       return { ...fixtures.jobsForScenario(scenario)[0], awaiting_wipe_confirmation: false };
+    case "import_retry":
+      return `job-${Date.now()}`;
+    case "import_dismiss": {
+      const jobId = args?.jobId as string | undefined;
+      return fixtures.jobsForScenario(scenario).filter((job) => job.id !== jobId);
+    }
+    case "import_clear_finished":
+      return fixtures
+        .jobsForScenario(scenario)
+        .filter((job) => job.status === "running" || job.status === "pending");
     // Void commands: profile_delete, album_share_users, import_cancel, open_logs_dir, ...
     default:
       return undefined;
