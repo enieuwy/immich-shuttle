@@ -1,0 +1,102 @@
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  Album,
+  AlbumShareLink,
+  AlbumUser,
+  ImportInput,
+  ImportJob,
+  Profile,
+  ProfileInput,
+  RemovableDevice,
+  ScanResult,
+  ServerInfo,
+} from "./types";
+
+async function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    return await invoke<T>(command, args);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${command} failed: ${message}`);
+  }
+}
+
+export function profilesList(): Promise<Profile[]> {
+  return invokeCommand<Profile[]>("profiles_list");
+}
+
+export function profileUpsert(input: ProfileInput): Promise<Profile> {
+  return invokeCommand<Profile>("profile_upsert", { input });
+}
+
+export function profileDelete(id: string): Promise<void> {
+  return invokeCommand<void>("profile_delete", { id });
+}
+
+export function profileValidate(url: string, apiKey: string): Promise<ServerInfo> {
+  return invokeCommand<ServerInfo>("profile_validate", { url, apiKey });
+}
+
+export function albumsList(profileId: string, query?: string): Promise<Album[]> {
+  return invokeCommand<Album[]>("albums_list", { profileId, query: query ?? null });
+}
+
+export function albumCreate(profileId: string, name: string): Promise<Album> {
+  return invokeCommand<Album>("album_create", { profileId, name });
+}
+
+export function albumShareUsers(profileId: string, albumId: string, userIds: string[]): Promise<void> {
+  return invokeCommand<void>("album_share_users", {
+    profileId,
+    albumId,
+    userIds,
+  });
+}
+
+export function albumShareLink(profileId: string, albumId: string): Promise<AlbumShareLink> {
+  return invokeCommand<AlbumShareLink>("album_share_link", { profileId, albumId });
+}
+
+export function importStart(input: ImportInput): Promise<string> {
+  return invokeCommand<string>("import_start", { input });
+}
+
+export function importCancel(jobId: string): Promise<void> {
+  return invokeCommand<void>("import_cancel", { jobId });
+}
+
+export function importConfirmWipe(jobId: string, confirm: boolean): Promise<ImportJob> {
+  return invokeCommand<ImportJob>("import_confirm_wipe", { jobId, confirm });
+}
+
+export function importListJobs(): Promise<ImportJob[]> {
+  return invokeCommand<ImportJob[]>("import_list_jobs");
+}
+
+export function devicesListRemovable(): Promise<RemovableDevice[]> {
+  return invokeCommand<RemovableDevice[]>("devices_list_removable");
+}
+
+export function usersList(profileId: string): Promise<AlbumUser[]> {
+  return invokeCommand<AlbumUser[]>("users_list", { profileId });
+}
+
+export function getServerInfo(profileId: string): Promise<ServerInfo> {
+  return invokeCommand<ServerInfo>("get_server_info", { profileId });
+}
+
+export function getLogsDir(): Promise<string> {
+  return invokeCommand<string>("get_logs_dir");
+}
+
+export function openLogsDir(): Promise<void> {
+  return invokeCommand<void>("open_logs_dir");
+}
+
+export function scanSource(path: string): Promise<ScanResult> {
+  return invokeCommand<ScanResult>("scan_source", { path });
+}
+
+export function scanSources(paths: string[]): Promise<ScanResult> {
+  return invokeCommand<ScanResult>("scan_sources", { paths });
+}

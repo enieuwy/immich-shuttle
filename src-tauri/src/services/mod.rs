@@ -1,0 +1,10 @@
+pub mod device_detector;
+pub mod immich_client;
+pub mod keychain;
+pub mod logs;
+pub mod media_scanner;
+pub mod profile_store;
+pub mod sidecar_runner;
+pub mod stdout_parser;
+pub mod url_resolver;
+pub mod wipe;
