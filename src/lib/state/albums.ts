@@ -12,6 +12,7 @@ type AlbumsState = {
   availableUsers: AlbumUser[];
   loading: boolean;
   error: string | null;
+  shareLinkUrl: string | null;
 };
 
 const state = writable<AlbumsState>({
@@ -20,6 +21,7 @@ const state = writable<AlbumsState>({
   availableUsers: [],
   loading: false,
   error: null,
+  shareLinkUrl: null,
 });
 
 export const albumsState = {
@@ -74,18 +76,24 @@ export const albumsState = {
       if (shareUserIds.length > 0) {
         await albumShareUsers(profile.id, created.id, shareUserIds);
       }
+      let shareLinkUrl: string | null = null;
       if (createPublicLink) {
-        await albumShareLink(profile.id, created.id);
+        const link = await albumShareLink(profile.id, created.id);
+        shareLinkUrl = link.url;
       }
       state.update((s) => ({
         ...s,
         availableAlbums: [created, ...s.availableAlbums],
         selectedAlbumIds: [...s.selectedAlbumIds, created.id],
+        shareLinkUrl,
       }));
       return created;
     } catch (error) {
       errorsState.addError("Could not create album.");
       throw error;
     }
+  },
+  clearShareLink() {
+    state.update((s) => ({ ...s, shareLinkUrl: null }));
   },
 };

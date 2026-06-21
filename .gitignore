@@ -12,3 +12,7 @@ vite.config.ts.timestamp-*
 # Agent harness / session tooling (not project source)
 .agents/
 .sisyphus/
+/test-results
+/playwright-report
+/playwright/.cache
+e2e/__screenshots__/

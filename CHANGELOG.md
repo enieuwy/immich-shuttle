@@ -11,6 +11,10 @@
 - Restyled import options as descriptive toggle rows with a destructive-action warning, and toasts with per-level icons and animations
 - Added a browser design-preview harness (mocked Tauri backend + scenarios) for visual UI inspection; dev-only and excluded from production builds
 - Removed stale compiled `.js`/`.js.map` artifacts from `src/` that were shadowing TypeScript sources and breaking production builds
+- Fixed: the "Stack RAW+JPEG" and "Stack burst" toggles are now sent to the backend (threaded through `ImportInput` → sidecar `--manage-raw-jpeg`/`--manage-burst`); previously they had no effect
+- Fixed: the public album share link is now shown with a copy action instead of being discarded after creation
+- Replaced the blocking native wipe confirmation with an in-app Delete/Keep confirmation in the queue panel
+- Added Playwright end-to-end tests covering every design-preview scenario
 
 ## v0.1.0
 

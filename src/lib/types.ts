@@ -52,6 +52,8 @@ export interface ImportInput {
   source_paths: string[];
   album_ids: string[];
   keep_files: boolean;
+  stack_raw_jpeg: boolean;
+  stack_burst: boolean;
 }
 
 export interface ImportJob {

@@ -75,4 +75,42 @@ describe("albumsState", () => {
     expect(vi.mocked(api.albumCreate)).toHaveBeenCalled();
     expect(get(albumsState).selectedAlbumIds).toContain("a2");
   });
+
+  it("stores the public share link after creating a linked album", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+
+    vi.mocked(api.albumShareLink).mockClear();
+    await albumsState.createAlbum("Holiday", ["u1"], true);
+    expect(get(albumsState).shareLinkUrl).toBe("https://example.com/share/x");
+    albumsState.clearShareLink();
+    expect(get(albumsState).shareLinkUrl).toBeNull();
+  });
+
+  it("leaves the public share link empty when no link is created", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+
+    await albumsState.createAlbum("Holiday", ["u1"], true);
+    expect(get(albumsState).shareLinkUrl).toBe("https://example.com/share/x");
+
+    vi.mocked(api.albumShareLink).mockClear();
+    await albumsState.createAlbum("Private", [], false);
+    expect(vi.mocked(api.albumShareLink)).not.toHaveBeenCalled();
+    expect(get(albumsState).shareLinkUrl).toBeNull();
+  });
 });

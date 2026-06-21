@@ -11,12 +11,60 @@ vi.mock("$lib/api", () => ({
     awaiting_wipe_confirmation: false,
     pending_wipe_count: 0,
   })),
+  profileUpsert: vi.fn(async (input) => ({
+    id: input.id ?? "p1",
+    display_name: input.display_name ?? "Ellis",
+    server_url: input.server_url,
+    lan_server_url: input.lan_server_url ?? null,
+    wan_server_url: input.wan_server_url ?? null,
+  })),
+  scanSources: vi.fn(async () => ({
+    files: [],
+    total_size_bytes: 0,
+    photo_count: 0,
+    video_count: 0,
+    skipped_unreadable: 0,
+  })),
+  devicesListRemovable: vi.fn(async () => []),
 }));
 
+import * as api from "$lib/api";
 import { queueState } from "./queue";
+import { profilesState } from "./profiles";
+import { sourceState } from "./source";
 
 describe("queueState", () => {
   it("rejects startImport when profile/source not set", async () => {
     await expect(queueState.startImport()).rejects.toThrow("Select a profile before starting import");
+  });
+
+  it("forwards stack flags to importStart", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+
+    await queueState.startImport();
+
+    const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
+    expect(payload).toBeDefined();
+    expect(typeof payload?.stack_raw_jpeg).toBe("boolean");
+    expect(typeof payload?.stack_burst).toBe("boolean");
+    expect(payload).toMatchObject({
+      profile_id: "p1",
+      stack_raw_jpeg: true,
+      stack_burst: true,
+    });
+  });
+
+  it("confirmWipe forwards args to importConfirmWipe", async () => {
+    await queueState.confirmWipe("job-1", true);
+    expect(vi.mocked(api.importConfirmWipe)).toHaveBeenCalledWith("job-1", true);
   });
 });

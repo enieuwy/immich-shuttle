@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Search, Plus, X, Images } from "@lucide/svelte";
+  import { Link, Search, Plus, X, Images } from "@lucide/svelte";
 
   import { albumsState } from "$lib/state/albums";
   import { activeProfile } from "$lib/state/profiles";
@@ -10,6 +10,7 @@
   import { ScrollArea } from "$lib/components/ui/scroll-area";
   import { Card, CardHeader, CardTitle, CardAction, CardContent } from "$lib/components/ui/card";
   import { Label } from "$lib/components/ui/label";
+  import { Alert, AlertDescription } from "$lib/components/ui/alert";
 
   let search = $state("");
   let showCreate = $state(false);
@@ -82,6 +83,28 @@
         <Badge variant="outline" class="text-muted-foreground">No album</Badge>
       {/if}
     </div>
+
+    {#if $albumsState.shareLinkUrl}
+      {@const shareLinkUrl = $albumsState.shareLinkUrl ?? ""}
+      <Alert class="border-primary/20 bg-primary/10 text-primary">
+        <Link class="shrink-0" />
+        <AlertDescription class="flex min-w-0 flex-col gap-2 text-primary sm:flex-row sm:items-center">
+          <span class="min-w-0 flex-1 truncate font-mono text-xs" title={shareLinkUrl}>{shareLinkUrl}</span>
+          <div class="flex shrink-0 items-center gap-1">
+            <Button size="sm" onclick={() => $albumsState.shareLinkUrl && navigator.clipboard.writeText($albumsState.shareLinkUrl)}>Copy</Button>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              class="text-primary hover:bg-primary/20"
+              aria-label="Dismiss share link"
+              onclick={() => albumsState.clearShareLink()}
+            >
+              <X class="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </AlertDescription>
+      </Alert>
+    {/if}
 
     <ScrollArea class="h-[200px] rounded-md border border-border bg-card">
       <div class="sticky top-0 z-10 bg-card px-2 pt-2 pb-1">

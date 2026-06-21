@@ -32,6 +32,8 @@ pub struct UploadRequest {
     pub log_path: PathBuf,
     pub device_uuid: String,
     pub cancel_flag: Arc<AtomicBool>,
+    pub stack_raw_jpeg: bool,
+    pub stack_burst: bool,
 }
 
 pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<SidecarResult, String> {
@@ -42,8 +44,18 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
         request.server_url.clone(),
         "--api-key".to_string(),
         request.api_key.clone(),
-        "--manage-raw-jpeg=StackCoverRaw".to_string(),
-        "--manage-burst=Stack".to_string(),
+        format!(
+            "--manage-raw-jpeg={}",
+            if request.stack_raw_jpeg {
+                "StackCoverRaw"
+            } else {
+                "NoStack"
+            }
+        ),
+        format!(
+            "--manage-burst={}",
+            if request.stack_burst { "Stack" } else { "NoStack" }
+        ),
         "--folder-as-album=NONE".to_string(),
         "--device-uuid".to_string(),
         request.device_uuid.clone(),

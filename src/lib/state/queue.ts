@@ -24,7 +24,6 @@ const state = writable<QueueState>({
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let progressUnlisten: UnlistenFn | null = null;
-const activeWipePrompts = new Set<string>();
 
 type ImportProgressEvent = {
   job_id: string;
@@ -36,40 +35,9 @@ async function refreshJobs() {
   try {
     const jobs = await importListJobs();
     state.update((s) => ({ ...s, jobs, error: null }));
-    await handleWipeConfirmations(jobs);
   } catch (error) {
     errorsState.addError("Could not refresh import queue.");
     state.update((s) => ({ ...s, error: error instanceof Error ? error.message : String(error) }));
-  }
-}
-
-async function handleWipeConfirmations(jobs: ImportJob[]) {
-  let changed = false;
-
-  for (const job of jobs) {
-    if (!job.awaiting_wipe_confirmation || activeWipePrompts.has(job.id)) {
-      continue;
-    }
-
-    activeWipePrompts.add(job.id);
-    try {
-      const fileCount = job.pending_wipe_count;
-      const proceed = window.confirm(
-        `Delete ${fileCount} confirmed-uploaded files from disk? This cannot be undone.`,
-      );
-      await importConfirmWipe(job.id, proceed);
-      changed = true;
-    } catch (error) {
-      errorsState.addError("Could not complete wipe confirmation.");
-      state.update((s) => ({ ...s, error: error instanceof Error ? error.message : String(error) }));
-    } finally {
-      activeWipePrompts.delete(job.id);
-    }
-  }
-
-  if (changed) {
-    const updatedJobs = await importListJobs();
-    state.update((s) => ({ ...s, jobs: updatedJobs, error: null }));
   }
 }
 
@@ -136,6 +104,8 @@ export const queueState = {
       source_paths: source.selectedPaths,
       album_ids: albums.selectedAlbumIds,
       keep_files: options.keepFiles,
+      stack_raw_jpeg: options.stackRawJpeg,
+      stack_burst: options.stackBurst,
     });
     await refreshJobs();
   },
@@ -145,6 +115,16 @@ export const queueState = {
       await refreshJobs();
     } catch (error) {
       errorsState.addError("Could not cancel import.");
+      throw error;
+    }
+  },
+  async confirmWipe(jobId: string, proceed: boolean) {
+    try {
+      await importConfirmWipe(jobId, proceed);
+      await refreshJobs();
+    } catch (error) {
+      errorsState.addError("Could not complete wipe confirmation.");
+      state.update((s) => ({ ...s, error: error instanceof Error ? error.message : String(error) }));
       throw error;
     }
   },

@@ -87,6 +87,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
 
     let source_paths = input.source_paths.clone();
     let keep_files = input.keep_files;
+    let stack_raw_jpeg = input.stack_raw_jpeg;
+    let stack_burst = input.stack_burst;
     let album_ids = input.album_ids.clone();
     let job_id_clone = job_id.clone();
     let server_url = url_resolver::resolve_server_url(&profile).await;
@@ -110,6 +112,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             log_path,
             device_uuid,
             cancel_flag: cancel_flag.clone(),
+            stack_raw_jpeg,
+            stack_burst,
         };
         let mut merged_progress = JobProgress {
             total: 0,

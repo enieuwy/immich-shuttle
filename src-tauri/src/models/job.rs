@@ -24,6 +24,8 @@ pub struct ImportInput {
     pub source_paths: Vec<String>,
     pub album_ids: Vec<String>,
     pub keep_files: bool,
+    pub stack_raw_jpeg: bool,
+    pub stack_burst: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
