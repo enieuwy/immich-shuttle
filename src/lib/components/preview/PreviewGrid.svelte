@@ -1,14 +1,52 @@
 <script lang="ts">
   import type { Action } from "svelte/action";
-  import { CheckCircle2, Circle, FileVideo, Camera, Image, Loader2 } from "@lucide/svelte";
+  import { CheckCircle2, Circle, FileVideo, Camera, Image, Loader2, Calendar } from "@lucide/svelte";
 
-  import type { MediaFile, ThumbResult } from "$lib/types";
+  import type { CaptureDate, MediaFile, ThumbResult } from "$lib/types";
   import { selectionState } from "$lib/state/selection";
-  import { previewThumbnails } from "$lib/api";
+  import { previewDates, previewThumbnails } from "$lib/api";
   import { Button } from "$lib/components/ui/button";
   import { cn } from "$lib/utils.js";
 
   let { files }: { files: MediaFile[] } = $props();
+
+  // Sort mode for the grid. "date" uses EXIF capture date (mtime fallback).
+  let sortMode = $state<"name" | "date">("name");
+  // Capture dates (epoch seconds) keyed by path; fetched lazily once per file set.
+  let dates = $state(new Map<string, number | null>());
+  let datesFetchedFor = "";
+
+  $effect(() => {
+    const paths = files.map((f) => f.path);
+    const key = paths.join("\n");
+    if (files.length === 0 || key === datesFetchedFor) {
+      return;
+    }
+    datesFetchedFor = key;
+    void previewDates(paths).then((rows: CaptureDate[]) => {
+      const next = new Map<string, number | null>();
+      for (const row of rows) {
+        next.set(row.path, row.captured_at);
+      }
+      dates = next;
+    });
+  });
+
+  const sortedFiles = $derived.by(() => {
+    const list = [...files];
+    if (sortMode === "name") {
+      return list.sort((a, b) => a.name.localeCompare(b.name));
+    }
+    // Newest first; files with no known date sort last, then by name.
+    return list.sort((a, b) => {
+      const da = dates.get(a.path) ?? null;
+      const db = dates.get(b.path) ?? null;
+      if (da === null && db === null) return a.name.localeCompare(b.name);
+      if (da === null) return 1;
+      if (db === null) return -1;
+      return db - da;
+    });
+  });
 
   // Loaded thumbnails keyed by file path. Reassigned (new Map) on every merge so
   // Svelte reactivity fires for the affected tiles.
@@ -140,14 +178,31 @@
     >
       <Button variant="outline" size="sm" onclick={selectAll}>Select all</Button>
       <Button variant="ghost" size="sm" onclick={() => selectionState.clear()}>Clear</Button>
-      <span class="ml-auto text-xs text-muted-foreground">
+      <div class="ml-auto flex items-center gap-1">
+        <span class="text-[11px] text-muted-foreground">Sort</span>
+        <Button
+          variant={sortMode === "name" ? "secondary" : "ghost"}
+          size="sm"
+          onclick={() => (sortMode = "name")}
+        >
+          Name
+        </Button>
+        <Button
+          variant={sortMode === "date" ? "secondary" : "ghost"}
+          size="sm"
+          onclick={() => (sortMode = "date")}
+        >
+          <Calendar class="h-3.5 w-3.5" /> Date
+        </Button>
+      </div>
+      <span class="text-xs text-muted-foreground">
         {selStats.count} of {files.length} selected · {fmtSize(selStats.size)}
       </span>
     </div>
 
     <div class="flex-1 overflow-y-auto p-3">
       <div class="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-2">
-        {#each files as file (file.path)}
+        {#each sortedFiles as file (file.path)}
           {@const selected = $selectionState.selected.has(file.path)}
           {@const thumb = thumbs.get(file.path)}
           <button

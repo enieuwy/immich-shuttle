@@ -122,3 +122,9 @@ export interface ThumbResult {
   width: number;
   height: number;
 }
+
+export interface CaptureDate {
+  path: string;
+  /** Capture time as epoch seconds, or null when unknown. */
+  captured_at: number | null;
+}

@@ -3,6 +3,7 @@ import type {
   Album,
   AlbumShareLink,
   AlbumUser,
+  CaptureDate,
   ImportInput,
   ImportJob,
   ImportRecord,
@@ -121,6 +122,10 @@ export function scanSources(paths: string[]): Promise<ScanResult> {
 
 export function previewThumbnails(paths: string[]): Promise<ThumbResult[]> {
   return invokeCommand<ThumbResult[]>("preview_thumbnails", { paths });
+}
+
+export function previewDates(paths: string[]): Promise<CaptureDate[]> {
+  return invokeCommand<CaptureDate[]>("preview_dates", { paths });
 }
 
 export function historyList(): Promise<ImportRecord[]> {

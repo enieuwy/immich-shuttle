@@ -9,6 +9,7 @@ import type {
   Album,
   AlbumShareLink,
   AlbumUser,
+  CaptureDate,
   ImportJob,
   ImportRecord,
   MediaFile,
@@ -292,5 +293,17 @@ export function thumbsForPaths(paths: string[]): ThumbResult[] {
       return { path, data_url: null, width: 0, height: 0 };
     }
     return { path, data_url: thumbDataUrl(path), width: 120, height: 80 };
+  });
+}
+
+/** Mock backend: capture dates spread so Date order differs from Name order; videos have none. */
+export function datesForPaths(paths: string[]): CaptureDate[] {
+  const base = Date.UTC(2026, 5, 14, 12, 0, 0) / 1000;
+  return paths.map((path, i) => {
+    if (path.toLowerCase().endsWith(".mov")) {
+      return { path, captured_at: null };
+    }
+    // Each later file in scan order is an hour newer → newest-first reverses name order.
+    return { path, captured_at: base + i * 3600 };
   });
 }

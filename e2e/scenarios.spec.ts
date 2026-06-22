@@ -125,4 +125,10 @@ test('preview scenario shows the selection grid and selects files', async ({ pag
   await page.getByRole('button', { name: /Select all/ }).click();
   await expect(page.getByText(/48 of 48 selected/)).toBeVisible();
   await expect(page.getByRole('button', { name: /Import 48 selected/ })).toBeEnabled();
+
+  // Sorting by capture date reorders the grid (newest first).
+  const firstTile = page.locator('button[aria-pressed]').first();
+  await expect(firstTile).toContainText('IMG_1000');
+  await page.getByRole('button', { name: /^Date$/ }).click();
+  await expect(firstTile).toContainText('IMG_1046');
 });

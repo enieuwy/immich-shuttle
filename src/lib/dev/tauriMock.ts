@@ -42,6 +42,8 @@ function handle(cmd: string, args: InvokeArgs): unknown {
       return fixtures.scanResultForScenario(scenario);
     case "preview_thumbnails":
       return fixtures.thumbsForPaths((args?.paths as string[]) ?? []);
+    case "preview_dates":
+      return fixtures.datesForPaths((args?.paths as string[]) ?? []);
     case "profile_validate":
     case "get_server_info":
       return fixtures.serverInfo;
