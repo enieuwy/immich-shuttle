@@ -67,39 +67,48 @@ patterns. To import an arbitrary selected subset:
 - **Invert to `--ban-file` patterns**: fragile for large/arbitrary selections.
 - **Per-file invocations**: many immich-go runs; loses batching/dedupe view.
 
-## Proposed v1 (revised after research)
-- **Thumbnails: `image` (JPEG/PNG/TIFF/WebP) + `rawler` (RAW embedded preview) +
-  `kamadak-exif` (orientation/date).** This covers the two dominant camera-card
-  formats — JPEG and RAW (incl. Canon) — with maintained pure-Rust libs and no
-  AGPL. **HEIC and video get a typed placeholder tile** (icon + extension + size).
-- **HEIC/video real thumbnails: deferred to a phase-2 bead** via OS-native
-  decoders (macOS ImageIO/`sips`, Windows WIC/AVFoundation) behind a trait, so we
-  avoid AGPL and bundled C entirely. Linux keeps placeholders for those two.
-- **Selection → import: symlink staging dir** (Decision B, confirmed).
-- Grid is **opt-in** (a "Preview" affordance on a scanned source), not forced, so
-  large cards stay fast by default.
+## Recommended architecture (after "native vs crates" review)
+A `Thumbnailer` trait with pluggable, per-platform backends — sequenced by
+value/effort so each dependency earns its keep.
 
-Accepted dependency cost: `image` (MIT/Apache) + `rawler` (LGPL-2.1, acceptable
-for this OSS app) + `kamadak-exif` (MIT/Apache). Document the LGPL component in
-the README/licensing notes.
+- **macOS backend (v1): OS built-ins, zero deps.** `sips` thumbnails
+  JPEG/PNG/TIFF/**HEIC/RAW**; `qlmanage -t` (Quick Look) thumbnails **video**.
+  Batched invocations + lazy (visible tiles only) + on-disk cache amortise the
+  subprocess cost. Full coverage on the primary platform, no crates, no copyleft.
+- **Portable Rust backend (v1): `image`** (MIT) for JPEG/PNG/TIFF/WebP on Windows
+  & Linux; `kamadak-exif` for orientation/date; placeholder tiles for the rest.
+- **Phase 2 (only on real demand):** `rawler` (LGPL-2.1) for RAW on Windows/Linux;
+  a Windows-native backend (WIC / `IShellItemImageFactory`) for HEIC/RAW/video.
+  Linux HEIC/video stay placeholders unless a freedesktop thumbnailer is present.
 
-## Proposed child beads
-1. `thumbnailer` service — for each `MediaFile`: JPEG/PNG/etc via `image`; RAW via
-   `rawler` embedded preview; orientation/date via `kamadak-exif`; placeholder
-   marker for HEIC/video. Downscale (~256px), cache to
-   `app-data/thumbnails/<sha1(path+mtime)>.jpg`. Bounded thread pool. Unit-tested.
+Why this split: on macOS the OS tools are broader and cheaper than any Rust crate,
+so the crates do **not** earn their keep there; off macOS, `image` is a cheap
+portable JPEG floor that does. `rawler` / Windows-native are deferred until there
+is evidence non-macOS users need RAW/HEIC — earning their keep on demand.
+
+## v1 scope
+- Thumbnails via the trait: macOS backend (full) + `image` backend (JPEG) + typed
+  placeholders. New deps: `image` + `kamadak-exif` (both MIT/Apache).
+- Selection → import: symlink staging dir (Decision B, confirmed).
+- Opt-in "Preview" affordance on a scanned source; lazy + cached; cancellable.
+
+## Child beads (v1)
+1. `Thumbnailer` trait + macOS backend (`sips`/`qlmanage`, batched, cached) +
+   `image` backend + placeholder markers. Cache to
+   `app-data/thumbnails/<sha1(path+mtime)>.jpg`. Unit-tested where feasible.
 2. Streaming command + `thumbnail-ready {path,cachePath,w,h,capture_date}` events;
    cancellable.
 3. `PreviewGrid.svelte` — virtualized grid, lazy thumbnails, per-tile checkbox,
    select all/none, live "N selected · M GB".
-4. `selection` store + wiring into the source/import flow.
+4. `selection` store + source/import wiring.
 5. Selection → import staging (symlink dir, hardlink/copy fallback) in `import_start`.
 6. Dev harness `preview` scenario + fixtures; vitest (selection) + e2e.
-7. (Phase 2, separate bead) HEIC + video thumbnails via OS-native decoders.
+
+## Phase 2 beads
+7. `rawler` RAW backend (Windows/Linux embedded-preview thumbnails).
+8. Windows-native backend (WIC / Shell thumbnail) for HEIC/RAW/video.
 
 ## Decisions
-- **A. Thumbnail coverage for v1:** *Recommended* — `image` + `rawler` (JPEG +
-  RAW), placeholders for HEIC/video, OS-native HEIC/video deferred to phase 2.
-  Alternatives: JPEG-only (drop `rawler`, simplest); or full bundled C now
-  (libheif/libraw/ffmpeg — heavy, not recommended). **← awaiting confirmation**
-- **B. Selection → import:** symlink staging dir. **← confirmed**
+- **A. Coverage/strategy:** trait-based hybrid — macOS-native (full) + portable
+  `image` (JPEG) in v1; `rawler` + Windows-native in phase 2. ← recommended
+- **B. Selection → import:** symlink staging dir. ← confirmed
