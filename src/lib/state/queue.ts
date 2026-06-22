@@ -23,6 +23,7 @@ type QueueState = {
   loading: boolean;
   error: string | null;
   rates: Record<string, { itemsPerSec: number; etaSeconds: number | null }>;
+  currentFiles: Record<string, string>;
 };
 
 const state = writable<QueueState>({
@@ -30,6 +31,7 @@ const state = writable<QueueState>({
   loading: false,
   error: null,
   rates: {},
+  currentFiles: {},
 });
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -39,6 +41,7 @@ type ImportProgressEvent = {
   job_id: string;
   progress?: ImportJob["progress"];
   parsed_progress?: ImportJob["progress"];
+  current_file?: string | null;
 };
 
 const firstSamples = new Map<string, { time: number; uploaded: number }>();
@@ -78,7 +81,16 @@ async function refreshJobs() {
   try {
     const jobs = await importListJobs();
     const rates = recomputeRates(jobs);
-    state.update((s) => ({ ...s, jobs, rates, error: null }));
+    const runningIds = new Set(jobs.filter((j) => j.status === "running").map((j) => j.id));
+    state.update((s) => ({
+      ...s,
+      jobs,
+      rates,
+      currentFiles: Object.fromEntries(
+        Object.entries(s.currentFiles).filter(([id]) => runningIds.has(id)),
+      ),
+      error: null,
+    }));
   } catch (error) {
     errorsState.addError("Could not refresh import queue.");
     state.update((s) => ({ ...s, error: error instanceof Error ? error.message : String(error) }));
@@ -111,7 +123,10 @@ export const queueState = {
             job.id === payload.job_id ? { ...job, status: "running", progress } : job,
           );
           const rates = recomputeRates(jobs);
-          return { ...s, jobs, rates };
+          const currentFiles = payload.current_file
+            ? { ...s.currentFiles, [payload.job_id]: payload.current_file }
+            : s.currentFiles;
+          return { ...s, jobs, rates, currentFiles };
         });
       }).then((unlisten) => {
         progressUnlisten = unlisten;

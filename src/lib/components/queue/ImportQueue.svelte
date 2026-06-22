@@ -157,6 +157,15 @@
               </div>
             {/if}
 
+            {#if job.status === "running" && $queueState.currentFiles[job.id]}
+              <p
+                class="truncate text-xs text-muted-foreground"
+                title={$queueState.currentFiles[job.id]}
+              >
+                Importing {$queueState.currentFiles[job.id]}
+              </p>
+            {/if}
+
             <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
               <span class="tabular-nums">Uploaded {job.progress.uploaded}/{job.progress.total}</span>
               <span aria-hidden="true" class="text-muted-foreground/50">·</span>
