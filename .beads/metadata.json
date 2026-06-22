@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "immich_shuttle",
+  "project_id": "136a3926-10a1-4403-b9d2-6fc01dc98a16"
+}
