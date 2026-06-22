@@ -146,7 +146,11 @@ export const queueState = {
       progressUnlisten = null;
     }
   },
-  async startImport() {
+  async startImport(overrides?: {
+    sourcePaths?: string[];
+    keepFiles?: boolean;
+    albumIds?: string[];
+  }) {
     const profile = get(activeProfile);
     const source = get(sourceState);
     const options = get(importOptionsState);
@@ -155,15 +159,16 @@ export const queueState = {
     if (!profile) {
       throw new Error("Select a profile before starting import.");
     }
-    if (source.selectedPaths.length === 0) {
+    const sourcePaths = overrides?.sourcePaths ?? source.selectedPaths;
+    if (sourcePaths.length === 0) {
       throw new Error("Select a source before starting import.");
     }
 
     await importStart({
       profile_id: profile.id,
-      source_paths: source.selectedPaths,
-      album_ids: albums.selectedAlbumIds,
-      keep_files: options.keepFiles,
+      source_paths: sourcePaths,
+      album_ids: overrides?.albumIds ?? albums.selectedAlbumIds,
+      keep_files: overrides?.keepFiles ?? options.keepFiles,
       stack_raw_jpeg: options.stackRawJpeg,
       stack_burst: options.stackBurst,
       date_range: options.dateRange,

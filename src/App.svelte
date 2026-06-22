@@ -15,6 +15,7 @@
   import ProfileManager from "$lib/components/profiles/ProfileManager.svelte";
   import ProfileSelector from "$lib/components/profiles/ProfileSelector.svelte";
   import SourcePicker from "$lib/components/source/SourcePicker.svelte";
+  import AutoImportBanner from "$lib/components/source/AutoImportBanner.svelte";
   import { Button } from "$lib/components/ui/button";
   import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "$lib/components/ui/dialog";
   import { Tabs, TabsList, TabsTrigger, TabsContent } from "$lib/components/ui/tabs";
@@ -80,6 +81,8 @@
   {#snippet actions()}
     <ThemeToggle />
   {/snippet}
+
+  <AutoImportBanner />
 
   <div class="grid grid-cols-1 gap-5 lg:grid-cols-2">
     <div class="flex flex-col gap-5">

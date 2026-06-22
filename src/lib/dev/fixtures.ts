@@ -17,7 +17,7 @@ import type {
   ServerInfo,
 } from "$lib/types";
 
-export type Scenario = "default" | "onboarding" | "importing" | "wipe" | "empty";
+export type Scenario = "default" | "onboarding" | "importing" | "wipe" | "empty" | "cardinsert";
 
 export const PRESET_PATH = "/Volumes/CANON_EOS/DCIM";
 

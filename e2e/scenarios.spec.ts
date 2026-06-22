@@ -89,3 +89,17 @@ test('parallel uploads input validates its range', async ({ page }) => {
 
   await captureScenario(page, 'concurrency');
 });
+
+test('card insert scenario surfaces the auto-import banner', async ({ page }) => {
+  await page.goto('/?scenario=cardinsert');
+
+  await expect(page.getByText(/Card detected/).first()).toBeVisible();
+  await captureScenario(page, 'cardinsert');
+
+  const importBtn = page.getByRole('button', { name: /^Import$/ });
+  await expect(importBtn).toBeVisible();
+
+  // Declining hides the banner.
+  await page.getByRole('button', { name: /Not now/ }).click();
+  await expect(page.getByText(/Card detected/)).toHaveCount(0);
+});

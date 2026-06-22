@@ -1,14 +1,18 @@
 <script lang="ts">
   import { onMount } from "svelte";
 
+  import { get } from "svelte/store";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open } from "@tauri-apps/plugin-dialog";
-  import { FolderOpen, FileImage, HardDrive, History, Loader2, X } from "@lucide/svelte";
+  import { FolderOpen, FileImage, HardDrive, History, Loader2, X, Zap } from "@lucide/svelte";
 
   import { sourceState } from "$lib/state/source";
+  import { autoImportState } from "$lib/state/auto-import";
   import { historySourceLastImport } from "$lib/api";
   import type { RemovableDevice } from "$lib/types";
+  import { Switch } from "$lib/components/ui/switch";
+  import { Label } from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
   import { Badge } from "$lib/components/ui/badge";
@@ -44,10 +48,14 @@
     let unlistenDevice: (() => void) | undefined;
     let unlistenDrop: (() => void) | undefined;
 
-    void sourceState.loadDevices();
+    void sourceState.loadDevices().then(() => {
+      autoImportState.observe(get(sourceState).detectedDevices);
+    });
     void listen<RemovableDevice[]>("device-changed", (event) => {
       if (Array.isArray(event.payload)) {
-        void sourceState.loadDevices();
+        void sourceState.loadDevices().then(() => {
+          autoImportState.observe(get(sourceState).detectedDevices);
+        });
       }
     }).then((fn) => {
       unlistenDevice = fn;
@@ -294,6 +302,27 @@
         {/if}
       </div>
     {/if}
+
+    <div class="flex items-center justify-between gap-3 rounded-lg border border-border/60 px-3 py-2.5">
+      <Label
+        for="auto-import-toggle"
+        class="flex min-w-0 flex-col items-start gap-0.5 cursor-pointer font-normal"
+      >
+        <span class="flex items-center gap-1.5 text-sm font-medium text-foreground">
+          <Zap class="h-3.5 w-3.5 text-primary" />
+          Auto-import on card insert
+        </span>
+        <span class="text-xs text-muted-foreground">
+          Offer a one-click import when a camera card with a DCIM folder is plugged in.
+        </span>
+      </Label>
+      <Switch
+        id="auto-import-toggle"
+        aria-label="Auto-import on card insert"
+        checked={$autoImportState.enabled}
+        onCheckedChange={(v) => autoImportState.setEnabled(v)}
+      />
+    </div>
 
     {#if $sourceState.error}
       <p class="text-sm text-destructive">{$sourceState.error}</p>

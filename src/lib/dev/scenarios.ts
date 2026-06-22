@@ -7,11 +7,19 @@
 import * as fixtures from "$lib/dev/fixtures";
 import type { Scenario } from "$lib/dev/fixtures";
 import { albumsState } from "$lib/state/albums";
+import { autoImportState } from "$lib/state/auto-import";
 import { importOptionsState } from "$lib/state/import-options";
 import { profilesState } from "$lib/state/profiles";
 import { sourceState } from "$lib/state/source";
 
-const SCENARIOS: readonly Scenario[] = ["default", "onboarding", "importing", "wipe", "empty"];
+const SCENARIOS: readonly Scenario[] = [
+  "default",
+  "onboarding",
+  "importing",
+  "wipe",
+  "empty",
+  "cardinsert",
+];
 
 export function getScenario(): Scenario {
   const raw = new URLSearchParams(window.location.search).get("scenario");
@@ -28,6 +36,17 @@ export async function seedStores(): Promise<void> {
   await profilesState.loadProfiles();
 
   if (scenario === "onboarding" || scenario === "empty") {
+    return;
+  }
+
+  if (scenario === "cardinsert") {
+    // Simulate a freshly-inserted DCIM card with auto-import enabled so the
+    // "card detected" banner renders. Events don't fire in preview, so drive
+    // the detector directly: baseline (empty) then the inserted device.
+    autoImportState._reset();
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([fixtures.devices[0]]);
     return;
   }
 
