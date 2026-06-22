@@ -1,13 +1,13 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { Play, FolderOpen, ListChecks, History } from "@lucide/svelte";
-  import { openLogsDir } from "$lib/api";
+  import { Play, FileText, ListChecks, History } from "@lucide/svelte";
 
   import AppLayout from "$lib/components/layout/AppLayout.svelte";
   import ThemeToggle from "$lib/components/layout/ThemeToggle.svelte";
   import AlbumSelector from "$lib/components/albums/AlbumSelector.svelte";
   import ErrorToast from "$lib/components/feedback/ErrorToast.svelte";
+  import LogViewer from "$lib/components/feedback/LogViewer.svelte";
   import ImportOptions from "$lib/components/import/ImportOptions.svelte";
   import ImportQueue from "$lib/components/queue/ImportQueue.svelte";
   import HistoryPanel from "$lib/components/queue/HistoryPanel.svelte";
@@ -22,6 +22,7 @@
   import { queueState } from "$lib/state/queue";
 
   let showManager = $state(false);
+  let showLogs = $state(false);
   let showOnboarding = $state(false);
   let importError = $state("");
 
@@ -31,15 +32,6 @@
       await queueState.startImport();
     } catch (error) {
       importError = error instanceof Error ? error.message : String(error);
-    }
-  }
-
-  async function openLogsFolder() {
-    importError = "";
-    try {
-      await openLogsDir();
-    } catch (error) {
-      importError = error instanceof Error ? error.message : "Could not open logs folder";
     }
   }
 
@@ -143,8 +135,8 @@
         {/if}
       </div>
       <div class="flex shrink-0 items-center gap-2">
-        <Button variant="ghost" size="sm" onclick={openLogsFolder}>
-          <FolderOpen class="size-4" /> Logs
+        <Button variant="ghost" size="sm" onclick={() => (showLogs = true)}>
+          <FileText class="size-4" /> Logs
         </Button>
         <Button size="sm" onclick={startImport}>
           <Play class="size-4" /> Start Import
@@ -163,6 +155,8 @@
     <ProfileManager onDone={() => (showManager = false)} />
   </DialogContent>
 </Dialog>
+
+<LogViewer bind:open={showLogs} />
 
 {#if showOnboarding}
   <OnboardingOverlay onDone={() => (showOnboarding = false)} />

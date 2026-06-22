@@ -81,6 +81,8 @@ function handle(cmd: string, args: InvokeArgs): unknown {
       return undefined;
     case "history_source_last_import":
       return scenario === "onboarding" || scenario === "empty" ? null : fixtures.lastImportMs;
+    case "get_recent_logs":
+      return scenario === "onboarding" || scenario === "empty" ? "" : fixtures.recentLogs;
     // Void commands: profile_delete, album_share_users, import_cancel, open_logs_dir, ...
     default:
       return undefined;

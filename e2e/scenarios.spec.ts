@@ -67,3 +67,13 @@ test('history tab lists past imports', async ({ page }) => {
 
   await captureScenario(page, 'history');
 });
+
+test('logs dialog shows recent activity', async ({ page }) => {
+  await page.goto('/?scenario=default');
+
+  await page.getByRole('button', { name: /^Logs$/ }).click();
+  await expect(page.getByText('Application logs')).toBeVisible();
+  await expect(page.getByText(/import_complete/).first()).toBeVisible();
+
+  await captureScenario(page, 'logs');
+});

@@ -37,6 +37,7 @@ pub fn run() {
             commands::users::users_list,
             commands::settings::get_server_info,
             commands::settings::get_logs_dir,
+            commands::settings::get_recent_logs,
             commands::settings::open_logs_dir
         ])
         .run(tauri::generate_context!())

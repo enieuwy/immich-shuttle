@@ -35,6 +35,11 @@ pub async fn get_logs_dir() -> Result<String, String> {
 }
 
 #[tauri::command]
+pub async fn get_recent_logs() -> Result<String, String> {
+    logs::read_recent("app.log", 500)
+}
+
+#[tauri::command]
 pub async fn open_logs_dir() -> Result<(), String> {
     let path = logs::logs_dir()?;
     tauri_plugin_opener::open_path(&path, None::<String>)

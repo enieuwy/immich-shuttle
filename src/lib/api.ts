@@ -106,6 +106,10 @@ export function openLogsDir(): Promise<void> {
   return invokeCommand<void>("open_logs_dir");
 }
 
+export function getRecentLogs(): Promise<string> {
+  return invokeCommand<string>("get_recent_logs");
+}
+
 export function scanSource(path: string): Promise<ScanResult> {
   return invokeCommand<ScanResult>("scan_source", { path });
 }

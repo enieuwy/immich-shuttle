@@ -211,3 +211,13 @@ export function jobsForScenario(scenario: Scenario): ImportJob[] {
 export function profilesForScenario(scenario: Scenario): Profile[] {
   return scenario === "onboarding" ? [] : profiles;
 }
+
+export const recentLogs = [
+  "2026-06-22 08:11:02 import_start job_id=job-2b1e8d44 paths=1 albums=1",
+  "2026-06-22 08:11:03 scan_complete photos=312 videos=0 size_mb=1840",
+  "2026-06-22 08:14:51 import_complete job_id=job-2b1e8d44 status=Completed uploaded=308 total=312 errors=0",
+  "2026-06-22 08:15:50 album_assign job_id=job-2b1e8d44 album=a-vacation assets=308 ok",
+  "2026-06-22 09:02:11 import_start job_id=job-9d0c5a17 paths=2 albums=0",
+  "2026-06-22 09:09:44 upload_error job_id=job-9d0c5a17 immich-go: connection reset by peer",
+  "2026-06-22 09:09:45 import_complete job_id=job-9d0c5a17 status=Failed uploaded=410 total=540 errors=130",
+].join("\n");

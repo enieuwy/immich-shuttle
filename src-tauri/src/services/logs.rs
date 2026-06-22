@@ -8,6 +8,21 @@ pub fn logs_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn tail_lines(content: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+pub fn read_recent(file_name: &str, max_lines: usize) -> Result<String, String> {
+    let path = logs_dir()?.join(file_name);
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let content = fs::read_to_string(&path).map_err(|e| format!("Could not read log file: {e}"))?;
+    Ok(tail_lines(&content, max_lines))
+}
+
 pub fn append_log(file_name: &str, line: &str) -> Result<(), String> {
     let path = logs_dir()?.join(file_name);
     let mut file = fs::OpenOptions::new()
@@ -36,4 +51,21 @@ pub fn rotate_recent_logs(max_files: usize) -> Result<(), String> {
         let _ = fs::remove_file(entry.path());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_lines;
+
+    #[test]
+    fn tail_lines_returns_recent_lines() {
+        let content = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10";
+
+        assert_eq!(tail_lines(content, 3), "8\n9\n10");
+    }
+
+    #[test]
+    fn tail_lines_returns_all_when_under_limit() {
+        assert_eq!(tail_lines("a\nb", 10), "a\nb");
+    }
 }
