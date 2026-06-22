@@ -112,4 +112,22 @@ describe("queueState", () => {
 
     expect(vi.mocked(api.importRetry)).toHaveBeenCalledWith("job-1");
   });
+
+  it("forwards selectFiles override as select_files to importStart", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+
+    await queueState.startImport({ selectFiles: ["/Volumes/SD/DCIM/IMG_1.JPG"] });
+
+    const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
+    expect(payload?.select_files).toEqual(["/Volumes/SD/DCIM/IMG_1.JPG"]);
+  });
 });

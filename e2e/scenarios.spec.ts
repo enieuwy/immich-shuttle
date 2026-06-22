@@ -113,3 +113,16 @@ test('failed import lists which files failed and why', async ({ page }) => {
 
   await captureScenario(page, 'file-errors');
 });
+
+test('preview scenario shows the selection grid and selects files', async ({ page }) => {
+  await page.goto('/?scenario=preview');
+
+  await expect(page.getByText('Preview & select').first()).toBeVisible();
+  await expect(page.getByText(/0 of 48 selected/)).toBeVisible();
+
+  await captureScenario(page, 'preview');
+
+  await page.getByRole('button', { name: /Select all/ }).click();
+  await expect(page.getByText(/48 of 48 selected/)).toBeVisible();
+  await expect(page.getByRole('button', { name: /Import 48 selected/ })).toBeEnabled();
+});

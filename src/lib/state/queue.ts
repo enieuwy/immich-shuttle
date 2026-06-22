@@ -150,6 +150,7 @@ export const queueState = {
     sourcePaths?: string[];
     keepFiles?: boolean;
     albumIds?: string[];
+    selectFiles?: string[];
   }) {
     const profile = get(activeProfile);
     const source = get(sourceState);
@@ -173,6 +174,7 @@ export const queueState = {
       stack_burst: options.stackBurst,
       date_range: options.dateRange,
       concurrent_tasks: options.concurrentTasks,
+      select_files: overrides?.selectFiles ?? null,
     });
     await refreshJobs();
   },

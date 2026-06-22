@@ -19,7 +19,7 @@ use crate::{
         immich_client::ImmichClient,
         keychain, logs, media_scanner, profile_store,
         sidecar_runner::{run_upload, SidecarResult, UploadRequest},
-        url_resolver, wipe,
+        staging, url_resolver, wipe,
     },
 };
 
@@ -106,12 +106,19 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
 
     let source_paths = input.source_paths.clone();
     let record_source_paths = source_paths.clone();
-    let keep_files = input.keep_files;
+    let keep_files = input.keep_files
+        || input
+            .select_files
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
     let stack_raw_jpeg = input.stack_raw_jpeg;
     let stack_burst = input.stack_burst;
     let date_range = input.date_range.clone();
     let concurrent_tasks = input.concurrent_tasks;
     let album_ids = input.album_ids.clone();
+    let select_files = input.select_files.clone().unwrap_or_default();
+    let staging_requested = !select_files.is_empty();
     let started_at = now_ms();
     let job_id_clone = job_id.clone();
     let server_url = url_resolver::resolve_server_url(&profile).await;
@@ -127,11 +134,43 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
 
     tauri::async_runtime::spawn(async move {
         let api_key_for_album_assignment = api_key_clone.clone();
+        let staging_dir = if staging_requested {
+            match staging::create_staging_dir(&select_files) {
+                Ok(dir) => Some(dir),
+                Err(e) => {
+                    if let Ok(mut running) = RUNNING_IMPORTS.lock() {
+                        running.remove(&job_id_clone);
+                    }
+                    let _ = set_job(ImportJob {
+                        id: job_id_clone.clone(),
+                        status: JobStatus::Failed,
+                        progress: JobProgress {
+                            total: 0,
+                            uploaded: 0,
+                            duplicates: 0,
+                            errors: 1,
+                        },
+                        error: Some(format!("Could not stage selected files: {e}")),
+                        summary: None,
+                        awaiting_wipe_confirmation: false,
+                        pending_wipe_count: 0,
+                        file_errors: Vec::new(),
+                    });
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let upload_paths: Vec<String> = match &staging_dir {
+            Some(dir) => vec![dir.to_string_lossy().to_string()],
+            None => source_paths.clone(),
+        };
         let request = UploadRequest {
             job_id: job_id_clone.clone(),
             server_url,
             api_key: api_key_clone,
-            source_path: source_paths[0].clone(),
+            source_path: upload_paths[0].clone(),
             log_path,
             device_uuid,
             cancel_flag: cancel_flag.clone(),
@@ -154,7 +193,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let mut request = request;
         let mut upload_error: Option<String> = None;
 
-        for path in source_paths {
+        for path in upload_paths {
             request.source_path = path;
             match run_upload(app_clone.clone(), request.clone()).await {
                 Ok(run) => {
@@ -178,6 +217,10 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                     break;
                 }
             }
+        }
+
+        if let Some(dir) = &staging_dir {
+            staging::cleanup_staging_dir(dir);
         }
 
         let result = if let Some(err) = upload_error {

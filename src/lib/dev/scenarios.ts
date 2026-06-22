@@ -9,6 +9,7 @@ import type { Scenario } from "$lib/dev/fixtures";
 import { albumsState } from "$lib/state/albums";
 import { autoImportState } from "$lib/state/auto-import";
 import { importOptionsState } from "$lib/state/import-options";
+import { previewState } from "$lib/state/preview";
 import { profilesState } from "$lib/state/profiles";
 import { sourceState } from "$lib/state/source";
 
@@ -19,6 +20,7 @@ const SCENARIOS: readonly Scenario[] = [
   "wipe",
   "empty",
   "cardinsert",
+  "preview",
 ];
 
 export function getScenario(): Scenario {
@@ -57,5 +59,9 @@ export async function seedStores(): Promise<void> {
 
   if (scenario === "wipe") {
     importOptionsState.setKeepFiles(false);
+  }
+
+  if (scenario === "preview") {
+    previewState.open();
   }
 }

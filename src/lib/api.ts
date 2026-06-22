@@ -11,6 +11,7 @@ import type {
   RemovableDevice,
   ScanResult,
   ServerInfo,
+  ThumbResult,
 } from "./types";
 
 async function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -116,6 +117,10 @@ export function scanSource(path: string): Promise<ScanResult> {
 
 export function scanSources(paths: string[]): Promise<ScanResult> {
   return invokeCommand<ScanResult>("scan_sources", { paths });
+}
+
+export function previewThumbnails(paths: string[]): Promise<ThumbResult[]> {
+  return invokeCommand<ThumbResult[]>("preview_thumbnails", { paths });
 }
 
 export function historyList(): Promise<ImportRecord[]> {

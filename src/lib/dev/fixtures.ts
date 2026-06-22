@@ -11,13 +11,22 @@ import type {
   AlbumUser,
   ImportJob,
   ImportRecord,
+  MediaFile,
   Profile,
   RemovableDevice,
   ScanResult,
   ServerInfo,
+  ThumbResult,
 } from "$lib/types";
 
-export type Scenario = "default" | "onboarding" | "importing" | "wipe" | "empty" | "cardinsert";
+export type Scenario =
+  | "default"
+  | "onboarding"
+  | "importing"
+  | "wipe"
+  | "empty"
+  | "cardinsert"
+  | "preview";
 
 export const PRESET_PATH = "/Volumes/CANON_EOS/DCIM";
 
@@ -230,3 +239,58 @@ export const recentLogs = [
   "2026-06-22 09:09:44 upload_error job_id=job-9d0c5a17 immich-go: connection reset by peer",
   "2026-06-22 09:09:45 import_complete job_id=job-9d0c5a17 status=Failed uploaded=410 total=540 errors=130",
 ].join("\n");
+
+const PREVIEW_SPECS: { ext: string; video: boolean }[] = [
+  { ext: ".jpg", video: false },
+  { ext: ".jpg", video: false },
+  { ext: ".jpg", video: false },
+  { ext: ".cr3", video: false },
+  { ext: ".heic", video: false },
+  { ext: ".mov", video: true },
+];
+
+export const previewFiles: MediaFile[] = Array.from({ length: 48 }, (_, i) => {
+  const spec = PREVIEW_SPECS[i % PREVIEW_SPECS.length];
+  const n = String(1000 + i);
+  return {
+    path: `/Volumes/CANON_EOS/DCIM/100CANON/IMG_${n}${spec.ext}`,
+    name: `IMG_${n}${spec.ext}`,
+    extension: spec.ext,
+    size_bytes: (spec.video ? 84 : 6) * 1024 * 1024,
+    is_video: spec.video,
+  };
+});
+
+export function scanResultForScenario(scenario: Scenario): ScanResult {
+  if (scenario !== "preview") {
+    return scanResult;
+  }
+  return {
+    files: previewFiles,
+    total_size_bytes: previewFiles.reduce((sum, f) => sum + f.size_bytes, 0),
+    photo_count: previewFiles.filter((f) => !f.is_video).length,
+    video_count: previewFiles.filter((f) => f.is_video).length,
+    skipped_unreadable: 0,
+  };
+}
+
+function thumbDataUrl(path: string): string {
+  const seed = [...path].reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+  const hue = (seed * 47) % 360;
+  const svg =
+    `<svg xmlns='http://www.w3.org/2000/svg' width='120' height='80'>` +
+    `<rect width='120' height='80' fill='hsl(${hue},55%,55%)'/></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
+/** Mock backend: renders thumbnails for JPEG/PNG, placeholders for RAW/HEIC/video. */
+export function thumbsForPaths(paths: string[]): ThumbResult[] {
+  return paths.map((path) => {
+    const lower = path.toLowerCase();
+    const renderable = lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png");
+    if (!renderable) {
+      return { path, data_url: null, width: 0, height: 0 };
+    }
+    return { path, data_url: thumbDataUrl(path), width: 120, height: 80 };
+  });
+}

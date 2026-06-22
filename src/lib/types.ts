@@ -56,6 +56,7 @@ export interface ImportInput {
   stack_burst: boolean;
   date_range: string | null;
   concurrent_tasks: number | null;
+  select_files?: string[] | null;
 }
 
 export interface FileError {
@@ -110,4 +111,14 @@ export interface ImportRecord {
   uploaded: number;
   duplicates: number;
   errors: number;
+}
+
+export interface ThumbResult {
+  /** Source file path (echoed back). */
+  path: string;
+  /** Data URL of the generated thumbnail, or null when no backend could render it. */
+  data_url: string | null;
+  /** Thumbnail pixel dimensions; 0 when this is a placeholder. */
+  width: number;
+  height: number;
 }

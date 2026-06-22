@@ -5,10 +5,12 @@
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open } from "@tauri-apps/plugin-dialog";
-  import { FolderOpen, FileImage, HardDrive, History, Loader2, X, Zap } from "@lucide/svelte";
+  import { FolderOpen, FileImage, HardDrive, History, LayoutGrid, Loader2, X, Zap } from "@lucide/svelte";
 
   import { sourceState } from "$lib/state/source";
   import { autoImportState } from "$lib/state/auto-import";
+  import { previewState } from "$lib/state/preview";
+  import { selectionState } from "$lib/state/selection";
   import { historySourceLastImport } from "$lib/api";
   import type { RemovableDevice } from "$lib/types";
   import { Switch } from "$lib/components/ui/switch";
@@ -120,6 +122,13 @@
     manualPath = "";
   }
 
+  function openPreview() {
+    const files = $sourceState.scanResult?.files ?? [];
+    // Default to everything selected; the grid is for de-selecting what you don't want.
+    selectionState.selectOnly(files.map((f) => f.path));
+    previewState.open();
+  }
+
   function sourceLabel(paths: string[]): string {
     if (paths.length === 0) return "";
     if (paths.length === 1) return paths[0];
@@ -216,6 +225,11 @@
                 {fmtSize($sourceState.scanResult.total_size_bytes)} total
               </span>
             </div>
+            {#if $sourceState.scanResult.files.length > 0}
+              <Button variant="outline" size="sm" class="mt-1 w-fit" onclick={openPreview}>
+                <LayoutGrid class="h-3.5 w-3.5" /> Preview &amp; select
+              </Button>
+            {/if}
             {#if $sourceState.scanResult.skipped_unreadable > 0}
               <p class="text-xs text-muted-foreground">
                 {$sourceState.scanResult.skipped_unreadable} unreadable skipped

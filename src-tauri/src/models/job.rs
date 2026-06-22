@@ -28,6 +28,9 @@ pub struct ImportInput {
     pub stack_burst: bool,
     pub date_range: Option<String>,
     pub concurrent_tasks: Option<u32>,
+    /// When set, import only these files (staged into a temp dir); forces keep_files.
+    #[serde(default)]
+    pub select_files: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

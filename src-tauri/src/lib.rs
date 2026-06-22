@@ -33,6 +33,7 @@ pub fn run() {
             commands::history::history_source_last_import,
             commands::import::scan_source,
             commands::import::scan_sources,
+            commands::preview::preview_thumbnails,
             commands::devices::devices_list_removable,
             commands::users::users_list,
             commands::settings::get_server_info,
