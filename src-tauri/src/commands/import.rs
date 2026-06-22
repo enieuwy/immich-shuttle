@@ -31,6 +31,13 @@ static RUNNING_IMPORTS: Lazy<Mutex<HashMap<String, Arc<AtomicBool>>>> =
 static JOB_INPUTS: Lazy<Mutex<HashMap<String, ImportInput>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn get_job(job_id: &str) -> Result<ImportJob, String> {
     let jobs = JOBS
         .lock()
@@ -91,10 +98,12 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     )?;
 
     let source_paths = input.source_paths.clone();
+    let record_source_paths = source_paths.clone();
     let keep_files = input.keep_files;
     let stack_raw_jpeg = input.stack_raw_jpeg;
     let stack_burst = input.stack_burst;
     let album_ids = input.album_ids.clone();
+    let started_at = now_ms();
     let job_id_clone = job_id.clone();
     let server_url = url_resolver::resolve_server_url(&profile).await;
     let api_key_clone = api_key;
@@ -311,7 +320,28 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             ),
         );
         let _ = logs::rotate_recent_logs(5);
-        let _ = set_job(update);
+        let _ = set_job(update.clone());
+        let status = match &update.status {
+            JobStatus::Completed => "completed",
+            JobStatus::Cancelled => "cancelled",
+            _ => "failed",
+        };
+        crate::services::store::append_history(
+            &app_clone,
+            crate::models::history::ImportRecord {
+                id: update.id.clone(),
+                started_at,
+                finished_at: now_ms(),
+                profile_id: profile.id.clone(),
+                source_paths: record_source_paths.clone(),
+                album_ids: album_ids.clone(),
+                status: status.to_string(),
+                total: update.progress.total,
+                uploaded: update.progress.uploaded,
+                duplicates: update.progress.duplicates,
+                errors: update.progress.errors,
+            },
+        );
     });
 
     Ok(job_id)

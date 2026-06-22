@@ -56,3 +56,14 @@ test('empty scenario shows source and queue empty states', async ({ page }) => {
 
   await captureScenario(page, 'empty');
 });
+
+test('history tab lists past imports', async ({ page }) => {
+  await page.goto('/?scenario=default');
+
+  await page.getByRole('tab', { name: /History/ }).click();
+  await expect(page.getByText('Import history').first()).toBeVisible();
+  await expect(page.getByText(/uploaded/).first()).toBeVisible();
+  await expect(page.getByText('Clear history').first()).toBeVisible();
+
+  await captureScenario(page, 'history');
+});

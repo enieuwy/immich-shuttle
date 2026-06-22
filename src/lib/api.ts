@@ -5,6 +5,7 @@ import type {
   AlbumUser,
   ImportInput,
   ImportJob,
+  ImportRecord,
   Profile,
   ProfileInput,
   RemovableDevice,
@@ -111,4 +112,16 @@ export function scanSource(path: string): Promise<ScanResult> {
 
 export function scanSources(paths: string[]): Promise<ScanResult> {
   return invokeCommand<ScanResult>("scan_sources", { paths });
+}
+
+export function historyList(): Promise<ImportRecord[]> {
+  return invokeCommand<ImportRecord[]>("history_list");
+}
+
+export function historyClear(): Promise<void> {
+  return invokeCommand<void>("history_clear");
+}
+
+export function historySourceLastImport(sourcePaths: string[]): Promise<number | null> {
+  return invokeCommand<number | null>("history_source_last_import", { sourcePaths });
 }

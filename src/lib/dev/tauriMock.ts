@@ -75,6 +75,12 @@ function handle(cmd: string, args: InvokeArgs): unknown {
       return fixtures
         .jobsForScenario(scenario)
         .filter((job) => job.status === "running" || job.status === "pending");
+    case "history_list":
+      return fixtures.historyForScenario(scenario);
+    case "history_clear":
+      return undefined;
+    case "history_source_last_import":
+      return scenario === "onboarding" || scenario === "empty" ? null : fixtures.lastImportMs;
     // Void commands: profile_delete, album_share_users, import_cancel, open_logs_dir, ...
     default:
       return undefined;

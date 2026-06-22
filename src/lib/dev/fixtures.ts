@@ -10,6 +10,7 @@ import type {
   AlbumShareLink,
   AlbumUser,
   ImportJob,
+  ImportRecord,
   Profile,
   RemovableDevice,
   ScanResult,
@@ -89,6 +90,67 @@ export const scanResult: ScanResult = {
 };
 
 export const logsDir = "/Users/ada/Library/Logs/immich-shuttle";
+
+export const lastImportMs = Date.now() - 1000 * 60 * 60 * 2;
+
+export const historyRecords: ImportRecord[] = [
+  {
+    id: "job-2b1e8d44",
+    started_at: lastImportMs,
+    finished_at: lastImportMs + 1000 * 60 * 4,
+    profile_id: "p-home",
+    source_paths: [PRESET_PATH],
+    album_ids: ["a-vacation"],
+    status: "completed",
+    total: 312,
+    uploaded: 308,
+    duplicates: 4,
+    errors: 0,
+  },
+  {
+    id: "job-9d0c5a17",
+    started_at: Date.now() - 1000 * 60 * 60 * 26,
+    finished_at: Date.now() - 1000 * 60 * 60 * 26 + 1000 * 60 * 9,
+    profile_id: "p-home",
+    source_paths: ["/Volumes/Untitled/Trip", "/Volumes/CANON_EOS/DCIM"],
+    album_ids: [],
+    status: "failed",
+    total: 540,
+    uploaded: 410,
+    duplicates: 0,
+    errors: 130,
+  },
+  {
+    id: "job-7a1f3c02",
+    started_at: Date.now() - 1000 * 60 * 60 * 24 * 5,
+    finished_at: Date.now() - 1000 * 60 * 60 * 24 * 5 + 1000 * 60 * 2,
+    profile_id: "p-studio",
+    source_paths: ["/Users/ada/Pictures/Lightroom Export"],
+    album_ids: ["a-wedding", "a-family"],
+    status: "completed",
+    total: 1203,
+    uploaded: 1203,
+    duplicates: 0,
+    errors: 0,
+  },
+  {
+    id: "job-5c8e1b90",
+    started_at: Date.now() - 1000 * 60 * 60 * 24 * 9,
+    finished_at: Date.now() - 1000 * 60 * 60 * 24 * 9 + 1000 * 30,
+    profile_id: "p-home",
+    source_paths: [PRESET_PATH],
+    album_ids: [],
+    status: "cancelled",
+    total: 0,
+    uploaded: 0,
+    duplicates: 0,
+    errors: 0,
+  },
+];
+
+export function historyForScenario(scenario: Scenario): ImportRecord[] {
+  return scenario === "onboarding" || scenario === "empty" ? [] : historyRecords;
+}
 
 const completedJob: ImportJob = {
   id: "job-2b1e8d44",

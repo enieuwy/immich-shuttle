@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { Play, FolderOpen } from "@lucide/svelte";
+  import { Play, FolderOpen, ListChecks, History } from "@lucide/svelte";
   import { openLogsDir } from "$lib/api";
 
   import AppLayout from "$lib/components/layout/AppLayout.svelte";
@@ -10,12 +10,14 @@
   import ErrorToast from "$lib/components/feedback/ErrorToast.svelte";
   import ImportOptions from "$lib/components/import/ImportOptions.svelte";
   import ImportQueue from "$lib/components/queue/ImportQueue.svelte";
+  import HistoryPanel from "$lib/components/queue/HistoryPanel.svelte";
   import OnboardingOverlay from "$lib/components/onboarding/OnboardingOverlay.svelte";
   import ProfileManager from "$lib/components/profiles/ProfileManager.svelte";
   import ProfileSelector from "$lib/components/profiles/ProfileSelector.svelte";
   import SourcePicker from "$lib/components/source/SourcePicker.svelte";
   import { Button } from "$lib/components/ui/button";
   import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "$lib/components/ui/dialog";
+  import { Tabs, TabsList, TabsTrigger, TabsContent } from "$lib/components/ui/tabs";
   import { getProfilesSnapshot, profilesState } from "$lib/state/profiles";
   import { queueState } from "$lib/state/queue";
 
@@ -98,7 +100,22 @@
   </div>
 
   <div class="mt-5">
-    <ImportQueue />
+    <Tabs value="queue">
+      <TabsList>
+        <TabsTrigger value="queue">
+          <ListChecks class="size-4" /> Queue
+        </TabsTrigger>
+        <TabsTrigger value="history">
+          <History class="size-4" /> History
+        </TabsTrigger>
+      </TabsList>
+      <TabsContent value="queue">
+        <ImportQueue />
+      </TabsContent>
+      <TabsContent value="history">
+        <HistoryPanel />
+      </TabsContent>
+    </Tabs>
   </div>
 
   {#snippet footer()}

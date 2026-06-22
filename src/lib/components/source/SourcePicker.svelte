@@ -4,9 +4,10 @@
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open } from "@tauri-apps/plugin-dialog";
-  import { FolderOpen, FileImage, HardDrive, Loader2, X } from "@lucide/svelte";
+  import { FolderOpen, FileImage, HardDrive, History, Loader2, X } from "@lucide/svelte";
 
   import { sourceState } from "$lib/state/source";
+  import { historySourceLastImport } from "$lib/api";
   import type { RemovableDevice } from "$lib/types";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
@@ -19,6 +20,25 @@
   } from "$lib/components/ui/card";
 
   let manualPath = $state("");
+
+  let lastImportedAt = $state<number | null>(null);
+
+  $effect(() => {
+    const paths = $sourceState.selectedPaths;
+    if (paths.length === 0) {
+      lastImportedAt = null;
+      return;
+    }
+    let cancelled = false;
+    void historySourceLastImport(paths).then((ms) => {
+      if (!cancelled) {
+        lastImportedAt = ms;
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  });
 
   onMount(() => {
     let unlistenDevice: (() => void) | undefined;
@@ -113,6 +133,15 @@
     if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
     return `${Math.round(mb)} MB`;
   }
+
+  function fmtRelative(ms: number): string {
+    const mins = Math.round((Date.now() - ms) / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.round(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.round(hours / 24)}d ago`;
+  }
 </script>
 
 <Card>
@@ -185,6 +214,16 @@
               </p>
             {/if}
           {/if}
+            {#if lastImportedAt !== null}
+              <p
+                class="flex items-center gap-1.5 text-xs text-muted-foreground"
+                title="immich-go skips files already on the server by checksum"
+              >
+                <History class="h-3.5 w-3.5 shrink-0" />
+                Imported from here {fmtRelative(lastImportedAt)} — already-uploaded files
+                are skipped automatically
+              </p>
+            {/if}
         </div>
         <Button
           variant="ghost"

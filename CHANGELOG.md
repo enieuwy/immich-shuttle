@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Import history & persistence
+- Persist import history across app restarts in a JSON store under the app data dir (was in-memory only); new `history_list`/`history_clear` commands
+- New History tab beside the queue listing past imports with status, timestamp, source, and per-import stats
+- Per-source "last imported" indicator in the source picker; relies on immich-go's server-side checksum dedupe to skip already-uploaded files on repeat imports (verified: immich-go v0.31.0 has no timestamp-since filter, so no misleading "only new" toggle was added)
+
 ### Job lifecycle & queue
 - Retry failed imports, dismiss individual finished jobs, and clear all finished jobs (new `import_retry`/`import_dismiss`/`import_clear_finished` commands; the original input is persisted per job for retry)
 - Live throughput (items/sec), ETA, and the current/last file being imported on running jobs

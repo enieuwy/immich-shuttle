@@ -89,3 +89,17 @@ export interface ScanResult {
   video_count: number;
   skipped_unreadable: number;
 }
+
+export interface ImportRecord {
+  id: string;
+  started_at: number;
+  finished_at: number;
+  profile_id: string;
+  source_paths: string[];
+  album_ids: string[];
+  status: "completed" | "failed" | "cancelled";
+  total: number;
+  uploaded: number;
+  duplicates: number;
+  errors: number;
+}

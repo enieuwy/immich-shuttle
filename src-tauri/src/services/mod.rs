@@ -6,5 +6,6 @@ pub mod media_scanner;
 pub mod profile_store;
 pub mod sidecar_runner;
 pub mod stdout_parser;
+pub mod store;
 pub mod url_resolver;
 pub mod wipe;
