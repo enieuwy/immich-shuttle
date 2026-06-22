@@ -125,6 +125,10 @@
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
   }
+  /* Overlay title bar (macOS): reserve space so the header clears the traffic lights. */
+  .titlebar-overlay [data-titlebar] {
+    padding-left: 5rem;
+  }
   /* Quiet, theme-aware scrollbars so dense lists don't feel heavy. */
   * {
     scrollbar-width: thin;

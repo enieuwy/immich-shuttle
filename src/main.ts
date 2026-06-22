@@ -12,6 +12,13 @@ if (designPreview) {
   (await import("$lib/dev/preview")).installTauriMock();
 }
 
+// Real macOS Tauri window uses an overlay title bar (traffic lights only); flag
+// it so the header can reserve space for the lights. Never set in the browser
+// preview, where there is no native title bar.
+if (!designPreview && navigator.userAgent.includes("Mac")) {
+  document.documentElement.classList.add("titlebar-overlay");
+}
+
 const app = mount(App, {
   target: document.getElementById("app")!,
 });
