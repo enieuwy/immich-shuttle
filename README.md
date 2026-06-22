@@ -95,11 +95,14 @@ Tauri builds.
 
 ### Verify
 
+Run the full suite that CI runs (svelte-check, Vitest, rustfmt, Clippy, `cargo test`, build, Playwright e2e):
+
 ```bash
-npm run check
-npm run build
-cargo build --manifest-path src-tauri/Cargo.toml
+npm run verify        # full local mirror of CI
+npm run verify:fast   # quick subset: svelte-check + Vitest + rustfmt
 ```
+
+Git hooks (installed automatically on `npm install` via `core.hooksPath`) run these for you: a fast **pre-commit** (`verify:fast`) and a full **pre-push** (`verify`), so a clean local run means green CI. Bypass once with `git commit --no-verify` / `git push --no-verify`. The pre-push e2e step needs the Playwright browser once: `npx playwright install chromium`.
 
 ## Contributing
 

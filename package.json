@@ -13,7 +13,10 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-check --tsconfig ./tsconfig.json --watch",
     "test": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "verify:fast": "npm run check && npm run test && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check",
+    "verify": "npm run verify:fast && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings && cargo test --manifest-path src-tauri/Cargo.toml --lib && npm run build && npm run e2e",
+    "prepare": "git config core.hooksPath .githooks 2>/dev/null || true"
   },
   "license": "MIT",
   "dependencies": {

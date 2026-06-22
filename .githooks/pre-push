@@ -1,0 +1,15 @@
+#!/bin/sh
+#
+# Full pre-push gate: mirrors what CI runs (svelte-check, vitest, rustfmt,
+# clippy -D warnings, cargo test, vite build, Playwright e2e) so a green local
+# run means a green CI run. The cross-platform `tauri build` bundles are left
+# to CI.
+#
+# First run needs the Playwright browser: npx playwright install chromium
+# Bypass once with:  git push --no-verify
+#
+set -e
+
+echo "▶ pre-push: full verify (this mirrors CI; takes a couple of minutes)"
+npm run --silent verify
+echo "✓ pre-push passed — CI should be green"

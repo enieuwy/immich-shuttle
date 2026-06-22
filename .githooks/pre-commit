@@ -1,0 +1,13 @@
+#!/bin/sh
+#
+# Fast pre-commit gate: mirrors CI's cheap checks so most red builds are caught
+# before they leave your machine. Heavier checks (clippy, rust + e2e tests,
+# build) run on `git push` via the pre-push hook.
+#
+# Bypass once with:  git commit --no-verify
+#
+set -e
+
+echo "▶ pre-commit: svelte-check, vitest, rustfmt"
+npm run --silent verify:fast
+echo "✓ pre-commit passed"
