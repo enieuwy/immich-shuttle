@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Safety
+- Verify before wipe: when deleting source files after an import, each file's SHA-1 is checked against the Immich server (`POST /api/assets/bulk-upload-check`) and only files the server confirms it holds are deleted; unverified files are kept. If verification can't run (server unreachable), all files are kept.
+
 ### Import history & persistence
 - Persist import history across app restarts in a JSON store under the app data dir (was in-memory only); new `history_list`/`history_clear` commands
 - New History tab beside the queue listing past imports with status, timestamp, source, and per-import stats

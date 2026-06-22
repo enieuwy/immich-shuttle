@@ -24,12 +24,18 @@ use crate::{
 };
 
 static JOBS: Lazy<Mutex<Vec<ImportJob>>> = Lazy::new(|| Mutex::new(Vec::new()));
-static PENDING_WIPE: Lazy<Mutex<HashMap<String, Vec<String>>>> =
+static PENDING_WIPE: Lazy<Mutex<HashMap<String, PendingWipe>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static RUNNING_IMPORTS: Lazy<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static JOB_INPUTS: Lazy<Mutex<HashMap<String, ImportInput>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+struct PendingWipe {
+    paths: Vec<String>,
+    server_url: String,
+    api_key: String,
+}
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -243,7 +249,14 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                     None
                 } else if !keep_files {
                     if let Ok(mut pending) = PENDING_WIPE.lock() {
-                        pending.insert(job_id_clone.clone(), completed_asset_paths.clone());
+                        pending.insert(
+                            job_id_clone.clone(),
+                            PendingWipe {
+                                paths: completed_asset_paths.clone(),
+                                server_url: profile.server_url.clone(),
+                                api_key: api_key_for_album_assignment.clone(),
+                            },
+                        );
                     } else {
                         let _ = logs::append_log(
                             "app.log",
@@ -355,29 +368,68 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
         return Err(format!("Job does not need wipe confirmation: {job_id}"));
     }
 
-    let files = PENDING_WIPE
+    let pending = PENDING_WIPE
         .lock()
         .map_err(|_| "Could not lock pending wipe state".to_string())?
         .remove(&job_id)
         .ok_or_else(|| format!("No pending wipe payload for job: {job_id}"))?;
 
     if confirm {
-        let wipe_result = wipe::wipe_files(&files);
-        let kept = wipe_result.failed + wipe_result.skipped;
-        job.summary = Some(format!(
-            "Deleted {} files. {} files kept (not uploaded or failed).",
-            wipe_result.deleted, kept
-        ));
-        job.error = if wipe_result.failed > 0 {
-            Some(format!(
-                "Wipe completed with errors: deleted={}, failed={}, skipped={}",
-                wipe_result.deleted, wipe_result.failed, wipe_result.skipped
-            ))
-        } else {
-            None
-        };
+        match wipe::verify_uploaded(&pending.server_url, &pending.api_key, &pending.paths).await {
+            Ok(verified) => {
+                let wipe_result = wipe::wipe_files(&verified.confirmed);
+                let kept = wipe_result.failed + wipe_result.skipped + verified.unverified.len();
+                job.summary = Some(format!(
+                    "Verified {} of {} files on the server and deleted {}. Kept {} ({} not found on server).",
+                    verified.confirmed.len(),
+                    pending.paths.len(),
+                    wipe_result.deleted,
+                    kept,
+                    verified.unverified.len(),
+                ));
+                job.error = if wipe_result.failed > 0 {
+                    Some(format!(
+                        "Wipe completed with errors: deleted={}, failed={}, skipped={}",
+                        wipe_result.deleted, wipe_result.failed, wipe_result.skipped
+                    ))
+                } else if !verified.unverified.is_empty() {
+                    Some(format!(
+                        "{} file(s) were not found on the server and were kept for safety.",
+                        verified.unverified.len()
+                    ))
+                } else {
+                    None
+                };
+                let _ = logs::append_log(
+                    "app.log",
+                    &format!(
+                        "import_wipe_verified job_id={} confirmed={} unverified={} deleted={}",
+                        job_id,
+                        verified.confirmed.len(),
+                        verified.unverified.len(),
+                        wipe_result.deleted
+                    ),
+                );
+            }
+            Err(err) => {
+                job.summary = Some(format!(
+                    "Could not verify uploads with the server. All {} files were kept.",
+                    pending.paths.len()
+                ));
+                job.error = Some(format!(
+                    "Wipe verification failed: {err}. Source files kept for safety."
+                ));
+                let _ = logs::append_log(
+                    "app.log",
+                    &format!("import_wipe_verify_failed job_id={job_id} error={err}"),
+                );
+            }
+        }
     } else {
-        job.summary = Some(format!("Wipe skipped by user. {} files kept.", files.len()));
+        job.summary = Some(format!(
+            "Wipe skipped by user. {} files kept.",
+            pending.paths.len()
+        ));
     }
 
     job.awaiting_wipe_confirmation = false;
@@ -387,10 +439,10 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
     let _ = logs::append_log(
         "app.log",
         &format!(
-            "import_wipe_confirmed job_id={} confirm={} remaining_pending={}",
+            "import_wipe_confirmed job_id={} confirm={} pending_count={}",
             job_id,
             confirm,
-            files.len()
+            pending.paths.len()
         ),
     );
 

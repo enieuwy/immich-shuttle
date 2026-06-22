@@ -271,6 +271,43 @@ impl ImmichClient {
         .await?;
         Ok(())
     }
+
+    /// Checks which of the given (id, sha1-hex-checksum) items already exist on
+    /// the server. Returns the set of `id`s the server reports as duplicates,
+    /// i.e. assets it already holds. Used to verify uploads before wiping the
+    /// local source files.
+    pub async fn bulk_upload_check(
+        &self,
+        items: &[(String, String)],
+    ) -> Result<std::collections::HashSet<String>, String> {
+        let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for chunk in items.chunks(500) {
+            let assets: Vec<Value> = chunk
+                .iter()
+                .map(|(id, checksum)| json!({ "id": id, "checksum": checksum }))
+                .collect();
+            let value = self
+                .request_json(
+                    Method::POST,
+                    "/assets/bulk-upload-check",
+                    Some(json!({ "assets": assets })),
+                )
+                .await?;
+            let results = value
+                .get("results")
+                .and_then(|r| r.as_array())
+                .ok_or_else(|| "bulk-upload-check returned no results".to_string())?;
+            for result in results {
+                let id = result.get("id").and_then(|v| v.as_str());
+                let action = result.get("action").and_then(|v| v.as_str());
+                if let (Some(id), Some("reject")) = (id, action) {
+                    // action=reject (reason=duplicate) => the server already has it.
+                    present.insert(id.to_string());
+                }
+            }
+        }
+        Ok(present)
+    }
 }
 
 pub fn normalize_server_url(value: &str) -> String {

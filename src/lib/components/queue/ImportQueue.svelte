@@ -183,7 +183,7 @@
                 <div class="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
                   <AlertTriangle class="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
                   <span>
-                    Awaiting wipe confirmation for {job.pending_wipe_count} files. This cannot be undone.
+                    Awaiting wipe confirmation for {job.pending_wipe_count} files. Each file is checked against the server before deletion. This cannot be undone.
                   </span>
                 </div>
                 <div class="flex items-center gap-2">
@@ -194,7 +194,7 @@
                       void queueState.confirmWipe(job.id, true);
                     }}
                   >
-                    Delete {job.pending_wipe_count} files
+                    Verify &amp; delete {job.pending_wipe_count} files
                   </Button>
                   <Button
                     variant="outline"
