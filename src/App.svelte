@@ -85,33 +85,30 @@
 
   <AutoImportBanner />
 
-  <div class="grid grid-cols-1 gap-5 lg:grid-cols-2">
+  <div class="grid grid-cols-1 items-start gap-5 lg:grid-cols-2">
     <div class="flex flex-col gap-5">
       <SourcePicker />
       <ImportOptions />
     </div>
-    <div>
+    <div class="flex flex-col gap-5">
       <AlbumSelector />
+      <Tabs value="queue">
+        <TabsList>
+          <TabsTrigger value="queue">
+            <ListChecks class="size-4" /> Queue
+          </TabsTrigger>
+          <TabsTrigger value="history">
+            <History class="size-4" /> History
+          </TabsTrigger>
+        </TabsList>
+        <TabsContent value="queue">
+          <ImportQueue />
+        </TabsContent>
+        <TabsContent value="history">
+          <HistoryPanel />
+        </TabsContent>
+      </Tabs>
     </div>
-  </div>
-
-  <div class="mt-5">
-    <Tabs value="queue">
-      <TabsList>
-        <TabsTrigger value="queue">
-          <ListChecks class="size-4" /> Queue
-        </TabsTrigger>
-        <TabsTrigger value="history">
-          <History class="size-4" /> History
-        </TabsTrigger>
-      </TabsList>
-      <TabsContent value="queue">
-        <ImportQueue />
-      </TabsContent>
-      <TabsContent value="history">
-        <HistoryPanel />
-      </TabsContent>
-    </Tabs>
   </div>
 
   {#snippet footer()}

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Layout
+- Reworked the main window for wide displays: content is now capped to a comfortable width and centered (no more edge-to-edge sprawl), and the right column carries Albums **plus** the Queue/History so it fills the space instead of leaving a tall empty gap next to the import options. Reflows cleanly to a single column on narrow windows.
+
 ### Preview & selection
 - New pre-import **preview grid**: click "Preview & select" on a scanned source to see your media as a thumbnail grid and pick exactly what to import. Thumbnails are generated on demand and cached — on macOS via the OS (`sips` for photos incl. HEIC/RAW, Quick Look for video), elsewhere via a built-in decoder for JPEG/PNG (RAW/HEIC/video show a typed placeholder tile). Selecting a subset stages just those files (via symlinks) for upload and always keeps the originals.
 - The preview grid can sort by **capture date** (EXIF `DateTimeOriginal`, falling back to file modification time) as well as by name, so you can review a shoot newest-first.
