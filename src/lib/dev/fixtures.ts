@@ -160,6 +160,7 @@ const completedJob: ImportJob = {
   summary: "Imported 308 items, skipped 4 duplicates.",
   awaiting_wipe_confirmation: false,
   pending_wipe_count: 0,
+  file_errors: [],
 };
 
 export function jobsForScenario(scenario: Scenario): ImportJob[] {
@@ -174,6 +175,7 @@ export function jobsForScenario(scenario: Scenario): ImportJob[] {
           summary: null,
           awaiting_wipe_confirmation: false,
           pending_wipe_count: 0,
+          file_errors: [],
         },
         completedJob,
       ];
@@ -187,6 +189,7 @@ export function jobsForScenario(scenario: Scenario): ImportJob[] {
           summary: null,
           awaiting_wipe_confirmation: true,
           pending_wipe_count: 1813,
+          file_errors: [],
         },
       ];
     case "empty":
@@ -203,6 +206,12 @@ export function jobsForScenario(scenario: Scenario): ImportJob[] {
           summary: null,
           awaiting_wipe_confirmation: false,
           pending_wipe_count: 0,
+          file_errors: [
+            { file: "/Volumes/CANON_EOS/DCIM:100CANON/IMG_0412.CR3", reason: "Internal Server Error (500)" },
+            { file: "/Volumes/CANON_EOS/DCIM:100CANON/IMG_0451.JPG", reason: "Unsupported media type" },
+            { file: "/Volumes/CANON_EOS/DCIM:101CANON/MVI_0007.MOV", reason: "Connection reset by peer" },
+            { file: "/Volumes/CANON_EOS/DCIM:101CANON/IMG_0533.HEIC", reason: "checksum mismatch" },
+          ],
         },
       ];
   }

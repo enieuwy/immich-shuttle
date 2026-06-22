@@ -93,6 +93,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         summary: None,
         awaiting_wipe_confirmation: false,
         pending_wipe_count: 0,
+        file_errors: Vec::new(),
     };
     set_job(initial)?;
     logs::append_log(
@@ -194,6 +195,11 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         if let Ok(mut running) = RUNNING_IMPORTS.lock() {
             running.remove(&job_id_clone);
         }
+
+        let file_errors = match std::fs::read_to_string(&request.log_path) {
+            Ok(contents) => crate::services::stdout_parser::parse_error_log(&contents),
+            Err(_) => Vec::new(),
+        };
 
         let update = match result {
             Ok(SidecarResult {
@@ -297,6 +303,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 } else {
                     completed_asset_paths.len() as u32
                 },
+                file_errors: file_errors.clone(),
             },
             Err(err) => {
                 let cancelled = err == "Cancelled by user";
@@ -321,9 +328,24 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                     },
                     awaiting_wipe_confirmation: false,
                     pending_wipe_count: 0,
+                    file_errors: if cancelled {
+                        Vec::new()
+                    } else {
+                        file_errors.clone()
+                    },
                 }
             }
         };
+
+        for fe in &file_errors {
+            let _ = logs::append_log(
+                "app.log",
+                &format!(
+                    "import_error job_id={} file={} reason={}",
+                    job_id_clone, fe.file, fe.reason
+                ),
+            );
+        }
 
         let _ = logs::append_log(
             "app.log",

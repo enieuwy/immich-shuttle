@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ListChecks, Inbox, X, AlertTriangle, RotateCcw, Trash2 } from "@lucide/svelte";
+  import { ListChecks, Inbox, X, AlertTriangle, FileWarning, RotateCcw, Trash2 } from "@lucide/svelte";
 
   import { queueState } from "$lib/state/queue";
   import { Card, CardHeader, CardTitle, CardContent } from "$lib/components/ui/card";
@@ -50,6 +50,13 @@
 
   function fmtEta(s: number) {
     return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+  }
+
+  function fileLabel(file: string): string {
+    // immich-go logs the file as "<fs>:<name>"; show the last path segment.
+    const afterColon = file.includes(":") ? file.slice(file.lastIndexOf(":") + 1) : file;
+    const seg = afterColon.split(/[\\/]/).pop();
+    return seg && seg.length > 0 ? seg : file;
   }
 </script>
 
@@ -215,6 +222,27 @@
 
             {#if job.error}
               <p class="text-xs text-destructive">{job.error}</p>
+            {/if}
+
+            {#if job.file_errors.length > 0}
+              <div class="flex flex-col gap-1.5 rounded-md border border-destructive/30 bg-destructive/5 p-2.5">
+                <div class="flex items-center gap-1.5 text-xs font-medium text-destructive">
+                  <FileWarning class="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                  <span>{job.file_errors.length} file{job.file_errors.length === 1 ? "" : "s"} failed</span>
+                </div>
+                <div class="flex max-h-40 flex-col gap-1 overflow-y-auto">
+                  {#each job.file_errors as fe}
+                    <div class="flex flex-col rounded bg-background/60 px-2 py-1">
+                      <span class="truncate font-mono text-xs text-foreground" title={fe.file}>
+                        {fileLabel(fe.file)}
+                      </span>
+                      <span class="truncate text-xs text-muted-foreground" title={fe.reason}>
+                        {fe.reason}
+                      </span>
+                    </div>
+                  {/each}
+                </div>
+              </div>
             {/if}
           </div>
         {/each}

@@ -103,3 +103,13 @@ test('card insert scenario surfaces the auto-import banner', async ({ page }) =>
   await page.getByRole('button', { name: /Not now/ }).click();
   await expect(page.getByText(/Card detected/)).toHaveCount(0);
 });
+
+test('failed import lists which files failed and why', async ({ page }) => {
+  await page.goto('/?scenario=default');
+
+  await expect(page.getByText(/4 files failed/).first()).toBeVisible();
+  await expect(page.getByText('IMG_0412.CR3').first()).toBeVisible();
+  await expect(page.getByText(/Internal Server Error/).first()).toBeVisible();
+
+  await captureScenario(page, 'file-errors');
+});

@@ -58,6 +58,11 @@ export interface ImportInput {
   concurrent_tasks: number | null;
 }
 
+export interface FileError {
+  file: string;
+  reason: string;
+}
+
 export interface ImportJob {
   id: string;
   status: JobStatus;
@@ -66,6 +71,7 @@ export interface ImportJob {
   summary?: string | null;
   awaiting_wipe_confirmation: boolean;
   pending_wipe_count: number;
+  file_errors: FileError[];
 }
 
 export interface RemovableDevice {

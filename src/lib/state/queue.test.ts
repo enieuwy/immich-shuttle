@@ -87,6 +87,7 @@ describe("queueState", () => {
         progress: { total: 4, uploaded: 1, duplicates: 0, errors: 0 },
         awaiting_wipe_confirmation: false,
         pending_wipe_count: 0,
+        file_errors: [],
       },
     ];
     vi.mocked(api.importDismiss).mockResolvedValueOnce(remaining);

@@ -31,6 +31,14 @@ pub struct ImportInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileError {
+    /// The file immich-go reported as failed (its full name as logged, e.g. "<fs>:<name>").
+    pub file: String,
+    /// Why it failed (the `error=` reason, or the event message when no reason was logged).
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportJob {
     pub id: String,
     pub status: JobStatus,
@@ -39,4 +47,6 @@ pub struct ImportJob {
     pub summary: Option<String>,
     pub awaiting_wipe_confirmation: bool,
     pub pending_wipe_count: u32,
+    /// Per-file failures parsed from immich-go's run log, for actionable reporting.
+    pub file_errors: Vec<FileError>,
 }
