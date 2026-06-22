@@ -55,6 +55,7 @@ export interface ImportInput {
   stack_raw_jpeg: boolean;
   stack_burst: boolean;
   date_range: string | null;
+  concurrent_tasks: number | null;
 }
 
 export interface ImportJob {

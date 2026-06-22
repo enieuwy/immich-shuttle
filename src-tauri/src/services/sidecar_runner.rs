@@ -35,6 +35,7 @@ pub struct UploadRequest {
     pub stack_raw_jpeg: bool,
     pub stack_burst: bool,
     pub date_range: Option<String>,
+    pub concurrent_tasks: Option<u32>,
 }
 
 pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<SidecarResult, String> {
@@ -74,6 +75,11 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
         let range = range.trim();
         if !range.is_empty() {
             args.push(format!("--date-range={range}"));
+        }
+    }
+    if let Some(tasks) = request.concurrent_tasks {
+        if tasks >= 1 {
+            args.push(format!("--concurrent-tasks={tasks}"));
         }
     }
 

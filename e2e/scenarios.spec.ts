@@ -77,3 +77,15 @@ test('logs dialog shows recent activity', async ({ page }) => {
 
   await captureScenario(page, 'logs');
 });
+
+test('parallel uploads input validates its range', async ({ page }) => {
+  await page.goto('/?scenario=default');
+
+  const input = page.getByRole('spinbutton', { name: /Parallel uploads/ });
+  await input.fill('69');
+  await expect(page.getByText(/between 1 and 20/)).toBeVisible();
+  await input.fill('6');
+  await expect(page.getByText(/between 1 and 20/)).toHaveCount(0);
+
+  await captureScenario(page, 'concurrency');
+});

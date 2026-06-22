@@ -5,6 +5,7 @@ type ImportOptionsState = {
   stackRawJpeg: boolean;
   stackBurst: boolean;
   dateRange: string | null;
+  concurrentTasks: number | null;
 };
 
 const initialState: ImportOptionsState = {
@@ -12,6 +13,7 @@ const initialState: ImportOptionsState = {
   stackRawJpeg: true,
   stackBurst: true,
   dateRange: null,
+  concurrentTasks: null,
 };
 
 const state = writable<ImportOptionsState>(initialState);
@@ -29,5 +31,8 @@ export const importOptionsState = {
   },
   setDateRange(dateRange: string | null) {
     state.update((s) => ({ ...s, dateRange }));
+  },
+  setConcurrentTasks(concurrentTasks: number | null) {
+    state.update((s) => ({ ...s, concurrentTasks }));
   },
 };

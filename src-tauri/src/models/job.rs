@@ -27,6 +27,7 @@ pub struct ImportInput {
     pub stack_raw_jpeg: bool,
     pub stack_burst: bool,
     pub date_range: Option<String>,
+    pub concurrent_tasks: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

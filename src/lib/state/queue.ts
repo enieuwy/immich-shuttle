@@ -167,6 +167,7 @@ export const queueState = {
       stack_raw_jpeg: options.stackRawJpeg,
       stack_burst: options.stackBurst,
       date_range: options.dateRange,
+      concurrent_tasks: options.concurrentTasks,
     });
     await refreshJobs();
   },

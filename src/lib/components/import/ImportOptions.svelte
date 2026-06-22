@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { AlertTriangle, CalendarRange, SlidersHorizontal, X } from "@lucide/svelte";
+  import { AlertTriangle, CalendarRange, Gauge, SlidersHorizontal, X } from "@lucide/svelte";
   import { Alert, AlertDescription, AlertTitle } from "$lib/components/ui/alert";
   import { Button } from "$lib/components/ui/button";
   import { Card, CardContent, CardHeader } from "$lib/components/ui/card";
@@ -27,6 +27,21 @@
     fromDate = "";
     toDate = "";
   }
+
+  let tasksInput = $state("");
+
+  // `bind:value` on a type="number" input yields a number (or undefined when
+  // empty), so coerce to a string before any string ops.
+  const tasksRaw = $derived(tasksInput == null ? "" : String(tasksInput));
+  const tasksParsed = $derived(Number.parseInt(tasksRaw, 10));
+  const tasksValid = $derived(
+    Number.isInteger(tasksParsed) && tasksParsed >= 1 && tasksParsed <= 20,
+  );
+  const tasksOutOfRange = $derived(tasksRaw.trim() !== "" && !tasksValid);
+
+  $effect(() => {
+    importOptionsState.setConcurrentTasks(tasksValid ? tasksParsed : null);
+  });
 </script>
 
 <Card>
@@ -131,6 +146,43 @@
             Clear
           </Button>
         </div>
+      {/if}
+    </div>
+
+    <Separator class="my-2" />
+
+    <div class="flex flex-col gap-3 p-3">
+      <div class="flex items-start gap-3">
+        <Gauge class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+        <div class="flex min-w-0 flex-col gap-1">
+          <span class="text-sm font-medium text-foreground">Parallel uploads</span>
+          <span class="text-xs text-muted-foreground">
+            How many files to upload at once (1–20). Leave blank to use the default.
+          </span>
+        </div>
+      </div>
+
+      <div class="flex flex-col gap-1.5">
+        <Label for="import-option-parallel-uploads" class="text-xs font-normal text-muted-foreground">
+          Files at once
+        </Label>
+        <Input
+          id="import-option-parallel-uploads"
+          class="w-24"
+          type="number"
+          min="1"
+          max="20"
+          step="1"
+          inputmode="numeric"
+          placeholder="Auto"
+          aria-label="Parallel uploads"
+          aria-invalid={tasksOutOfRange}
+          bind:value={tasksInput}
+        />
+      </div>
+
+      {#if tasksOutOfRange}
+        <p class="text-xs text-destructive">Enter a value between 1 and 20.</p>
       {/if}
     </div>
   </CardContent>
