@@ -15,12 +15,14 @@ Immich Shuttle is a cross-platform desktop importer for Immich built with Tauri 
 
 ## Installation
 
-Download artifacts from GitHub Releases:
+Prebuilt binaries are published on [GitHub Releases](../../releases) for each tagged version:
 
-- macOS (Apple Silicon): `.dmg`
-- macOS (Intel): `.dmg`
-- Windows (x64): `.exe`
-- Linux (x64): `.AppImage`
+- **macOS (Apple Silicon)** — `.dmg`
+- **macOS (Intel)** — `.dmg`
+- **Linux (x64)** — `.AppImage` / `.deb`
+- **Windows (x64)** — `.exe`
+
+> These builds are **ad-hoc signed but not notarized** (no paid Apple/Windows code-signing certificate). They run normally, but the OS shows a **one-time** "unverified developer" prompt on first launch — see the [FAQ](#faq) for the bypass. On Linux, make the AppImage executable first: `chmod +x Immich\ Shuttle_*.AppImage`.
 
 ## Quick Start
 
@@ -37,9 +39,14 @@ Download artifacts from GitHub Releases:
 
 ## FAQ
 
-### macOS says the app is from an unidentified developer
+### macOS says the app "can't be opened" or is from an unidentified developer
 
-Right-click the app and choose Open.
+The builds are ad-hoc signed but not notarized, so macOS blocks them on first launch. This is a one-time step per install:
+
+- **macOS 15 (Sequoia) and later:** open **System Settings → Privacy & Security**, scroll to the message naming "Immich Shuttle", click **Open Anyway**, then authenticate. (The old right-click → Open shortcut no longer works for unsigned apps.)
+- **Older macOS:** right-click (Control-click) the app in Finder, choose **Open**, then confirm.
+
+Notarized builds with no prompt require a paid Apple Developer account.
 
 ### Windows SmartScreen warning appears
 

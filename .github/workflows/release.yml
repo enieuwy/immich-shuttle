@@ -57,6 +57,18 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS bundles are ad-hoc signed (signingIdentity "-" in tauri.conf.json),
+          # so they run after a one-time Gatekeeper "Open Anyway". To produce
+          # notarized, friction-free macOS builds, add an Apple Developer account's
+          # secrets below and set the signing identity to your "Developer ID
+          # Application: …" (via APPLE_SIGNING_IDENTITY or tauri.conf.json), then
+          # uncomment. tauri-action notarizes automatically when these are present.
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Immich Shuttle ${{ github.ref_name }}
