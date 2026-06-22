@@ -54,6 +54,7 @@ export interface ImportInput {
   keep_files: boolean;
   stack_raw_jpeg: boolean;
   stack_burst: boolean;
+  date_range: string | null;
 }
 
 export interface ImportJob {

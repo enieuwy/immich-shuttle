@@ -61,10 +61,13 @@ describe("queueState", () => {
     expect(payload).toBeDefined();
     expect(typeof payload?.stack_raw_jpeg).toBe("boolean");
     expect(typeof payload?.stack_burst).toBe("boolean");
+    expect(payload).toHaveProperty("date_range");
+    expect(payload?.date_range).toBeNull();
     expect(payload).toMatchObject({
       profile_id: "p1",
       stack_raw_jpeg: true,
       stack_burst: true,
+      date_range: null,
     });
   });
 

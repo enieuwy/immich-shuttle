@@ -166,6 +166,7 @@ export const queueState = {
       keep_files: options.keepFiles,
       stack_raw_jpeg: options.stackRawJpeg,
       stack_burst: options.stackBurst,
+      date_range: options.dateRange,
     });
     await refreshJobs();
   },

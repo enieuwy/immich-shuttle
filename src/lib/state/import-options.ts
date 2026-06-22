@@ -4,12 +4,14 @@ type ImportOptionsState = {
   keepFiles: boolean;
   stackRawJpeg: boolean;
   stackBurst: boolean;
+  dateRange: string | null;
 };
 
 const initialState: ImportOptionsState = {
   keepFiles: true,
   stackRawJpeg: true,
   stackBurst: true,
+  dateRange: null,
 };
 
 const state = writable<ImportOptionsState>(initialState);
@@ -24,5 +26,8 @@ export const importOptionsState = {
   },
   setStackBurst(stackBurst: boolean) {
     state.update((s) => ({ ...s, stackBurst }));
+  },
+  setDateRange(dateRange: string | null) {
+    state.update((s) => ({ ...s, dateRange }));
   },
 };

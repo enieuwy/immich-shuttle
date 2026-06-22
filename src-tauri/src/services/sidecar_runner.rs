@@ -34,6 +34,7 @@ pub struct UploadRequest {
     pub cancel_flag: Arc<AtomicBool>,
     pub stack_raw_jpeg: bool,
     pub stack_burst: bool,
+    pub date_range: Option<String>,
 }
 
 pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<SidecarResult, String> {
@@ -69,6 +70,13 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
         "--log-level".to_string(),
         "DEBUG".to_string(),
     ];
+    if let Some(range) = request.date_range.as_deref() {
+        let range = range.trim();
+        if !range.is_empty() {
+            args.push(format!("--date-range={range}"));
+        }
+    }
+
     args.push(request.source_path.clone());
 
     let sidecar = app
