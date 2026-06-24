@@ -239,10 +239,18 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             running.remove(&job_id_clone);
         }
 
-        let file_errors = match std::fs::read_to_string(&request.log_path) {
-            Ok(contents) => crate::services::stdout_parser::parse_error_log(&contents),
-            Err(_) => Vec::new(),
-        };
+        // immich-go writes per-file events to the run log, not stdout. Read it
+        // once after the run (the file is O_APPEND across multi-path runs) for
+        // per-file errors and the confirmed-upload paths + duplicate count, then
+        // fold the log-derived figures into the successful result.
+        let log_contents = std::fs::read_to_string(&request.log_path).unwrap_or_default();
+        let file_errors = crate::services::stdout_parser::parse_error_log(&log_contents);
+        let completed = crate::services::stdout_parser::parse_completed_assets(&log_contents);
+        let result = result.map(|mut r| {
+            r.completed_asset_paths = completed.paths;
+            r.progress.duplicates = completed.duplicates;
+            r
+        });
 
         let update = match result {
             Ok(SidecarResult {

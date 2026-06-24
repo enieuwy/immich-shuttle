@@ -9,10 +9,7 @@ use std::{
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_shell::{process::CommandEvent, ShellExt};
 
-use crate::{
-    models::job::JobProgress,
-    services::stdout_parser::{parse_line, ParsedLine},
-};
+use crate::{models::job::JobProgress, services::stdout_parser::parse_line};
 
 #[derive(Debug, Clone)]
 pub struct SidecarResult {
@@ -105,9 +102,11 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
     };
     let mut had_error_line = false;
     let mut error_lines: Vec<String> = Vec::new();
-    let mut completed_asset_paths = Vec::new();
-    let mut completed_asset_ids = Vec::new();
-    let mut current_file: Option<String> = None;
+    // Per-file paths/ids come from the run log (parsed in import.rs), not
+    // stdout, which in --no-ui carries only the aggregate progress line.
+    let completed_asset_paths: Vec<String> = Vec::new();
+    let completed_asset_ids: Vec<String> = Vec::new();
+    let current_file: Option<String> = None;
 
     while let Some(event) = rx.recv().await {
         if request.cancel_flag.load(Ordering::Relaxed) {
@@ -120,26 +119,7 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
         match event {
             CommandEvent::Stdout(line_bytes) => {
                 let line = String::from_utf8_lossy(&line_bytes).to_string();
-                let ParsedLine {
-                    progress: new_progress,
-                    has_error,
-                    completed_asset_path,
-                    completed_asset_id,
-                } = parse_line(&line, progress);
-                progress = new_progress;
-                had_error_line |= has_error;
-                if has_error {
-                    error_lines.push(line.trim().to_string());
-                }
-                if let Some(path) = completed_asset_path {
-                    current_file = std::path::Path::new(&path)
-                        .file_name()
-                        .map(|name| name.to_string_lossy().to_string());
-                    completed_asset_paths.push(path);
-                }
-                if let Some(asset_id) = completed_asset_id {
-                    completed_asset_ids.push(asset_id);
-                }
+                progress = parse_line(&line, progress);
                 let _ = app.emit(
                     "import-progress",
                     serde_json::json!({

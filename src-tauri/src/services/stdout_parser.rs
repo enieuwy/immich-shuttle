@@ -4,66 +4,50 @@ use std::collections::HashSet;
 
 use crate::models::job::{FileError, JobProgress};
 
-#[derive(Debug, Clone)]
-pub struct ParsedLine {
-    pub progress: JobProgress,
-    pub has_error: bool,
-    pub completed_asset_path: Option<String>,
-    pub completed_asset_id: Option<String>,
-}
-
-pub fn parse_line(line: &str, mut current: JobProgress) -> ParsedLine {
-    let total_re = Regex::new(r"Total Assets:\s*(\d+)").expect("valid regex");
-    let dup_re = Regex::new(r"server has duplicate\s*:\s*(\d+)").expect("valid regex");
-    let up_re = Regex::new(r"uploaded\s*:\s*(\d+)").expect("valid regex");
-    let archived_re = Regex::new(r"FileArchived.*path=([^\s]+)").expect("valid regex");
-    let asset_id_re =
-        Regex::new(r"(?:assetId|asset_id|id)=([A-Fa-f0-9-]{8,})").expect("valid regex");
-
-    if let Some(c) = total_re.captures(line) {
-        current.total = c
-            .get(1)
-            .and_then(|m| m.as_str().parse::<u32>().ok())
-            .unwrap_or(current.total);
+/// Parse immich-go's `--no-ui` aggregate progress line from stdout.
+///
+/// In `--no-ui` mode immich-go (v0.31.0, `app/upload/noui.go`) writes ONLY an
+/// aggregate progress line to stdout, refreshed in place with a leading `\r`
+/// and no trailing newline until the final flush:
+///
+/// ```text
+/// Immich read 100%, Assets found: 15, Upload errors: 2, Uploaded 13 .
+/// ```
+///
+/// Because the line is rewritten with `\r` (not `\n`), a single read may contain
+/// several `\r`-separated copies; the counts are monotonic, so the last match in
+/// the chunk holds the freshest totals. Per-file events (paths, duplicates,
+/// errors) are NOT on stdout — they go to the `--log-file` and are read by
+/// [`parse_completed_assets`] / [`parse_error_log`].
+pub fn parse_line(line: &str, mut current: JobProgress) -> JobProgress {
+    let progress_re =
+        Regex::new(r"Assets found:\s*(\d+),\s*Upload errors:\s*\d+,\s*Uploaded\s+(\d+)")
+            .expect("valid regex");
+    if let Some(c) = progress_re.captures_iter(line).last() {
+        if let Some(total) = c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()) {
+            current.total = total;
+        }
+        if let Some(uploaded) = c.get(2).and_then(|m| m.as_str().parse::<u32>().ok()) {
+            current.uploaded = uploaded;
+        }
     }
-    if let Some(c) = dup_re.captures(line) {
-        current.duplicates = c
-            .get(1)
-            .and_then(|m| m.as_str().parse::<u32>().ok())
-            .unwrap_or(current.duplicates);
-    }
-    if let Some(c) = up_re.captures(line) {
-        current.uploaded = c
-            .get(1)
-            .and_then(|m| m.as_str().parse::<u32>().ok())
-            .unwrap_or(current.uploaded);
-    }
-
-    let lower = line.to_lowercase();
-    let has_error = (lower.contains("error") || lower.contains("failed") || line.contains("ERR "))
-        && !lower.contains("upload errors");
-    if has_error {
-        current.errors = current.errors.saturating_add(1);
-    }
-
-    let completed_asset_path = archived_re
-        .captures(line)
-        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
-    let completed_asset_id = asset_id_re
-        .captures(line)
-        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
-
-    ParsedLine {
-        progress: current,
-        has_error,
-        completed_asset_path,
-        completed_asset_id,
-    }
+    current
 }
 
 /// Maximum number of per-file errors retained from a single run, to keep the job
 /// payload and the UI bounded on imports that fail en masse.
 const MAX_FILE_ERRORS: usize = 100;
+
+/// Assets immich-go confirmed it placed on the server during a run, recovered
+/// from the run log.
+#[derive(Debug, Clone, Default)]
+pub struct CompletedAssets {
+    /// Local filesystem paths of files uploaded successfully (safe-to-wipe
+    /// candidates, re-verified against the server by SHA-1 before deletion).
+    pub paths: Vec<String>,
+    /// Count of files the server already held (`server has duplicate`).
+    pub duplicates: u32,
+}
 
 /// Extract the value of a space-delimited `key=` attribute from a console-slog
 /// line. immich-go's console handler writes attribute values UNQUOTED (spaces
@@ -100,6 +84,76 @@ fn error_message(line: &str) -> Option<String> {
     } else {
         Some(msg.to_string())
     }
+}
+
+/// Convert immich-go's logged `file=` value into a real local filesystem path.
+///
+/// immich-go (v0.31.0) logs files as `<fsRoot>:<name>` — e.g.
+/// `/Volumes/CANON:DCIM/IMG_0001.JPG` — where `fsRoot` is the source path passed
+/// to it and `name` is the path within. POSIX roots contain no colon, so the
+/// first colon is the separator; on Windows the root carries a drive colon
+/// (`C:\DCIM`), so the search skips a leading `<drive>:` first.
+fn fs_path_from_file_attr(file: &str) -> String {
+    let search_from = if is_windows_drive_prefix(file) { 2 } else { 0 };
+    if let Some(rel) = file.get(search_from..).and_then(|s| s.find(':')) {
+        let idx = search_from + rel;
+        let root = &file[..idx];
+        let name = &file[idx + 1..];
+        if !root.is_empty() && !name.is_empty() {
+            return format!("{root}/{name}");
+        }
+    }
+    file.to_string()
+}
+
+/// Whether `s` begins with a Windows drive prefix like `C:\` or `C:/`.
+fn is_windows_drive_prefix(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// console-slog (NoColor, `TimeFormat: time.DateTime`) line prefix:
+/// `YYYY-MM-DD HH:MM:SS <LVL> `.
+fn info_line_message(line: &str) -> Option<&str> {
+    // console-slog NoColor renders "YYYY-MM-DD HH:MM:SS INF <message...>"; the
+    // 19-char timestamp is fixed-width, so the level token sits at column 19.
+    const MARKER: &str = " INF ";
+    if line.len() < 19 + MARKER.len() || !line.is_char_boundary(19) {
+        return None;
+    }
+    if &line[19..19 + MARKER.len()] != MARKER {
+        return None;
+    }
+    Some(&line[19 + MARKER.len()..])
+}
+
+/// Recover assets immich-go confirmed during a run from its `--log-file`.
+///
+/// Scans console-slog INFO lines for `uploaded successfully` (collecting the
+/// local path, de-duplicated) and counts `server has duplicate`. The log is
+/// opened `O_APPEND` by immich-go, so a single run file may span several
+/// invocations — call this ONCE on the full file after the run completes.
+pub fn parse_completed_assets(contents: &str) -> CompletedAssets {
+    let mut out = CompletedAssets::default();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for line in contents.lines() {
+        let Some(message) = info_line_message(line) else {
+            continue;
+        };
+        if message.starts_with("uploaded successfully") {
+            if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
+                let path = fs_path_from_file_attr(&file);
+                if seen.insert(path.clone()) {
+                    out.paths.push(path);
+                }
+            }
+        } else if message.starts_with("server has duplicate") {
+            out.duplicates = out.duplicates.saturating_add(1);
+        }
+    }
+
+    out
 }
 
 /// Parse per-file upload failures out of immich-go's run log (written via
@@ -140,96 +194,135 @@ pub fn parse_error_log(contents: &str) -> Vec<FileError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_error_log, parse_line};
+    use super::{parse_completed_assets, parse_error_log, parse_line};
     use crate::models::job::JobProgress;
 
-    #[test]
-    fn parses_total_assets() {
-        let initial = JobProgress {
+    fn zero() -> JobProgress {
+        JobProgress {
             total: 0,
             uploaded: 0,
             duplicates: 0,
             errors: 0,
-        };
-        let parsed = parse_line("Total Assets: 15", initial);
-        assert_eq!(parsed.progress.total, 15);
+        }
+    }
+
+    // ---- stdout aggregate progress line (app/upload/noui.go) ----
+
+    #[test]
+    fn parses_real_noui_progress_line() {
+        let line = "Immich read 100%, Assets found: 15, Upload errors: 2, Uploaded 13 .";
+        let p = parse_line(line, zero());
+        assert_eq!(p.total, 15);
+        assert_eq!(p.uploaded, 13);
     }
 
     #[test]
-    fn parses_duplicates() {
-        let initial = JobProgress {
-            total: 0,
-            uploaded: 0,
-            duplicates: 0,
-            errors: 0,
-        };
-        let parsed = parse_line("server has duplicate : 3", initial);
-        assert_eq!(parsed.progress.duplicates, 3);
+    fn takes_latest_of_carriage_return_refreshed_copies() {
+        // A single stdout read often holds several '\r'-separated refreshes.
+        let chunk = "\rImmich read 40%, Assets found: 8, Upload errors: 0, Uploaded 5  \
+                     \rImmich read 100%, Assets found: 15, Upload errors: 0, Uploaded 15 .";
+        let p = parse_line(chunk, zero());
+        assert_eq!(p.total, 15);
+        assert_eq!(p.uploaded, 15);
     }
 
     #[test]
-    fn marks_error_lines() {
-        let initial = JobProgress {
-            total: 0,
-            uploaded: 0,
-            duplicates: 0,
-            errors: 0,
-        };
-        let parsed = parse_line("ERROR upload failed", initial);
-        assert!(parsed.has_error);
-        assert_eq!(parsed.progress.errors, 1);
-    }
-
-    #[test]
-    fn extracts_archived_asset_path() {
-        let initial = JobProgress {
-            total: 0,
-            uploaded: 0,
-            duplicates: 0,
-            errors: 0,
-        };
-        let parsed = parse_line(
-            "FileArchived status=ok path=/tmp/DCIM/100MEDIA/IMG_0001.JPG",
-            initial,
-        );
-        assert_eq!(
-            parsed.completed_asset_path.as_deref(),
-            Some("/tmp/DCIM/100MEDIA/IMG_0001.JPG")
-        );
-    }
-
-    #[test]
-    fn ignores_incomplete_non_matching_lines() {
+    fn leaves_progress_untouched_on_banner_and_noise() {
         let initial = JobProgress {
             total: 9,
             uploaded: 4,
             duplicates: 1,
             errors: 0,
         };
-        let parsed = parse_line("uploaded :", initial.clone());
-        assert_eq!(parsed.progress.total, initial.total);
-        assert_eq!(parsed.progress.uploaded, initial.uploaded);
-        assert_eq!(parsed.progress.duplicates, initial.duplicates);
-        assert!(!parsed.has_error);
+        for line in [
+            "immich-go v0.31.0",
+            "Running environment: architecture=arm64 os=darwin",
+            "",
+        ] {
+            let p = parse_line(line, initial.clone());
+            assert_eq!(p.total, initial.total);
+            assert_eq!(p.uploaded, initial.uploaded);
+        }
+    }
+
+    // ---- run-log completed assets (console-slog, app/log.go + fileevents.go) ----
+
+    #[test]
+    fn collects_uploaded_paths_and_converts_fsroot_colon() {
+        let log =
+            "2026-06-22 14:30:00 INF uploaded successfully file=/Volumes/CANON:DCIM/IMG_0001.JPG";
+        let c = parse_completed_assets(log);
+        assert_eq!(c.paths, vec!["/Volumes/CANON/DCIM/IMG_0001.JPG"]);
+        assert_eq!(c.duplicates, 0);
     }
 
     #[test]
-    fn extracts_asset_id_from_line() {
-        let initial = JobProgress {
-            total: 0,
-            uploaded: 0,
-            duplicates: 0,
-            errors: 0,
-        };
-        let parsed = parse_line(
-            "uploaded : 1 assetId=123e4567-e89b-12d3-a456-426614174000",
-            initial,
-        );
-        assert_eq!(
-            parsed.completed_asset_id.as_deref(),
-            Some("123e4567-e89b-12d3-a456-426614174000")
-        );
+    fn handles_paths_with_spaces() {
+        let log =
+            "2026-06-22 14:30:05 INF uploaded successfully file=/Volumes/My Card:DCIM/VID 7.MP4";
+        let c = parse_completed_assets(log);
+        assert_eq!(c.paths, vec!["/Volumes/My Card/DCIM/VID 7.MP4"]);
     }
+
+    #[test]
+    fn converts_windows_drive_paths() {
+        let log = "2026-06-22 14:30:00 INF uploaded successfully file=C:\\DCIM:IMG_0001.JPG";
+        let c = parse_completed_assets(log);
+        assert_eq!(c.paths, vec!["C:\\DCIM/IMG_0001.JPG"]);
+    }
+
+    #[test]
+    fn counts_server_duplicates_without_treating_them_as_uploaded() {
+        let log =
+            "2026-06-22 14:30:01 INF server has duplicate file=/Volumes/CANON:DCIM/IMG_0002.JPG";
+        let c = parse_completed_assets(log);
+        assert!(c.paths.is_empty());
+        assert_eq!(c.duplicates, 1);
+    }
+
+    #[test]
+    fn deduplicates_repeated_uploaded_paths() {
+        let log =
+            "2026-06-22 14:30:00 INF uploaded successfully file=/Volumes/CANON:DCIM/IMG_0001.JPG\n\
+2026-06-22 14:30:09 INF uploaded successfully file=/Volumes/CANON:DCIM/IMG_0001.JPG";
+        let c = parse_completed_assets(log);
+        assert_eq!(c.paths.len(), 1);
+    }
+
+    #[test]
+    fn ignores_informational_noise_lines() {
+        // Startup banner/flags/report lines are also INF but are not file events.
+        let log = "2026-06-22 14:29:59 INF Assets on the server: 42\n\
+2026-06-22 14:30:00 INF got album from the server album=Trip assets=3\n\
+2026-06-22 14:30:00 INF Running environment: architecture=arm64 os=darwin";
+        let c = parse_completed_assets(log);
+        assert!(c.paths.is_empty());
+        assert_eq!(c.duplicates, 0);
+    }
+
+    #[test]
+    fn parses_mixed_run_log_for_completed_and_errors() {
+        let log = "2026-06-22 14:30:00 INF uploaded successfully file=/Volumes/CANON:DCIM/IMG_0001.JPG\n\
+2026-06-22 14:30:01 INF server has duplicate file=/Volumes/CANON:DCIM/IMG_0002.JPG\n\
+2026-06-22 14:30:02 INF uploaded successfully file=/Volumes/CANON:DCIM/IMG_0003.JPG\n\
+2026-06-22 14:30:03 ERR server error file=/Volumes/CANON:DCIM/IMG_0004.JPG error=Internal Server Error (500)";
+        let c = parse_completed_assets(log);
+        assert_eq!(
+            c.paths,
+            vec![
+                "/Volumes/CANON/DCIM/IMG_0001.JPG",
+                "/Volumes/CANON/DCIM/IMG_0003.JPG",
+            ]
+        );
+        assert_eq!(c.duplicates, 1);
+
+        let errors = parse_error_log(log);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].file, "/Volumes/CANON:DCIM/IMG_0004.JPG");
+        assert_eq!(errors[0].reason, "Internal Server Error (500)");
+    }
+
+    // ---- run-log per-file errors (unchanged behaviour, kept for regression) ----
 
     #[test]
     fn parses_per_file_server_error() {
