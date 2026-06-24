@@ -29,7 +29,7 @@
     "active": true,
     "targets": "all",
     "macOS": {
-      "signingIdentity": "-"
+      "signingIdentity": "Mac Command Centre Local Code Signing"
     },
     "externalBin": [
       "binaries/immich-go"
