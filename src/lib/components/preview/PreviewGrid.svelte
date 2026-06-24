@@ -4,6 +4,7 @@
 
   import type { CaptureDate, MediaFile, ThumbResult } from "$lib/types";
   import { selectionState } from "$lib/state/selection";
+  import { createThumbnailLoader } from "$lib/state/thumbnailLoader";
   import { previewDates, previewThumbnails } from "$lib/api";
   import { Button } from "$lib/components/ui/button";
   import { cn } from "$lib/utils.js";
@@ -51,8 +52,6 @@
   // Loaded thumbnails keyed by file path. Reassigned (new Map) on every merge so
   // Svelte reactivity fires for the affected tiles.
   let thumbs = $state(new Map<string, ThumbResult>());
-  // Paths we have already issued a request for — never request twice.
-  const requested = new Set<string>();
 
   // --- Selection summary -----------------------------------------------------
 
@@ -94,44 +93,23 @@
     return extension.replace(/^\./, "").toUpperCase();
   }
 
-  // --- Lazy, batched, debounced thumbnail loading ----------------------------
+  // --- Lazy, ordered, incremental thumbnail loading --------------------------
+
+  // Loads requested tiles in small ordered chunks, merging each chunk the moment
+  // it resolves so tiles paint incrementally top-down and one slow RAW/video
+  // can't gate the whole viewport.
+  const loader = createThumbnailLoader({
+    fetch: previewThumbnails,
+    onResults: (results) => {
+      const next = new Map(thumbs);
+      for (const r of results) next.set(r.path, r);
+      thumbs = next;
+    },
+  });
 
   let observer: IntersectionObserver | null = null;
   const tileNodes = new Set<HTMLElement>();
   const nodePath = new WeakMap<HTMLElement, string>();
-
-  let queue = new Set<string>();
-  let debounce: ReturnType<typeof setTimeout> | null = null;
-
-  function queuePath(path: string) {
-    if (thumbs.has(path) || requested.has(path)) return;
-    queue.add(path);
-    if (debounce) clearTimeout(debounce);
-    debounce = setTimeout(flushQueue, 80);
-  }
-
-  async function flushQueue() {
-    debounce = null;
-    if (queue.size === 0) return;
-    const batch = [...queue];
-    queue = new Set();
-    // Mark requested up front so concurrent scroll callbacks don't re-issue
-    // the same paths while this batch is in flight.
-    for (const p of batch) requested.add(p);
-
-    let results: ThumbResult[];
-    try {
-      results = await previewThumbnails(batch);
-    } catch {
-      // Allow a retry on the next intersection if the batch failed.
-      for (const p of batch) requested.delete(p);
-      return;
-    }
-
-    const next = new Map(thumbs);
-    for (const r of results) next.set(r.path, r);
-    thumbs = next;
-  }
 
   const observeTile: Action<HTMLElement, string> = (node, path) => {
     nodePath.set(node, path);
@@ -155,7 +133,7 @@
         for (const entry of entries) {
           if (!entry.isIntersecting) continue;
           const path = nodePath.get(entry.target as HTMLElement);
-          if (path) queuePath(path);
+          if (path) loader.request(path);
         }
       },
       { rootMargin: "200px" },
@@ -166,7 +144,7 @@
     return () => {
       obs.disconnect();
       observer = null;
-      if (debounce) clearTimeout(debounce);
+      loader.dispose();
     };
   });
 </script>

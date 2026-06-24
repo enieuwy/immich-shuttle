@@ -120,6 +120,9 @@ test('preview scenario shows the selection grid and selects files', async ({ pag
   await expect(page.getByText('Preview & select').first()).toBeVisible();
   await expect(page.getByText(/0 of 48 selected/)).toBeVisible();
 
+  // Tiles load their thumbnails through the lazy loader (no perpetual spinner).
+  await expect(page.locator('img.object-cover').first()).toBeVisible();
+
   await captureScenario(page, 'preview');
 
   await page.getByRole('button', { name: /Select all/ }).click();
