@@ -33,6 +33,7 @@ pub struct UploadRequest {
     pub stack_burst: bool,
     pub date_range: Option<String>,
     pub concurrent_tasks: Option<u32>,
+    pub into_album: Option<String>,
 }
 
 /// Read the current run log and emit a progress snapshot to the frontend.
@@ -96,6 +97,12 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
     if let Some(tasks) = request.concurrent_tasks {
         if tasks >= 1 {
             args.push(format!("--concurrent-tasks={tasks}"));
+        }
+    }
+    if let Some(album) = request.into_album.as_deref() {
+        let album = album.trim();
+        if !album.is_empty() {
+            args.push(format!("--into-album={album}"));
         }
     }
 

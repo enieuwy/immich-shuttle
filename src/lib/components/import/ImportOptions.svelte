@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Gauge, SlidersHorizontal } from "@lucide/svelte";
+  import { SlidersHorizontal } from "@lucide/svelte";
   import { Card, CardContent, CardHeader } from "$lib/components/ui/card";
   import { Input } from "$lib/components/ui/input";
   import { Label } from "$lib/components/ui/label";
@@ -80,24 +80,18 @@
 
     <Separator class="my-2" />
 
-    <div class="flex flex-col gap-3 p-3">
-      <div class="flex items-start gap-3">
-        <Gauge class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-        <div class="flex min-w-0 flex-col gap-1">
+    <div class="rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <div class="flex items-center justify-between gap-3">
+        <Label
+          for="import-option-parallel-uploads"
+          class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
+        >
           <span class="text-sm font-medium text-foreground">Parallel uploads</span>
-          <span class="text-xs text-muted-foreground">
-            How many files to upload at once (1–20). Leave blank to use the default.
-          </span>
-        </div>
-      </div>
-
-      <div class="flex flex-col gap-1.5">
-        <Label for="import-option-parallel-uploads" class="text-xs font-normal text-muted-foreground">
-          Files at once
+          <span class="text-xs text-muted-foreground">How many files to upload at once (1–20). Leave blank for the default.</span>
         </Label>
         <Input
           id="import-option-parallel-uploads"
-          class="w-24"
+          class="w-24 shrink-0"
           type="number"
           min="1"
           max="20"
@@ -111,7 +105,7 @@
       </div>
 
       {#if tasksOutOfRange}
-        <p class="text-xs text-destructive">Enter a value between 1 and 20.</p>
+        <p class="mt-2 text-xs text-destructive">Enter a value between 1 and 20.</p>
       {/if}
     </div>
   </CardContent>

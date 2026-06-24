@@ -57,6 +57,7 @@ export interface ImportInput {
   date_range: string | null;
   concurrent_tasks: number | null;
   select_files?: string[] | null;
+  into_album?: string | null;
 }
 
 export interface FileError {

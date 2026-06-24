@@ -255,27 +255,6 @@ impl ImmichClient {
         })
     }
 
-    // Not currently wired: post-upload album assignment needs server asset IDs,
-    // which immich-go v0.31.0 does not log on "uploaded successfully" lines.
-    // Retained for when album auto-assignment is implemented (separate issue).
-    #[allow(dead_code)]
-    pub async fn add_assets_to_album(
-        &self,
-        album_id: &str,
-        asset_ids: &[String],
-    ) -> Result<(), String> {
-        if asset_ids.is_empty() {
-            return Ok(());
-        }
-        self.request_json(
-            Method::PUT,
-            &format!("/albums/{album_id}/assets"),
-            Some(json!({ "ids": asset_ids })),
-        )
-        .await?;
-        Ok(())
-    }
-
     /// Checks which of the given (id, sha1-hex-checksum) items already exist on
     /// the server. Returns the set of `id`s the server reports as duplicates,
     /// i.e. assets it already holds. Used to verify uploads before wiping the

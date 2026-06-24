@@ -165,16 +165,24 @@ export const queueState = {
       throw new Error("Select a source before starting import.");
     }
 
+    // immich-go assigns albums by name (--into-album), single album per run.
+    const albumIds = overrides?.albumIds ?? albums.selectedAlbumIds;
+    const intoAlbum =
+      albumIds.length > 0
+        ? (albums.availableAlbums.find((a) => a.id === albumIds[0])?.album_name ?? null)
+        : null;
+
     await importStart({
       profile_id: profile.id,
       source_paths: sourcePaths,
-      album_ids: overrides?.albumIds ?? albums.selectedAlbumIds,
+      album_ids: albumIds,
       keep_files: overrides?.keepFiles ?? options.keepFiles,
       stack_raw_jpeg: options.stackRawJpeg,
       stack_burst: options.stackBurst,
       date_range: null,
       concurrent_tasks: options.concurrentTasks,
       select_files: overrides?.selectFiles ?? null,
+      into_album: intoAlbum,
     });
     await refreshJobs();
   },

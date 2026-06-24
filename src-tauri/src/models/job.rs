@@ -28,9 +28,13 @@ pub struct ImportInput {
     pub stack_burst: bool,
     pub date_range: Option<String>,
     pub concurrent_tasks: Option<u32>,
-    /// When set, import only these files (staged into a temp dir); forces keep_files.
+    /// When set, import only these files (staged into a temp dir).
     #[serde(default)]
     pub select_files: Option<Vec<String>>,
+    /// Album name to import every uploaded asset into (immich-go `--into-album`);
+    /// the album is reused if it already exists on the server, created otherwise.
+    #[serde(default)]
+    pub into_album: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

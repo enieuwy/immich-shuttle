@@ -29,12 +29,15 @@ vi.mock("$lib/api", () => ({
     skipped_unreadable: 0,
   })),
   devicesListRemovable: vi.fn(async () => []),
+  albumsList: vi.fn(async () => [{ id: "a1", album_name: "Trip", shared_with: [] }]),
+  usersList: vi.fn(async () => []),
 }));
 
 import * as api from "$lib/api";
 import { queueState } from "./queue";
 import { profilesState } from "./profiles";
 import { sourceState } from "./source";
+import { albumsState } from "./albums";
 import { get } from "svelte/store";
 import type { ImportJob } from "$lib/types";
 
@@ -129,5 +132,26 @@ describe("queueState", () => {
 
     const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
     expect(payload?.select_files).toEqual(["/Volumes/SD/DCIM/IMG_1.JPG"]);
+  });
+
+  it("resolves the selected album id to a name in into_album", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await albumsState.loadAlbums();
+    albumsState.selectAlbum("a1");
+
+    await queueState.startImport();
+
+    const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
+    expect(payload?.album_ids).toEqual(["a1"]);
+    expect(payload?.into_album).toBe("Trip");
   });
 });

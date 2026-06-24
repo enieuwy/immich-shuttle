@@ -50,12 +50,8 @@ export const albumsState = {
     }
   },
   selectAlbum(albumId: string) {
-    state.update((s) => {
-      if (s.selectedAlbumIds.includes(albumId)) {
-        return s;
-      }
-      return { ...s, selectedAlbumIds: [...s.selectedAlbumIds, albumId] };
-    });
+    // Single-select: immich-go imports into one album (--into-album).
+    state.update((s) => ({ ...s, selectedAlbumIds: [albumId] }));
   },
   deselectAlbum(albumId: string) {
     state.update((s) => ({
