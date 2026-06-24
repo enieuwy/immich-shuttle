@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
-  import { Send } from "@lucide/svelte";
+  import logoUrl from "$lib/assets/logo.png";
 
   let {
     title = "Immich Shuttle",
@@ -26,9 +26,7 @@
         {@render brand()}
       {:else}
         <div class="flex min-w-0 items-center gap-2.5" data-tauri-drag-region>
-          <div class="flex size-7 shrink-0 items-center justify-center rounded-lg brand-gradient">
-            <Send class="size-4 text-white" />
-          </div>
+          <img src={logoUrl} alt="" class="size-7 shrink-0 rounded-lg" draggable="false" />
           <span class="truncate text-[0.95rem] font-semibold tracking-tight text-card-foreground">{title}</span>
         </div>
       {/if}

@@ -7,7 +7,6 @@
   import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "$lib/components/ui/dialog";
   import { Input } from "$lib/components/ui/input";
   import { Badge } from "$lib/components/ui/badge";
-  import { ScrollArea } from "$lib/components/ui/scroll-area";
   import { Card, CardHeader, CardTitle, CardAction, CardContent } from "$lib/components/ui/card";
   import { Label } from "$lib/components/ui/label";
   import { Alert, AlertDescription } from "$lib/components/ui/alert";
@@ -81,7 +80,7 @@
           {/if}
         {/each}
       {:else}
-        <Badge variant="outline" class="text-muted-foreground">No album</Badge>
+        <Badge variant="outline" class="text-muted-foreground">No album selected</Badge>
       {/if}
     </div>
 
@@ -107,47 +106,51 @@
       </Alert>
     {/if}
 
-    <ScrollArea class="h-[200px] rounded-md border border-border bg-card">
-      <div class="sticky top-0 z-10 bg-card px-2 pt-2 pb-1">
-        <div class="flex items-center gap-2 border-b border-border pb-1.5">
-          <Search class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-          <input
-            bind:value={search}
-            aria-label="Search albums"
-            placeholder="Search albums..."
-            class="w-full bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
-          />
-          {#if search}
-            <button type="button" class="text-muted-foreground transition-colors hover:text-foreground" aria-label="Clear search" onclick={() => (search = "")}>
-              <X class="h-3.5 w-3.5" />
-            </button>
-          {/if}
-        </div>
-      </div>
-      <div class="flex flex-col gap-1 p-2">
-        {#if $albumsState.loading}
-          <p class="px-2 py-1.5 text-sm text-muted-foreground">Loading albums…</p>
-        {:else if $albumsState.availableAlbums.length === 0}
-          <p class="px-2 py-1.5 text-sm text-muted-foreground">No albums match.</p>
-        {:else}
+    <div class="flex items-center gap-2 rounded-md border border-border bg-card px-2 py-1.5">
+      <Search class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      <input
+        bind:value={search}
+        aria-label="Search albums"
+        placeholder="Search albums..."
+        class="w-full bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
+      />
+      {#if search}
+        <button
+          type="button"
+          class="text-muted-foreground transition-colors hover:text-foreground"
+          aria-label="Clear search"
+          onclick={() => (search = "")}
+        >
+          <X class="h-3.5 w-3.5" />
+        </button>
+      {/if}
+    </div>
+
+    <div class="album-scroll h-[160px] overflow-y-auto rounded-md border border-border bg-card p-2">
+      {#if $albumsState.loading}
+        <p class="px-1 py-1 text-sm text-muted-foreground">Loading albums…</p>
+      {:else if $albumsState.availableAlbums.length === 0}
+        <p class="px-1 py-1 text-sm text-muted-foreground">No albums match.</p>
+      {:else}
+        <div class="flex flex-wrap gap-1.5">
           {#each $albumsState.availableAlbums as album}
             {@const selected = $albumsState.selectedAlbumIds.includes(album.id)}
             <button
               type="button"
-              class="flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1.5 text-left text-sm transition-colors focus:outline-none {selected ? 'border-l-2 border-primary bg-primary/10 text-primary' : 'hover:bg-accent focus:bg-accent'}"
-              onclick={() => selected ? albumsState.deselectAlbum(album.id) : albumsState.selectAlbum(album.id)}
+              title={album.shared_with.length > 0
+                ? `${album.album_name} — shared with ${album.shared_with.map((user) => user.name).join(", ")}`
+                : album.album_name}
+              class="max-w-[12rem] truncate rounded-full border px-3 py-1 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring {selected
+                ? 'border-primary bg-primary/15 text-primary'
+                : 'border-border bg-muted/40 text-foreground hover:bg-accent'}"
+              onclick={() => (selected ? albumsState.deselectAlbum(album.id) : albumsState.selectAlbum(album.id))}
             >
-              <span class="font-medium {selected ? 'text-primary' : 'text-foreground'}">{album.album_name}</span>
-              {#if album.shared_with.length > 0}
-                <span class="text-xs text-muted-foreground">
-                  shared with: {album.shared_with.map((user) => user.name).join(", ")}
-                </span>
-              {/if}
+              {album.album_name}
             </button>
           {/each}
-        {/if}
-      </div>
-    </ScrollArea>
+        </div>
+      {/if}
+    </div>
 
     {#if $albumsState.error}
       <p class="text-sm text-destructive">{$albumsState.error}</p>
@@ -197,3 +200,20 @@
     </DialogContent>
   </Dialog>
 </Card>
+
+<style>
+  /* Keep the album list's scrollbar visible (WebKit defaults to an auto-hiding
+     overlay scrollbar) so it reads clearly as a scroll box. */
+  .album-scroll::-webkit-scrollbar {
+    width: 10px;
+  }
+  .album-scroll::-webkit-scrollbar-thumb {
+    background-color: var(--border);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  .album-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+</style>

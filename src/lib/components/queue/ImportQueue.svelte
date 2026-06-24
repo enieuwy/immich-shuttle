@@ -91,8 +91,8 @@
     {#if $queueState.loading && $queueState.jobs.length === 0}
       <p class="py-2 text-sm text-muted-foreground">Loading jobs…</p>
     {:else if $queueState.jobs.length === 0}
-      <div class="flex flex-col items-center gap-2 py-10 text-center">
-        <Inbox class="h-10 w-10 text-muted-foreground/60" aria-hidden="true" />
+      <div class="flex flex-col items-center gap-2 py-6 text-center">
+        <Inbox class="h-8 w-8 text-muted-foreground/60" aria-hidden="true" />
         <p class="text-sm text-muted-foreground">No imports yet</p>
         <p class="text-xs text-muted-foreground/70">
           Pick a source and start an import to see progress here.
