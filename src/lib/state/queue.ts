@@ -172,7 +172,7 @@ export const queueState = {
       keep_files: overrides?.keepFiles ?? options.keepFiles,
       stack_raw_jpeg: options.stackRawJpeg,
       stack_burst: options.stackBurst,
-      date_range: options.dateRange,
+      date_range: null,
       concurrent_tasks: options.concurrentTasks,
       select_files: overrides?.selectFiles ?? null,
     });

@@ -105,12 +105,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
 
     let source_paths = input.source_paths.clone();
     let record_source_paths = source_paths.clone();
-    let keep_files = input.keep_files
-        || input
-            .select_files
-            .as_ref()
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
+    // Selected (staged) imports honor the same keep/delete toggle as whole-folder
+    // imports; the post-wipe SHA-1 verification guards deletion either way.
+    let keep_files = input.keep_files;
     let stack_raw_jpeg = input.stack_raw_jpeg;
     let stack_burst = input.stack_burst;
     let date_range = input.date_range.clone();
@@ -219,7 +216,15 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let run = crate::services::stdout_parser::parse_run_progress(&log_contents);
         let mut progress = run.progress;
         progress.errors = file_errors.len() as u32;
-        let completed_asset_paths = run.completed_paths;
+        // For a staged (selected) import the log's paths point at the temp
+        // symlink dir, which is cleaned up below — so wipe must target the user's
+        // selected originals instead. SHA-1 verify_uploaded still gates deletion
+        // to files the server actually holds, so unuploaded picks are kept safe.
+        let completed_asset_paths = if staging_dir.is_some() {
+            select_files.clone()
+        } else {
+            run.completed_paths
+        };
 
         let update = if cancelled {
             ImportJob {

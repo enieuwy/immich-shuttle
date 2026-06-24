@@ -4,7 +4,6 @@ type ImportOptionsState = {
   keepFiles: boolean;
   stackRawJpeg: boolean;
   stackBurst: boolean;
-  dateRange: string | null;
   concurrentTasks: number | null;
 };
 
@@ -12,7 +11,6 @@ const initialState: ImportOptionsState = {
   keepFiles: true,
   stackRawJpeg: true,
   stackBurst: true,
-  dateRange: null,
   concurrentTasks: null,
 };
 
@@ -29,9 +27,7 @@ export const importOptionsState = {
   setStackBurst(stackBurst: boolean) {
     state.update((s) => ({ ...s, stackBurst }));
   },
-  setDateRange(dateRange: string | null) {
-    state.update((s) => ({ ...s, dateRange }));
-  },
+
   setConcurrentTasks(concurrentTasks: number | null) {
     state.update((s) => ({ ...s, concurrentTasks }));
   },

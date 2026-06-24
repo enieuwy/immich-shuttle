@@ -7,6 +7,7 @@
   import { sourceState } from "$lib/state/source";
   import { queueState } from "$lib/state/queue";
   import { errorsState } from "$lib/state/errors";
+  import { importOptionsState } from "$lib/state/import-options";
   import { Button } from "$lib/components/ui/button";
   import {
     Dialog,
@@ -61,7 +62,12 @@
     <DialogHeader class="border-b border-border px-4 py-3">
       <DialogTitle>Preview &amp; select</DialogTitle>
       <DialogDescription>
-        Choose which photos and videos to import. Source files are kept; nothing is deleted.
+        {#if $importOptionsState.keepFiles}
+          Choose which photos and videos to import. Source files are kept.
+        {:else}
+          Choose which photos and videos to import. Uploaded files are deleted from
+          the source after you confirm.
+        {/if}
       </DialogDescription>
     </DialogHeader>
 

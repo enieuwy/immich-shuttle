@@ -44,4 +44,23 @@ describe("selectionState", () => {
     const after = get(selectionState).selected;
     expect(after).not.toBe(before);
   });
+
+  it("add unions paths into the selection without dropping existing", () => {
+    selectionState.selectOnly(["/a.jpg"]);
+    selectionState.add(["/b.jpg", "/c.jpg", "/a.jpg"]);
+    expect(selectionState.paths().sort()).toEqual(["/a.jpg", "/b.jpg", "/c.jpg"]);
+  });
+
+  it("remove drops only the given paths", () => {
+    selectionState.selectOnly(["/a.jpg", "/b.jpg", "/c.jpg"]);
+    selectionState.remove(["/b.jpg", "/missing.jpg"]);
+    expect(selectionState.paths().sort()).toEqual(["/a.jpg", "/c.jpg"]);
+  });
+
+  it("invert toggles each path in the subset, leaving others untouched", () => {
+    selectionState.selectOnly(["/a.jpg", "/keep.jpg"]);
+    // visible subset = a, b, c -> a was selected (deselect), b & c become selected
+    selectionState.invert(["/a.jpg", "/b.jpg", "/c.jpg"]);
+    expect(selectionState.paths().sort()).toEqual(["/b.jpg", "/c.jpg", "/keep.jpg"]);
+  });
 });

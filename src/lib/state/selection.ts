@@ -31,6 +31,37 @@ export const selectionState = {
     state.set({ selected: new Set(paths) });
   },
 
+  /** Add every path to the selection (union); used by "select all" on a filter. */
+  add(paths: string[]): void {
+    state.update((s) => {
+      const next = new Set(s.selected);
+      for (const p of paths) next.add(p);
+      return { selected: next };
+    });
+  },
+
+  /** Remove every path from the selection (difference). */
+  remove(paths: string[]): void {
+    state.update((s) => {
+      const next = new Set(s.selected);
+      for (const p of paths) next.delete(p);
+      return { selected: next };
+    });
+  },
+
+  /** Toggle each path within `paths` — i.e. invert selection over a subset
+   *  (the currently visible/filtered files), leaving the rest untouched. */
+  invert(paths: string[]): void {
+    state.update((s) => {
+      const next = new Set(s.selected);
+      for (const p of paths) {
+        if (next.has(p)) next.delete(p);
+        else next.add(p);
+      }
+      return { selected: next };
+    });
+  },
+
   clear(): void {
     state.set({ selected: new Set() });
   },
