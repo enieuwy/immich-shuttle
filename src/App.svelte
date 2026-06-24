@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { Play, FileText, ListChecks, History } from "@lucide/svelte";
+  import { Play, FileText } from "@lucide/svelte";
 
   import AppLayout from "$lib/components/layout/AppLayout.svelte";
   import ThemeToggle from "$lib/components/layout/ThemeToggle.svelte";
@@ -19,11 +19,11 @@
   import PreviewDialog from "$lib/components/preview/PreviewDialog.svelte";
   import { Button } from "$lib/components/ui/button";
   import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "$lib/components/ui/dialog";
-  import { Tabs, TabsList, TabsTrigger, TabsContent } from "$lib/components/ui/tabs";
   import { getProfilesSnapshot, profilesState } from "$lib/state/profiles";
   import { queueState } from "$lib/state/queue";
   import { selectionState } from "$lib/state/selection";
   import { sourceState } from "$lib/state/source";
+  import { panelTab } from "$lib/state/ui";
 
   let showManager = $state(false);
   let showLogs = $state(false);
@@ -111,22 +111,11 @@
     </div>
     <div class="flex flex-col gap-5">
       <AlbumSelector />
-      <Tabs value="queue">
-        <TabsList>
-          <TabsTrigger value="queue">
-            <ListChecks class="size-4" /> Queue
-          </TabsTrigger>
-          <TabsTrigger value="history">
-            <History class="size-4" /> History
-          </TabsTrigger>
-        </TabsList>
-        <TabsContent value="queue">
-          <ImportQueue />
-        </TabsContent>
-        <TabsContent value="history">
-          <HistoryPanel />
-        </TabsContent>
-      </Tabs>
+      {#if $panelTab === "queue"}
+        <ImportQueue />
+      {:else}
+        <HistoryPanel />
+      {/if}
     </div>
   </div>
 

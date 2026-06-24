@@ -1,12 +1,13 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ListChecks, Inbox, X, AlertTriangle, FileWarning, RotateCcw, Trash2 } from "@lucide/svelte";
+  import { Inbox, X, AlertTriangle, FileWarning, RotateCcw, Trash2 } from "@lucide/svelte";
 
   import { queueState } from "$lib/state/queue";
-  import { Card, CardHeader, CardTitle, CardContent } from "$lib/components/ui/card";
+  import { Card, CardHeader, CardContent } from "$lib/components/ui/card";
   import { Badge } from "$lib/components/ui/badge";
   import { Button } from "$lib/components/ui/button";
   import { Progress } from "$lib/components/ui/progress";
+  import PanelTabs from "./PanelTabs.svelte";
 
   let actionError = $state("");
 
@@ -62,8 +63,7 @@
 
 <Card>
   <CardHeader class="flex flex-row items-center gap-2">
-    <ListChecks class="h-4 w-4 text-muted-foreground" aria-hidden="true" />
-    <CardTitle class="text-sm font-semibold">Import queue</CardTitle>
+    <PanelTabs />
     <div class="ml-auto flex items-center gap-2">
       {#if $queueState.jobs.some((job) => isFinished(job.status))}
         <Button

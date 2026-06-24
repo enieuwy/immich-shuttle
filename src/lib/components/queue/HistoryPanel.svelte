@@ -1,13 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { History, Clock, Trash2 } from "@lucide/svelte";
+  import { Clock, Trash2 } from "@lucide/svelte";
 
   import { historyState } from "$lib/state/history";
   import type { ImportRecord } from "$lib/types";
-  import { Card, CardHeader, CardTitle, CardContent } from "$lib/components/ui/card";
+  import { Card, CardHeader, CardContent } from "$lib/components/ui/card";
   import { Badge } from "$lib/components/ui/badge";
   import { Button } from "$lib/components/ui/button";
   import { ScrollArea } from "$lib/components/ui/scroll-area";
+  import PanelTabs from "./PanelTabs.svelte";
 
   onMount(() => {
     void historyState.loadHistory();
@@ -64,8 +65,7 @@
 
 <Card>
   <CardHeader class="flex flex-row items-center gap-2">
-    <History class="h-4 w-4 text-muted-foreground" aria-hidden="true" />
-    <CardTitle class="text-sm font-semibold">Import history</CardTitle>
+    <PanelTabs />
     <div class="ml-auto flex items-center gap-2">
       {#if $historyState.records.length > 0}
         <Button
@@ -87,8 +87,8 @@
     {#if $historyState.loading && $historyState.records.length === 0}
       <p class="py-2 text-sm text-muted-foreground">Loading history…</p>
     {:else if $historyState.records.length === 0}
-      <div class="flex flex-col items-center gap-2 py-10 text-center">
-        <Clock class="h-10 w-10 text-muted-foreground/60" aria-hidden="true" />
+      <div class="flex flex-col items-center gap-2 py-6 text-center">
+        <Clock class="h-8 w-8 text-muted-foreground/60" aria-hidden="true" />
         <p class="text-sm text-muted-foreground">No past imports</p>
         <p class="text-xs text-muted-foreground/70">
           Completed imports will be recorded here so you can look back later.

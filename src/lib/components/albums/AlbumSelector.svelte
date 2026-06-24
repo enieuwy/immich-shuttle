@@ -140,12 +140,30 @@
               title={album.shared_with.length > 0
                 ? `${album.album_name} — shared with ${album.shared_with.map((user) => user.name).join(", ")}`
                 : album.album_name}
-              class="max-w-[12rem] truncate rounded-full border px-3 py-1 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring {selected
+              class="inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring {selected
                 ? 'border-primary bg-primary/15 text-primary'
                 : 'border-border bg-muted/40 text-foreground hover:bg-accent'}"
               onclick={() => (selected ? albumsState.deselectAlbum(album.id) : albumsState.selectAlbum(album.id))}
             >
-              {album.album_name}
+              <span class="truncate">{album.album_name}</span>
+              {#if album.shared_with.length > 0}
+                <span class="flex shrink-0 -space-x-1" aria-hidden="true">
+                  {#each album.shared_with.slice(0, 3) as user}
+                    <span
+                      class="grid size-4 place-items-center rounded-full bg-primary/70 text-[8px] font-semibold text-primary-foreground ring-1 ring-card"
+                    >
+                      {user.name.charAt(0).toUpperCase()}
+                    </span>
+                  {/each}
+                  {#if album.shared_with.length > 3}
+                    <span
+                      class="grid size-4 place-items-center rounded-full bg-muted text-[8px] font-semibold text-muted-foreground ring-1 ring-card"
+                    >
+                      +{album.shared_with.length - 3}
+                    </span>
+                  {/if}
+                </span>
+              {/if}
             </button>
           {/each}
         </div>
