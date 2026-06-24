@@ -1,5 +1,6 @@
 <script lang="ts">
   import { Link, Search, Plus, X, Images } from "@lucide/svelte";
+  import { userDisplayNames } from "$lib/users";
 
   import { albumsState } from "$lib/state/albums";
   import { activeProfile } from "$lib/state/profiles";
@@ -138,7 +139,7 @@
             <button
               type="button"
               title={album.shared_with.length > 0
-                ? `${album.album_name} — shared with ${album.shared_with.map((user) => user.name).join(", ")}`
+                ? `${album.album_name} — shared with ${userDisplayNames(album.shared_with).join(", ")}`
                 : album.album_name}
               class="inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring {selected
                 ? 'border-primary bg-primary/15 text-primary'

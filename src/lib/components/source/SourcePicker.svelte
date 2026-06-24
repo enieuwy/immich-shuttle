@@ -26,6 +26,7 @@
   } from "$lib/components/ui/card";
 
   let manualPath = $state("");
+  let showPathInput = $state(false);
 
   let lastImportedAt = $state<number | null>(null);
 
@@ -285,8 +286,37 @@
         </Button>
       </div>
     {:else}
+      {#if $sourceState.loadingDevices}
+        <p class="text-sm text-muted-foreground">Scanning devices…</p>
+      {:else if $sourceState.detectedDevices.length > 0}
+        <div class="flex flex-col gap-1.5">
+          <h4 class="text-xs font-medium text-muted-foreground">Removable devices</h4>
+          {#each $sourceState.detectedDevices as device}
+            <button
+              type="button"
+              class="flex w-full items-center gap-3 rounded-lg border border-border p-3 text-left transition-colors hover:border-primary/40 hover:bg-accent"
+              onclick={() => sourceState.selectSources([device.mount_path])}
+            >
+              <HardDrive class="h-4 w-4 shrink-0 text-muted-foreground" />
+              <div class="min-w-0 flex-1">
+                <div class="flex items-center gap-2">
+                  <span class="truncate text-sm font-medium text-foreground">{device.name}</span>
+                  {#if device.has_dcim}
+                    <Badge variant="secondary">DCIM</Badge>
+                  {/if}
+                </div>
+                <p class="truncate text-xs text-muted-foreground">{device.mount_path}</p>
+              </div>
+              <span class="shrink-0 text-xs text-muted-foreground tabular-nums">
+                {fmtGb(device.available_space)} free of {fmtGb(device.total_space)}
+              </span>
+            </button>
+          {/each}
+        </div>
+      {/if}
+
       <div
-        class="flex flex-col items-center gap-3 rounded-xl border-2 border-dashed border-border px-4 py-8 text-center transition-colors hover:border-primary/50 hover:bg-muted/30"
+        class="flex flex-col items-center gap-3 rounded-xl border-2 border-dashed border-border px-4 py-6 text-center transition-colors hover:border-primary/50 hover:bg-muted/30"
       >
         <div class="flex h-12 w-12 items-center justify-center rounded-full bg-muted">
           <FileImage class="h-6 w-6 text-muted-foreground" />
@@ -307,41 +337,20 @@
         </div>
       </div>
 
-      <div class="flex items-center gap-2">
-        <Input bind:value={manualPath} placeholder="/path/to/photos" class="flex-1" />
-        <Button variant="outline" size="sm" onclick={chooseManualPath}>Use path</Button>
-      </div>
-
-      <div class="flex flex-col gap-2">
-        {#if $sourceState.loadingDevices}
-          <p class="text-sm text-muted-foreground">Scanning devices...</p>
-        {:else if $sourceState.detectedDevices.length > 0}
-          <h4 class="text-xs font-medium text-muted-foreground">Removable devices</h4>
-          <div class="flex flex-col gap-1.5">
-            {#each $sourceState.detectedDevices as device}
-              <button
-                type="button"
-                class="flex w-full items-center gap-3 rounded-lg border border-border p-3 text-left transition-colors hover:border-primary/40 hover:bg-accent"
-                onclick={() => sourceState.selectSources([device.mount_path])}
-              >
-                <HardDrive class="h-4 w-4 shrink-0 text-muted-foreground" />
-                <div class="min-w-0 flex-1">
-                  <div class="flex items-center gap-2">
-                    <span class="truncate text-sm font-medium text-foreground">{device.name}</span>
-                    {#if device.has_dcim}
-                      <Badge variant="secondary">DCIM</Badge>
-                    {/if}
-                  </div>
-                  <p class="truncate text-xs text-muted-foreground">{device.mount_path}</p>
-                </div>
-                <span class="shrink-0 text-xs text-muted-foreground tabular-nums">
-                  {fmtGb(device.available_space)} free of {fmtGb(device.total_space)}
-                </span>
-              </button>
-            {/each}
-          </div>
-        {/if}
-      </div>
+      {#if showPathInput}
+        <div class="flex items-center gap-2">
+          <Input bind:value={manualPath} placeholder="/path/to/photos" class="flex-1" />
+          <Button variant="outline" size="sm" onclick={chooseManualPath}>Use path</Button>
+        </div>
+      {:else}
+        <button
+          type="button"
+          class="self-start text-xs text-muted-foreground underline-offset-2 transition-colors hover:text-foreground hover:underline"
+          onclick={() => (showPathInput = true)}
+        >
+          Enter a path manually
+        </button>
+      {/if}
     {/if}
 
     <div class="flex items-center justify-between gap-3 rounded-lg border border-border/60 px-3 py-2.5">
