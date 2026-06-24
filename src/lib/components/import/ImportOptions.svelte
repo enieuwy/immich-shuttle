@@ -1,6 +1,5 @@
 <script lang="ts">
-  import { AlertTriangle, Gauge, SlidersHorizontal } from "@lucide/svelte";
-  import { Alert, AlertDescription, AlertTitle } from "$lib/components/ui/alert";
+  import { Gauge, SlidersHorizontal } from "@lucide/svelte";
   import { Card, CardContent, CardHeader } from "$lib/components/ui/card";
   import { Input } from "$lib/components/ui/input";
   import { Label } from "$lib/components/ui/label";
@@ -69,7 +68,7 @@
         class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
       >
         <span class="text-sm font-medium text-foreground">Delete uploaded files after import</span>
-        <span class="text-xs text-muted-foreground">Removes source files only after a confirmed upload.</span>
+        <span class="text-xs text-muted-foreground">Removes source files after upload — you'll review and confirm first.</span>
       </Label>
       <Switch
         id="import-option-delete-uploaded"
@@ -78,14 +77,6 @@
         onCheckedChange={(v) => importOptionsState.setKeepFiles(!v)}
       />
     </div>
-
-    {#if !$importOptionsState.keepFiles}
-      <Alert variant="destructive" class="mt-2">
-        <AlertTriangle />
-        <AlertTitle>This cannot be undone</AlertTitle>
-        <AlertDescription>Files are deleted from the source once Immich confirms each upload.</AlertDescription>
-      </Alert>
-    {/if}
 
     <Separator class="my-2" />
 
