@@ -22,16 +22,35 @@
   import { Tabs, TabsList, TabsTrigger, TabsContent } from "$lib/components/ui/tabs";
   import { getProfilesSnapshot, profilesState } from "$lib/state/profiles";
   import { queueState } from "$lib/state/queue";
+  import { selectionState } from "$lib/state/selection";
+  import { sourceState } from "$lib/state/source";
 
   let showManager = $state(false);
   let showLogs = $state(false);
   let showOnboarding = $state(false);
   let importError = $state("");
 
+  // Files chosen in Preview & select, intersected with the current scan so a
+  // stale selection from a previous source can never be staged.
+  const selectedPaths = $derived.by(() => {
+    const files = $sourceState.scanResult?.files ?? [];
+    const valid = new Set(files.map((f) => f.path));
+    const out: string[] = [];
+    for (const path of $selectionState.selected) {
+      if (valid.has(path)) out.push(path);
+    }
+    return out;
+  });
+  const selectedCount = $derived(selectedPaths.length);
+
   async function startImport() {
     importError = "";
+    const selection = selectedPaths;
     try {
-      await queueState.startImport();
+      await queueState.startImport(
+        selection.length > 0 ? { selectFiles: selection } : {},
+      );
+      selectionState.clear();
     } catch (error) {
       importError = error instanceof Error ? error.message : String(error);
     }
@@ -140,7 +159,8 @@
           <FileText class="size-4" /> Logs
         </Button>
         <Button size="sm" onclick={startImport}>
-          <Play class="size-4" /> Start Import
+          <Play class="size-4" />
+          {selectedCount > 0 ? `Import ${selectedCount} selected` : "Start Import"}
         </Button>
       </div>
     </div>

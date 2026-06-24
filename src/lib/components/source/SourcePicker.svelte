@@ -29,6 +29,18 @@
 
   let lastImportedAt = $state<number | null>(null);
 
+  // Count of previewed-and-selected files that still belong to the current scan.
+  const selectedCount = $derived.by(() => {
+    const files = $sourceState.scanResult?.files ?? [];
+    if (files.length === 0) return 0;
+    const valid = new Set(files.map((f) => f.path));
+    let n = 0;
+    for (const path of $selectionState.selected) {
+      if (valid.has(path)) n++;
+    }
+    return n;
+  });
+
   $effect(() => {
     const paths = $sourceState.selectedPaths;
     if (paths.length === 0) {
@@ -226,9 +238,24 @@
               </span>
             </div>
             {#if $sourceState.scanResult.files.length > 0}
-              <Button variant="outline" size="sm" class="mt-1 w-fit" onclick={openPreview}>
-                <LayoutGrid class="h-3.5 w-3.5" /> Preview &amp; select
-              </Button>
+              <div class="mt-1 flex flex-wrap items-center gap-2">
+                <Button variant="outline" size="sm" class="w-fit" onclick={openPreview}>
+                  <LayoutGrid class="h-3.5 w-3.5" /> Preview &amp; select
+                </Button>
+                {#if selectedCount > 0}
+                  <span class="text-xs font-medium text-foreground">
+                    {selectedCount} of {$sourceState.scanResult.files.length} selected
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    class="h-7 px-2 text-xs text-muted-foreground"
+                    onclick={() => selectionState.clear()}
+                  >
+                    Clear
+                  </Button>
+                {/if}
+              </div>
             {/if}
             {#if $sourceState.scanResult.skipped_unreadable > 0}
               <p class="text-xs text-muted-foreground">
