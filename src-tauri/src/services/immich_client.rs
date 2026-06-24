@@ -255,6 +255,10 @@ impl ImmichClient {
         })
     }
 
+    // Not currently wired: post-upload album assignment needs server asset IDs,
+    // which immich-go v0.31.0 does not log on "uploaded successfully" lines.
+    // Retained for when album auto-assignment is implemented (separate issue).
+    #[allow(dead_code)]
     pub async fn add_assets_to_album(
         &self,
         album_id: &str,

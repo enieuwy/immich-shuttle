@@ -10,7 +10,7 @@ pub enum JobStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JobProgress {
     pub total: u32,
     pub uploaded: u32,

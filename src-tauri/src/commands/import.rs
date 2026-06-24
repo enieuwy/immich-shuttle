@@ -16,9 +16,8 @@ use crate::{
         media::ScanResult,
     },
     services::{
-        immich_client::ImmichClient,
         keychain, logs, media_scanner, profile_store,
-        sidecar_runner::{run_upload, SidecarResult, UploadRequest},
+        sidecar_runner::{run_upload, UploadRequest},
         staging, url_resolver, wipe,
     },
 };
@@ -179,41 +178,25 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             date_range,
             concurrent_tasks,
         };
-        let mut merged_progress = JobProgress {
-            total: 0,
-            uploaded: 0,
-            duplicates: 0,
-            errors: 0,
-        };
-        let mut merged_had_error_line = false;
-        let mut merged_error_lines: Vec<String> = Vec::new();
-        let mut merged_asset_paths = Vec::new();
-        let mut merged_asset_ids = Vec::new();
+        let mut error_lines: Vec<String> = Vec::new();
+        let mut exit_nonzero = false;
+        let mut cancelled = false;
+        let mut spawn_error: Option<String> = None;
 
         let mut request = request;
-        let mut upload_error: Option<String> = None;
-
         for path in upload_paths {
             request.source_path = path;
             match run_upload(app_clone.clone(), request.clone()).await {
                 Ok(run) => {
-                    merged_progress.total =
-                        merged_progress.total.saturating_add(run.progress.total);
-                    merged_progress.uploaded = merged_progress
-                        .uploaded
-                        .saturating_add(run.progress.uploaded);
-                    merged_progress.duplicates = merged_progress
-                        .duplicates
-                        .saturating_add(run.progress.duplicates);
-                    merged_progress.errors =
-                        merged_progress.errors.saturating_add(run.progress.errors);
-                    merged_had_error_line |= run.had_error_line;
-                    merged_error_lines.extend(run.error_lines);
-                    merged_asset_paths.extend(run.completed_asset_paths);
-                    merged_asset_ids.extend(run.completed_asset_ids);
+                    error_lines.extend(run.error_lines);
+                    exit_nonzero |= run.exit_nonzero;
                 }
                 Err(err) => {
-                    upload_error = Some(err);
+                    if err == "Cancelled by user" {
+                        cancelled = true;
+                    } else {
+                        spawn_error = Some(err);
+                    }
                     break;
                 }
             }
@@ -223,168 +206,134 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             staging::cleanup_staging_dir(dir);
         }
 
-        let result = if let Some(err) = upload_error {
-            Err(err)
-        } else {
-            Ok(SidecarResult {
-                progress: merged_progress,
-                had_error_line: merged_had_error_line,
-                error_lines: merged_error_lines,
-                completed_asset_paths: merged_asset_paths,
-                completed_asset_ids: merged_asset_ids,
-            })
-        };
-
         if let Ok(mut running) = RUNNING_IMPORTS.lock() {
             running.remove(&job_id_clone);
         }
 
-        // immich-go writes per-file events to the run log, not stdout. Read it
-        // once after the run (the file is O_APPEND across multi-path runs) for
-        // per-file errors and the confirmed-upload paths + duplicate count, then
-        // fold the log-derived figures into the successful result.
+        // immich-go writes per-file events to the run log (stdout only carries a
+        // `\r`-refreshed aggregate that can't be read reliably through the pipe).
+        // The log is O_APPEND across multi-path runs, so one read afterwards
+        // yields the authoritative totals, completed paths, and per-file errors.
         let log_contents = std::fs::read_to_string(&request.log_path).unwrap_or_default();
         let file_errors = crate::services::stdout_parser::parse_error_log(&log_contents);
-        let completed = crate::services::stdout_parser::parse_completed_assets(&log_contents);
-        let result = result.map(|mut r| {
-            r.completed_asset_paths = completed.paths;
-            r.progress.duplicates = completed.duplicates;
-            r
-        });
+        let run = crate::services::stdout_parser::parse_run_progress(&log_contents);
+        let mut progress = run.progress;
+        progress.errors = file_errors.len() as u32;
+        let completed_asset_paths = run.completed_paths;
 
-        let update = match result {
-            Ok(SidecarResult {
-                progress,
-                had_error_line,
-                error_lines,
-                completed_asset_paths,
-                completed_asset_ids,
-            }) => ImportJob {
+        let update = if cancelled {
+            ImportJob {
                 id: job_id_clone.clone(),
-                status: if had_error_line {
-                    JobStatus::Failed
-                } else {
-                    JobStatus::Completed
+                status: JobStatus::Cancelled,
+                progress: JobProgress {
+                    total: 0,
+                    uploaded: 0,
+                    duplicates: 0,
+                    errors: 0,
                 },
+                error: None,
+                summary: Some("Import cancelled by user.".to_string()),
+                awaiting_wipe_confirmation: false,
+                pending_wipe_count: 0,
+                file_errors: Vec::new(),
+            }
+        } else if let Some(err) = spawn_error {
+            ImportJob {
+                id: job_id_clone.clone(),
+                status: JobStatus::Failed,
                 progress,
-                error: {
-                    let mut error: Option<String> = None;
-                    if had_error_line {
-                        let last_errors: Vec<&str> = error_lines
-                            .iter()
-                            .rev()
-                            .take(3)
-                            .map(|s| s.as_str())
-                            .collect();
-                        let last_errors: Vec<&str> = last_errors.into_iter().rev().collect();
-                        if last_errors.is_empty() {
-                            error =
-                                Some("immich-go reported error output during upload".to_string());
-                        } else {
-                            error = Some(last_errors.join(" | "));
-                        }
-                    }
-                    if !had_error_line && !album_ids.is_empty() && !completed_asset_ids.is_empty() {
-                        let client =
-                            ImmichClient::new(&profile.server_url, &api_key_for_album_assignment);
-                        let mut failures = Vec::new();
-                        for album_id in &album_ids {
-                            if let Err(err) = client
-                                .add_assets_to_album(album_id, &completed_asset_ids)
-                                .await
-                            {
-                                failures.push(format!("{album_id}: {err}"));
-                            }
-                        }
-                        if !failures.is_empty() {
-                            error = Some(format!(
-                                "Album assignment failed for {} album(s): {}",
-                                failures.len(),
-                                failures.join(" | ")
-                            ));
-                        }
-                    }
-                    error
-                },
-                summary: if had_error_line {
-                    None
-                } else if !keep_files {
-                    if let Ok(mut pending) = PENDING_WIPE.lock() {
-                        pending.insert(
-                            job_id_clone.clone(),
-                            PendingWipe {
-                                paths: completed_asset_paths.clone(),
-                                server_url: profile.server_url.clone(),
-                                api_key: api_key_for_album_assignment.clone(),
-                            },
-                        );
-                    } else {
-                        let _ = logs::append_log(
-                            "app.log",
-                            &format!(
-                                "import_wipe_pending_store_failed job_id={} pending_count={}",
-                                job_id_clone,
-                                completed_asset_paths.len()
-                            ),
-                        );
-                    }
-                    Some(if album_ids.is_empty() {
-                        "Upload completed. Awaiting wipe confirmation.".to_string()
-                    } else {
-                        format!(
-                            "Upload completed. Assigned {} assets to {} album(s). Awaiting wipe confirmation.",
-                            completed_asset_ids.len(),
-                            album_ids.len()
-                        )
-                    })
+                error: Some(err),
+                summary: None,
+                awaiting_wipe_confirmation: false,
+                pending_wipe_count: 0,
+                file_errors: file_errors.clone(),
+            }
+        } else {
+            // The process ran to completion. It is a failure only when nothing
+            // reached the server AND it ended badly; a partial run that uploaded
+            // or matched duplicates succeeds with any per-file errors surfaced.
+            let nothing_landed = progress.uploaded == 0 && progress.duplicates == 0;
+            let failed = nothing_landed && (exit_nonzero || !file_errors.is_empty());
+            let status = if failed {
+                JobStatus::Failed
+            } else {
+                JobStatus::Completed
+            };
+
+            let wipe_eligible = !failed && !keep_files && !completed_asset_paths.is_empty();
+            if wipe_eligible {
+                if let Ok(mut pending) = PENDING_WIPE.lock() {
+                    pending.insert(
+                        job_id_clone.clone(),
+                        PendingWipe {
+                            paths: completed_asset_paths.clone(),
+                            server_url: profile.server_url.clone(),
+                            api_key: api_key_for_album_assignment.clone(),
+                        },
+                    );
                 } else {
-                    Some(if album_ids.is_empty() {
-                        "Upload completed. Files were kept on disk.".to_string()
-                    } else {
-                        format!(
-                            "Upload completed. Assigned {} assets to {} album(s). Files were kept on disk.",
-                            completed_asset_ids.len(),
-                            album_ids.len()
-                        )
-                    })
-                },
-                awaiting_wipe_confirmation: !had_error_line && !keep_files,
-                pending_wipe_count: if had_error_line || keep_files {
-                    0
+                    let _ = logs::append_log(
+                        "app.log",
+                        &format!(
+                            "import_wipe_pending_store_failed job_id={} pending_count={}",
+                            job_id_clone,
+                            completed_asset_paths.len()
+                        ),
+                    );
+                }
+            }
+
+            let error = if failed {
+                let tail: Vec<&str> = error_lines
+                    .iter()
+                    .rev()
+                    .take(3)
+                    .map(|s| s.as_str())
+                    .collect();
+                let tail: Vec<&str> = tail.into_iter().rev().collect();
+                Some(if tail.is_empty() {
+                    "immich-go reported errors during upload".to_string()
                 } else {
+                    tail.join(" | ")
+                })
+            } else if !file_errors.is_empty() {
+                Some(format!(
+                    "{} file(s) could not be uploaded; see the error list.",
+                    file_errors.len()
+                ))
+            } else {
+                None
+            };
+
+            let summary = if failed {
+                None
+            } else {
+                let head = format!(
+                    "Upload completed. {} uploaded, {} duplicates, {} errors.",
+                    progress.uploaded, progress.duplicates, progress.errors
+                );
+                Some(if keep_files {
+                    format!("{head} Files kept on disk.")
+                } else if wipe_eligible {
+                    format!("{head} Awaiting wipe confirmation.")
+                } else {
+                    head
+                })
+            };
+
+            ImportJob {
+                id: job_id_clone.clone(),
+                status,
+                progress,
+                error,
+                summary,
+                awaiting_wipe_confirmation: wipe_eligible,
+                pending_wipe_count: if wipe_eligible {
                     completed_asset_paths.len() as u32
+                } else {
+                    0
                 },
                 file_errors: file_errors.clone(),
-            },
-            Err(err) => {
-                let cancelled = err == "Cancelled by user";
-                ImportJob {
-                    id: job_id_clone.clone(),
-                    status: if cancelled {
-                        JobStatus::Cancelled
-                    } else {
-                        JobStatus::Failed
-                    },
-                    progress: JobProgress {
-                        total: 0,
-                        uploaded: 0,
-                        duplicates: 0,
-                        errors: if cancelled { 0 } else { 1 },
-                    },
-                    error: if cancelled { None } else { Some(err) },
-                    summary: if cancelled {
-                        Some("Import cancelled by user.".to_string())
-                    } else {
-                        None
-                    },
-                    awaiting_wipe_confirmation: false,
-                    pending_wipe_count: 0,
-                    file_errors: if cancelled {
-                        Vec::new()
-                    } else {
-                        file_errors.clone()
-                    },
-                }
             }
         };
 

@@ -1,23 +1,23 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_shell::{process::CommandEvent, ShellExt};
 
-use crate::{models::job::JobProgress, services::stdout_parser::parse_line};
+use crate::services::stdout_parser::parse_run_progress;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SidecarResult {
-    pub progress: JobProgress,
-    pub had_error_line: bool,
+    /// stderr lines emitted by immich-go (diagnostics for a failed run).
     pub error_lines: Vec<String>,
-    pub completed_asset_paths: Vec<String>,
-    pub completed_asset_ids: Vec<String>,
+    /// Whether immich-go exited with a non-zero status.
+    pub exit_nonzero: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +33,25 @@ pub struct UploadRequest {
     pub stack_burst: bool,
     pub date_range: Option<String>,
     pub concurrent_tasks: Option<u32>,
+}
+
+/// Read the current run log and emit a progress snapshot to the frontend.
+fn emit_progress(app: &AppHandle, job_id: &str, log_path: &Path) {
+    let run = parse_run_progress(&std::fs::read_to_string(log_path).unwrap_or_default());
+    let current_file = run.completed_paths.last().and_then(|p| {
+        Path::new(p)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+    });
+    let _ = app.emit(
+        "import-progress",
+        serde_json::json!({
+            "job_id": job_id,
+            "progress": run.progress,
+            "parsed_progress": run.progress,
+            "current_file": current_file,
+        }),
+    );
 }
 
 pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<SidecarResult, String> {
@@ -94,21 +113,16 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
         .map_err(|e| format!("Could not spawn immich-go sidecar: {e}"))?;
     let child = Arc::new(tokio::sync::Mutex::new(Some(child)));
 
-    let mut progress = JobProgress {
-        total: 0,
-        uploaded: 0,
-        duplicates: 0,
-        errors: 0,
-    };
-    let mut had_error_line = false;
     let mut error_lines: Vec<String> = Vec::new();
-    // Per-file paths/ids come from the run log (parsed in import.rs), not
-    // stdout, which in --no-ui carries only the aggregate progress line.
-    let completed_asset_paths: Vec<String> = Vec::new();
-    let completed_asset_ids: Vec<String> = Vec::new();
-    let current_file: Option<String> = None;
+    let mut exit_nonzero = false;
 
-    while let Some(event) = rx.recv().await {
+    // immich-go's --no-ui stdout is a `\r`-refreshed aggregate that never
+    // line-flushes through the pipe, so progress is polled from the run log
+    // (append-only, written in real time) on a fixed cadence instead.
+    let mut ticker = tokio::time::interval(Duration::from_millis(500));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
         if request.cancel_flag.load(Ordering::Relaxed) {
             if let Some(running_child) = child.lock().await.take() {
                 let _ = running_child.kill();
@@ -116,55 +130,35 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
             return Err("Cancelled by user".to_string());
         }
 
-        match event {
-            CommandEvent::Stdout(line_bytes) => {
-                let line = String::from_utf8_lossy(&line_bytes).to_string();
-                progress = parse_line(&line, progress);
-                let _ = app.emit(
-                    "import-progress",
-                    serde_json::json!({
-                        "job_id": request.job_id,
-                        "line": line,
-                        "progress": progress,
-                        "parsed_progress": progress,
-                        "current_file": current_file,
-                    }),
-                );
+        tokio::select! {
+            _ = ticker.tick() => {
+                emit_progress(&app, &request.job_id, &request.log_path);
             }
-            CommandEvent::Stderr(line_bytes) => {
-                let line = String::from_utf8_lossy(&line_bytes).to_string();
-                had_error_line = true;
-                error_lines.push(line.trim().to_string());
-                let _ = app.emit(
-                    "import-progress",
-                    serde_json::json!({
-                        "job_id": request.job_id,
-                        "line": line,
-                        "progress": progress,
-                        "parsed_progress": progress,
-                        "current_file": current_file,
-                    }),
-                );
-            }
-            CommandEvent::Terminated(payload) => {
-                let _ = child.lock().await.take();
-                if payload.code.unwrap_or(1) != 0 {
-                    return Err(format!(
-                        "immich-go sidecar exited with code {}",
-                        payload.code.unwrap_or(-1)
-                    ));
+            maybe_event = rx.recv() => {
+                match maybe_event {
+                    None => break,
+                    Some(CommandEvent::Stderr(line_bytes)) => {
+                        let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                        if !line.is_empty() {
+                            error_lines.push(line);
+                        }
+                    }
+                    Some(CommandEvent::Terminated(payload)) => {
+                        let _ = child.lock().await.take();
+                        exit_nonzero = payload.code.unwrap_or(1) != 0;
+                        break;
+                    }
+                    Some(_) => {}
                 }
-                break;
             }
-            _ => {}
         }
     }
 
+    // Final authoritative snapshot so the UI lands on the run log's last counts.
+    emit_progress(&app, &request.job_id, &request.log_path);
+
     Ok(SidecarResult {
-        progress,
-        had_error_line,
         error_lines,
-        completed_asset_paths,
-        completed_asset_ids,
+        exit_nonzero,
     })
 }
