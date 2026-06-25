@@ -125,6 +125,9 @@ fn to_result(path_str: &str, file: &Path) -> Result<ThumbResult, String> {
 }
 
 /// Try the available backends in order; return the produced cache file, if any.
+// `png` is only consumed by the macOS Quick Look path; off macOS the portable
+// `image` backend writes JPEG only, leaving it intentionally unused.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
 fn generate(path: &Path, max: u32, jpg: &Path, png: &Path) -> Option<PathBuf> {
     let ext = ext_lower(path);
 
