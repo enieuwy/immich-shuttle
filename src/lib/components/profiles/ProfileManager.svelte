@@ -7,12 +7,20 @@
   import type { Profile } from "$lib/types";
   import { Button } from "$lib/components/ui/button";
 
-  let { onDone = () => {} } = $props<{ onDone?: () => void }>();
+  let { onDone = () => {}, initialEdit = null } = $props<{
+    onDone?: () => void;
+    initialEdit?: Profile | null;
+  }>();
 
   let editing = $state<Profile | null>(null);
   let creating = $state(false);
 
   onMount(async () => {
+    // When asked to edit a specific profile (e.g. it has no API key), open its
+    // editor directly instead of the profile list.
+    if (initialEdit) {
+      editing = initialEdit;
+    }
     await profilesState.loadProfiles();
   });
 

@@ -60,6 +60,27 @@ describe("albumsState", () => {
     expect(selected).toHaveLength(1);
   });
 
+  it("flags a missing API key instead of raising an error", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+
+    vi.mocked(api.albumsList).mockRejectedValueOnce(
+      new Error("No API key found for profile: p1"),
+    );
+    await albumsState.loadAlbums();
+
+    const s = get(albumsState);
+    expect(s.missingApiKey).toBe(true);
+    expect(s.error).toBeNull();
+  });
+
   it("creates album and selects it", async () => {
     await profilesState.saveProfile({
       id: "p1",

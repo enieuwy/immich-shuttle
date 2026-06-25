@@ -12,6 +12,8 @@ type AlbumsState = {
   availableUsers: AlbumUser[];
   loading: boolean;
   error: string | null;
+  /** The active profile has no stored API key — prompt to add one instead of erroring. */
+  missingApiKey: boolean;
   shareLinkUrl: string | null;
 };
 
@@ -21,6 +23,7 @@ const state = writable<AlbumsState>({
   availableUsers: [],
   loading: false,
   error: null,
+  missingApiKey: false,
   shareLinkUrl: null,
 });
 
@@ -33,7 +36,7 @@ export const albumsState = {
       return;
     }
 
-    state.update((s) => ({ ...s, loading: true, error: null }));
+    state.update((s) => ({ ...s, loading: true, error: null, missingApiKey: false }));
     try {
       const [availableAlbums, availableUsers] = await Promise.all([
         albumsList(profile.id, query),
@@ -41,12 +44,21 @@ export const albumsState = {
       ]);
       state.update((s) => ({ ...s, availableAlbums, availableUsers, loading: false }));
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // A missing key isn't an error to shout about — surface a CTA to add it.
+      if (/No API key/i.test(message)) {
+        state.update((s) => ({
+          ...s,
+          loading: false,
+          availableAlbums: [],
+          availableUsers: [],
+          missingApiKey: true,
+          error: null,
+        }));
+        return;
+      }
       errorsState.addError("Could not load albums.");
-      state.update((s) => ({
-        ...s,
-        loading: false,
-        error: error instanceof Error ? error.message : String(error),
-      }));
+      state.update((s) => ({ ...s, loading: false, error: message }));
     }
   },
   selectAlbum(albumId: string) {

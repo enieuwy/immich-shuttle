@@ -19,16 +19,29 @@
   import PreviewDialog from "$lib/components/preview/PreviewDialog.svelte";
   import { Button } from "$lib/components/ui/button";
   import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "$lib/components/ui/dialog";
-  import { getProfilesSnapshot, profilesState } from "$lib/state/profiles";
+  import { activeProfile, getProfilesSnapshot, profilesState } from "$lib/state/profiles";
+  import { albumsState } from "$lib/state/albums";
+  import type { Profile } from "$lib/types";
   import { queueState } from "$lib/state/queue";
   import { selectionState } from "$lib/state/selection";
   import { sourceState } from "$lib/state/source";
-  import { panelTab } from "$lib/state/ui";
+  import { openProfileEditor, panelTab } from "$lib/state/ui";
 
   let showManager = $state(false);
   let showLogs = $state(false);
   let showOnboarding = $state(false);
   let importError = $state("");
+  let editTarget = $state<Profile | null>(null);
+
+  // When a profile has no API key, the Albums CTA requests its editor — open the
+  // profile manager straight on that profile so the user lands on the key field.
+  $effect(() => {
+    if ($openProfileEditor) {
+      editTarget = $activeProfile;
+      showManager = true;
+      openProfileEditor.set(false);
+    }
+  });
 
   // Files chosen in Preview & select, intersected with the current scan so a
   // stale selection from a previous source can never be staged.
@@ -95,7 +108,7 @@
 
 <AppLayout>
   {#snippet profile()}
-    <ProfileSelector onManage={() => (showManager = !showManager)} />
+    <ProfileSelector onManage={() => { editTarget = null; showManager = !showManager; }} />
   {/snippet}
 
   {#snippet actions()}
@@ -162,7 +175,14 @@
       <DialogTitle>Manage Users</DialogTitle>
       <DialogDescription>Add or edit Immich user profiles.</DialogDescription>
     </DialogHeader>
-    <ProfileManager onDone={() => (showManager = false)} />
+    <ProfileManager
+      initialEdit={editTarget}
+      onDone={() => {
+        showManager = false;
+        editTarget = null;
+        void albumsState.loadAlbums();
+      }}
+    />
   </DialogContent>
 </Dialog>
 
