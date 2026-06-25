@@ -17,6 +17,10 @@ type AlbumsState = {
   shareLinkUrl: string | null;
 };
 
+// Bumped on each loadAlbums call so a newer load supersedes any in-flight retries.
+let loadGeneration = 0;
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 const state = writable<AlbumsState>({
   availableAlbums: [],
   selectedAlbumIds: [],
@@ -36,29 +40,56 @@ export const albumsState = {
       return;
     }
 
+    const generation = ++loadGeneration;
     state.update((s) => ({ ...s, loading: true, error: null, missingApiKey: false }));
-    try {
-      const [availableAlbums, availableUsers] = await Promise.all([
-        albumsList(profile.id, query),
-        usersList(profile.id),
-      ]);
-      state.update((s) => ({ ...s, availableAlbums, availableUsers, loading: false }));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      // A missing key isn't an error to shout about — surface a CTA to add it.
-      if (/No API key/i.test(message)) {
+
+    // Reaching a LAN server triggers the macOS Local Network prompt, and macOS
+    // denies the request that raises it. Retry a few times so we auto-recover the
+    // moment the user grants access (or the server comes back) — no manual retry.
+    const maxAttempts = 6;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (generation !== loadGeneration) return; // superseded by a newer load
+      try {
+        const [availableAlbums, availableUsers] = await Promise.all([
+          albumsList(profile.id, query),
+          usersList(profile.id),
+        ]);
+        if (generation !== loadGeneration) return;
+        state.update((s) => ({ ...s, availableAlbums, availableUsers, loading: false, error: null }));
+        return;
+      } catch (error) {
+        if (generation !== loadGeneration) return;
+        const message = error instanceof Error ? error.message : String(error);
+        // A missing key isn't an error to shout about — surface a CTA to add it.
+        if (/No API key/i.test(message)) {
+          state.update((s) => ({
+            ...s,
+            loading: false,
+            availableAlbums: [],
+            availableUsers: [],
+            missingApiKey: true,
+            error: null,
+          }));
+          return;
+        }
+        const isConnectionError =
+          /error sending request|tcp connect|no route to host|connection refused|dns error|connect/i.test(
+            message,
+          );
+        if (isConnectionError && attempt < maxAttempts) {
+          await delay(2500);
+          continue;
+        }
+        console.warn("loadAlbums failed:", message);
         state.update((s) => ({
           ...s,
           loading: false,
-          availableAlbums: [],
-          availableUsers: [],
-          missingApiKey: true,
-          error: null,
+          error: isConnectionError
+            ? "Couldn't reach your server. Make sure it's running and reachable."
+            : "Couldn't load albums.",
         }));
         return;
       }
-      errorsState.addError("Could not load albums.");
-      state.update((s) => ({ ...s, loading: false, error: message }));
     }
   },
   selectAlbum(albumId: string) {

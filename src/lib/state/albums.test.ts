@@ -81,6 +81,32 @@ describe("albumsState", () => {
     expect(s.error).toBeNull();
   });
 
+  it("auto-retries a connection error and recovers", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+
+    vi.useFakeTimers();
+    vi.mocked(api.albumsList)
+      .mockRejectedValueOnce(new Error("error sending request: tcp connect error -> No route to host"))
+      .mockResolvedValueOnce([{ id: "a1", album_name: "Family", shared_with: [] }]);
+
+    const pending = albumsState.loadAlbums();
+    await vi.advanceTimersByTimeAsync(3000); // clear the retry backoff
+    await pending;
+    vi.useRealTimers();
+
+    const s = get(albumsState);
+    expect(s.error).toBeNull();
+    expect(s.availableAlbums.map((a) => a.id)).toContain("a1");
+  });
+
   it("creates album and selects it", async () => {
     await profilesState.saveProfile({
       id: "p1",
