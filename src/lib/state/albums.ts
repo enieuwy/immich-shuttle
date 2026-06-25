@@ -80,7 +80,8 @@ export const albumsState = {
       state.update((s) => ({
         ...s,
         availableAlbums: [created, ...s.availableAlbums],
-        selectedAlbumIds: [...s.selectedAlbumIds, created.id],
+        // Single-select: importing into the just-created album (--into-album).
+        selectedAlbumIds: [created.id],
         shareLinkUrl,
       }));
       return created;

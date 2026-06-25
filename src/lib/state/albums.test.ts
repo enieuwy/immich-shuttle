@@ -71,9 +71,12 @@ describe("albumsState", () => {
     });
     profilesState.setActiveProfile("p1");
 
+    await albumsState.loadAlbums();
+    albumsState.selectAlbum("a1");
     await albumsState.createAlbum("Holiday", ["u1"], true);
     expect(vi.mocked(api.albumCreate)).toHaveBeenCalled();
-    expect(get(albumsState).selectedAlbumIds).toContain("a2");
+    // Single-select: the new album replaces any prior selection.
+    expect(get(albumsState).selectedAlbumIds).toEqual(["a2"]);
   });
 
   it("stores the public share link after creating a linked album", async () => {
