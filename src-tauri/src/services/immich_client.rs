@@ -1,6 +1,20 @@
+use std::time::Duration;
+
+use once_cell::sync::Lazy;
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+/// One shared HTTP client (connection pool + TLS config) reused across every
+/// request. Building a fresh `Client` per call is wasteful and was a likely
+/// source of flaky "error sending request" failures during the startup burst.
+static HTTP: Lazy<Client> = Lazy::new(|| {
+    Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| Client::new())
+});
 
 use crate::models::album::{Album, AlbumShareLink, AlbumUser};
 
@@ -29,7 +43,7 @@ impl ImmichClient {
         Self {
             server_url: normalize_server_url(server_url),
             api_key: api_key.to_string(),
-            http: Client::new(),
+            http: HTTP.clone(),
         }
     }
 
@@ -82,7 +96,14 @@ impl ImmichClient {
                     }
                 }
                 Err(e) => {
-                    last_err = format!("API {method} {path} failed at {url}: {e}");
+                    let mut detail = e.to_string();
+                    let mut src = std::error::Error::source(&e);
+                    while let Some(s) = src {
+                        detail.push_str(" -> ");
+                        detail.push_str(&s.to_string());
+                        src = s.source();
+                    }
+                    last_err = format!("API {method} {path} failed at {url}: {detail}");
                 }
             }
         }
