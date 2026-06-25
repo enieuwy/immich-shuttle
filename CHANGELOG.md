@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Branding
+- New original app icon and in-app logo — the "Send-lens" mark (an open lens ring with an upward arrow, reading as *sending photos into Immich*) in the indigo→teal brand gradient — replacing the default Tauri scaffold logo. The full macOS/Windows/Linux icon set is regenerated from it; editable SVG masters live at `src/lib/assets/logo.svg` and `src-tauri/icons/icon.svg`.
+
+### Design
+- Depth pass: cards now lift off the dark canvas (layered shadow + top highlight), a subtle brand glow sits behind the workspace, and a gradient hairline underlines the header.
+- The empty source dropzone gets a brand-gradient icon and a brand-tinted dashed border; section headers (Source, Import options, Albums) carry tinted icon chips; the profile avatar gains a brand-gradient ring.
+- Removable devices now show a storage **capacity bar** (teal→indigo, turning red past 90% full).
+- "Start Import" is now the gradient primary call-to-action.
+- Moved "Auto-import on card insert" from the Source panel into Import options, styled consistently with the other toggles.
+
 ### Layout
 - Reworked the main window for wide displays: content is now capped to a comfortable width and centered (no more edge-to-edge sprawl), and the right column carries Albums **plus** the Queue/History so it fills the space instead of leaving a tall empty gap next to the import options. Reflows cleanly to a single column on narrow windows.
 - macOS now uses a frameless **overlay title bar** — just the traffic-light controls, no title strip — with the app header doubling as the drag region and reserving space so the brand clears the lights. Other platforms are unaffected.
@@ -20,6 +30,7 @@
 - CI now runs the full test suite in a dedicated job — svelte-check, Vitest, `cargo test`, and Playwright e2e — not just fmt/clippy/build
 - Added `npm run verify` (full CI mirror) and `npm run verify:fast`, plus version-controlled git hooks (`.githooks`, wired via `core.hooksPath` on install): a fast **pre-commit** (svelte-check + Vitest + rustfmt) and a full **pre-push** (everything CI runs) to keep CI green
 - The `immich-go` sidecar download now verifies each archive's SHA-256 against the upstream release `checksums.txt` before extracting, failing the build on any mismatch
+- Per-push CI builds Linux + Windows and runs the full test suite (svelte-check, Vitest, `cargo test`, Playwright) on Linux; macOS bundles build on `v*` release tags via the release workflow, to conserve Actions minutes. Bumped CI to Node 22 and `actions/*@v5`.
 
 ### Distribution
 - Release workflow now publishes prebuilt installers (macOS `.dmg`, Linux `.AppImage`/`.deb`, Windows `.exe`) to GitHub Releases on each `v*` tag

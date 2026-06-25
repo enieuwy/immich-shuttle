@@ -10,7 +10,7 @@ Immich Shuttle is a cross-platform desktop importer for Immich built with Tauri 
 - Album selection with inline album creation and sharing options (imports into a single target album)
 - Import queue panel with per-job progress bars, live throughput/ETA, duplicate/error stats, and cancel, retry, dismiss, and clear-finished actions
 - Optional wipe mode that deletes only confirmed uploaded files, with an in-app safety warning
-- Immich-branded UI with light, dark, and system themes
+- Immich-themed UI with a custom brand mark, light/dark/system themes, and at-a-glance storage capacity meters on removable devices
 - LAN/WAN URL resolution using TCP probe
 
 ## Installation
@@ -117,9 +117,15 @@ npm run verify:fast   # quick subset: svelte-check + Vitest + rustfmt
 
 Git hooks (installed automatically on `npm install` via `core.hooksPath`) run these for you: a fast **pre-commit** (`verify:fast`) and a full **pre-push** (`verify`), so a clean local run means green CI. Bypass once with `git commit --no-verify` / `git push --no-verify`. The pre-push e2e step needs the Playwright browser once: `npx playwright install chromium`.
 
+> CI builds Linux + Windows on every push/PR and runs the full test suite on Linux; macOS bundles are built on `v*` release tags (see `.github/workflows/release.yml`) to conserve Actions minutes.
+
 ## Contributing
 
 PRs are welcome. Keep changes focused, include verification output, and update docs when behavior changes.
+
+## Acknowledgements
+
+Immich Shuttle uses [**immich-go**](https://github.com/simulot/immich-go) by Stéphane Guillou ([@simulot](https://github.com/simulot)) as its bundled upload engine — it does the actual heavy lifting of transferring media to your Immich server. Immich Shuttle wraps it with a desktop UI for profile management, source selection, album targeting, and import monitoring. Huge thanks to the immich-go project and its contributors.
 
 ## License
 
