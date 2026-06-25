@@ -7,13 +7,18 @@
 //!   coverage, zero extra crates.
 //! - **All platforms (and the macOS fallback)**: the pure-Rust `image` crate for
 //!   JPEG/PNG/TIFF/WebP/GIF/BMP, with EXIF orientation applied via `kamadak-exif`.
-//! - Anything no backend can render (e.g. HEIC/RAW/video off macOS) → a
-//!   placeholder result (`data_url: None`) that the UI renders as a typed tile.
+//! - **All platforms**: for camera RAW (CR2/CR3/NEF/ARW/RAF/RW2/ORF/DNG…), the
+//!   largest JPEG preview embedded in the file is extracted and decoded — pure
+//!   Rust, no RAW decoder, so RAW gets real thumbnails off macOS too.
+//! - Anything no backend can render (e.g. HEIC/video off macOS, or a RAW with no
+//!   embedded preview) → a placeholder result (`data_url: None`) that the UI
+//!   renders as a typed tile.
 //!
 //! Results are cached on disk keyed by path+mtime+size so re-scans are instant.
 
 use std::{
     fs,
+    io::Cursor,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -68,6 +73,35 @@ fn ext_lower(path: &Path) -> String {
 
 fn is_video_ext(ext: &str) -> bool {
     matches!(ext, "mp4" | "mov" | "m4v" | "avi" | "mkv")
+}
+
+/// Camera RAW extensions whose embedded JPEG preview we extract off macOS
+/// (macOS renders these natively via `sips`).
+fn is_raw_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "cr2"
+            | "cr3"
+            | "nef"
+            | "nrw"
+            | "arw"
+            | "srf"
+            | "sr2"
+            | "raf"
+            | "rw2"
+            | "orf"
+            | "dng"
+            | "pef"
+            | "rwl"
+            | "raw"
+            | "3fr"
+            | "erf"
+            | "kdc"
+            | "mrw"
+            | "iiq"
+            | "cap"
+            | "mef"
+    )
 }
 
 /// Generate (or fetch from cache) a thumbnail for a single file. Never errors:
@@ -140,6 +174,12 @@ fn generate(path: &Path, max: u32, jpg: &Path, png: &Path) -> Option<PathBuf> {
         } else if generate_sips(path, max, jpg) {
             return Some(jpg.to_path_buf());
         }
+    }
+
+    // Camera RAW: pull the largest embedded JPEG preview (CR2/CR3/NEF/ARW/RAF/…),
+    // before the portable decoder so a TIFF-based RAW (e.g. DNG) isn't misread.
+    if is_raw_ext(&ext) && generate_with_raw_preview(path, max, jpg) {
+        return Some(jpg.to_path_buf());
     }
 
     // Portable backend (primary off macOS, fallback on macOS): still images only.
@@ -218,6 +258,58 @@ fn generate_with_image(src: &Path, max: u32, out: &Path) -> bool {
     rgb.save_with_format(out, image::ImageFormat::Jpeg).is_ok()
 }
 
+/// Find the byte offset of the largest (by pixel area) JPEG embedded in a RAW
+/// container. Cameras embed a full-size preview and often a small thumbnail;
+/// byte stuffing means a real `FF D8 FF` SOI never appears inside JPEG entropy
+/// data, so scanning for it reliably locates the embedded streams.
+fn best_embedded_jpeg_offset(data: &[u8]) -> Option<usize> {
+    let mut best: Option<(u64, usize)> = None;
+    let mut i = 0usize;
+    while i + 3 <= data.len() {
+        if data[i] == 0xFF && data[i + 1] == 0xD8 && data[i + 2] == 0xFF {
+            if let Ok((w, h)) =
+                image::ImageReader::with_format(Cursor::new(&data[i..]), image::ImageFormat::Jpeg)
+                    .into_dimensions()
+            {
+                let area = u64::from(w) * u64::from(h);
+                let better = match best {
+                    Some((a, _)) => area > a,
+                    None => true,
+                };
+                if better {
+                    best = Some((area, i));
+                }
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    best.map(|(_, off)| off)
+}
+
+/// Decode the largest embedded JPEG preview from a camera RAW file and write a
+/// JPEG thumbnail. Pure Rust (no RAW decoder); works on every platform.
+fn generate_with_raw_preview(src: &Path, max: u32, out: &Path) -> bool {
+    let data = match fs::read(src) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let offset = match best_embedded_jpeg_offset(&data) {
+        Some(o) => o,
+        None => return false,
+    };
+    let decoded =
+        match image::load_from_memory_with_format(&data[offset..], image::ImageFormat::Jpeg) {
+            Ok(img) => img,
+            Err(_) => return false,
+        };
+    let thumb = decoded.thumbnail(max, max);
+    // JPEG has no alpha channel; flatten to RGB before encoding.
+    let rgb = image::DynamicImage::ImageRgb8(thumb.to_rgb8());
+    rgb.save_with_format(out, image::ImageFormat::Jpeg).is_ok()
+}
+
 fn read_orientation(src: &Path) -> Option<u32> {
     let file = fs::File::open(src).ok()?;
     let mut reader = std::io::BufReader::new(file);
@@ -276,5 +368,73 @@ mod tests {
         assert!(r.data_url.is_some(), "expected a thumbnail data url");
         assert!(r.width > 0 && r.height > 0);
         assert!(r.data_url.unwrap().starts_with("data:image/"));
+    }
+
+    fn jpeg_of(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb([20, 40, 80]));
+        let mut buf = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn raw_extension_detected() {
+        assert!(is_raw_ext("cr3"));
+        assert!(is_raw_ext("dng"));
+        assert!(!is_raw_ext("jpg"));
+        assert!(!is_raw_ext("mov"));
+    }
+
+    #[test]
+    fn picks_largest_embedded_jpeg() {
+        // Simulate a RAW container: junk, a small thumbnail JPEG, more junk, the
+        // full-size preview JPEG, trailing bytes. The picker must choose the preview.
+        let small = jpeg_of(16, 16);
+        let big = jpeg_of(200, 120);
+        let mut data = vec![0x00, 0x11, 0x22, 0x33];
+        data.extend_from_slice(&small);
+        data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let big_off = data.len();
+        data.extend_from_slice(&big);
+        data.extend_from_slice(&[0x99, 0x88]);
+
+        let off = best_embedded_jpeg_offset(&data).expect("an embedded jpeg");
+        assert_eq!(
+            off, big_off,
+            "should pick the larger preview, not the thumbnail"
+        );
+        let (w, h) =
+            image::ImageReader::with_format(Cursor::new(&data[off..]), image::ImageFormat::Jpeg)
+                .into_dimensions()
+                .unwrap();
+        assert_eq!((w, h), (200, 120));
+    }
+
+    #[test]
+    fn raw_preview_backend_writes_thumbnail() {
+        let big = jpeg_of(300, 200);
+        let mut data = vec![0x49, 0x49, 0x2A, 0x00]; // TIFF-ish header bytes
+        data.extend_from_slice(&big);
+        let src = std::env::temp_dir().join("immich_shuttle_raw_test.cr2");
+        let out = std::env::temp_dir().join("immich_shuttle_raw_test_thumb.jpg");
+        fs::write(&src, &data).unwrap();
+        let _ = fs::remove_file(&out);
+        assert!(generate_with_raw_preview(&src, 64, &out));
+        let (w, h) = image::image_dimensions(&out).unwrap();
+        assert!(w <= 64 && h <= 64 && w > 0 && h > 0);
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&out);
+    }
+
+    #[test]
+    fn no_embedded_jpeg_returns_false() {
+        let src = std::env::temp_dir().join("immich_shuttle_raw_none.cr2");
+        let out = std::env::temp_dir().join("immich_shuttle_raw_none_thumb.jpg");
+        fs::write(&src, [0u8; 256]).unwrap();
+        let _ = fs::remove_file(&out);
+        assert!(!generate_with_raw_preview(&src, 64, &out));
+        let _ = fs::remove_file(&src);
     }
 }
