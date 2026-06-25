@@ -171,7 +171,7 @@
         <Button variant="ghost" size="sm" onclick={() => (showLogs = true)}>
           <FileText class="size-4" /> Logs
         </Button>
-        <Button size="sm" onclick={startImport}>
+        <Button size="sm" class="btn-brand" onclick={startImport}>
           <Play class="size-4" />
           {selectedCount > 0 ? `Import ${selectedCount} selected` : "Start Import"}
         </Button>

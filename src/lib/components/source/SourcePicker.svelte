@@ -177,7 +177,7 @@
 <Card>
   <CardHeader>
     <CardTitle class="flex items-center gap-2 text-sm font-semibold">
-      <HardDrive class="h-4 w-4 text-muted-foreground" />
+      <HardDrive class="h-4 w-4 text-primary" />
       Source
     </CardTitle>
   </CardHeader>
@@ -292,34 +292,46 @@
         <div class="flex flex-col gap-1.5">
           <h4 class="text-xs font-medium text-muted-foreground">Removable devices</h4>
           {#each $sourceState.detectedDevices as device}
+            {@const used = Math.max(0, device.total_space - device.available_space)}
+            {@const pct = device.total_space > 0 ? Math.min(100, Math.round((used / device.total_space) * 100)) : 0}
             <button
               type="button"
-              class="flex w-full items-center gap-3 rounded-lg border border-border p-3 text-left transition-colors hover:border-primary/40 hover:bg-accent"
+              class="flex w-full flex-col gap-2.5 rounded-lg border border-border p-3 text-left transition-all hover:border-primary/40 hover:bg-accent"
               onclick={() => sourceState.selectSources([device.mount_path])}
             >
-              <HardDrive class="h-4 w-4 shrink-0 text-muted-foreground" />
-              <div class="min-w-0 flex-1">
-                <div class="flex items-center gap-2">
-                  <span class="truncate text-sm font-medium text-foreground">{device.name}</span>
-                  {#if device.has_dcim}
-                    <Badge variant="secondary">DCIM</Badge>
-                  {/if}
+              <div class="flex w-full items-center gap-3">
+                <HardDrive class="h-4 w-4 shrink-0 text-muted-foreground" />
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <span class="truncate text-sm font-medium text-foreground">{device.name}</span>
+                    {#if device.has_dcim}
+                      <Badge variant="secondary">DCIM</Badge>
+                    {/if}
+                  </div>
+                  <p class="truncate text-xs text-muted-foreground">{device.mount_path}</p>
                 </div>
-                <p class="truncate text-xs text-muted-foreground">{device.mount_path}</p>
+                <span class="shrink-0 text-xs text-muted-foreground tabular-nums">
+                  {fmtGb(device.available_space)} free of {fmtGb(device.total_space)}
+                </span>
               </div>
-              <span class="shrink-0 text-xs text-muted-foreground tabular-nums">
-                {fmtGb(device.available_space)} free of {fmtGb(device.total_space)}
-              </span>
+              <div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                <div
+                  class="h-full rounded-full transition-[width] duration-500"
+                  style="width: {pct}%; background: {pct > 90
+                    ? 'oklch(0.7 0.19 25)'
+                    : 'linear-gradient(90deg, oklch(0.74 0.14 196), oklch(0.55 0.18 273))'};"
+                ></div>
+              </div>
             </button>
           {/each}
         </div>
       {/if}
 
       <div
-        class="flex flex-col items-center gap-3 rounded-xl border-2 border-dashed border-border px-4 py-6 text-center transition-colors hover:border-primary/50 hover:bg-muted/30"
+        class="group flex flex-col items-center gap-3 rounded-xl border-2 border-dashed border-primary/25 bg-primary/[0.02] px-4 py-7 text-center transition-all hover:border-primary/60 hover:bg-primary/[0.06]"
       >
-        <div class="flex h-12 w-12 items-center justify-center rounded-full bg-muted">
-          <FileImage class="h-6 w-6 text-muted-foreground" />
+        <div class="brand-gradient flex h-12 w-12 items-center justify-center rounded-full shadow-lg shadow-primary/20 transition-transform group-hover:scale-105">
+          <FileImage class="h-6 w-6 text-white" />
         </div>
         <div class="space-y-0.5">
           <p class="text-sm font-medium text-foreground">Drag photos or a folder here</p>

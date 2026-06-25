@@ -25,7 +25,7 @@
 
 <Card>
   <CardHeader class="flex flex-row items-center gap-2">
-    <SlidersHorizontal class="h-4 w-4 text-muted-foreground" />
+    <SlidersHorizontal class="h-4 w-4 text-primary" />
     <h3 class="text-sm font-semibold text-foreground">Import options</h3>
   </CardHeader>
 

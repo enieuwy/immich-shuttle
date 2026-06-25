@@ -170,3 +170,33 @@
     color: transparent;
   }
 }
+
+/* --- Beauty pass: unlayered so these win over Tailwind utility classes --- */
+
+/* Gradient hero CTA, echoing the app/brand mark. */
+.btn-brand {
+  background-image: linear-gradient(
+    135deg,
+    oklch(0.5 0.17 273) 0%,
+    oklch(0.62 0.21 283) 50%,
+    oklch(0.74 0.14 196) 100%
+  );
+  color: #fff;
+  border-color: transparent;
+  box-shadow: 0 6px 18px -6px oklch(0.55 0.19 277 / 0.5);
+}
+.btn-brand:hover {
+  filter: brightness(1.07) saturate(1.04);
+}
+.btn-brand:active {
+  filter: brightness(0.95);
+}
+
+/* Layered elevation so cards lift off the dark canvas. */
+.dark [data-slot="card"] {
+  border-color: oklch(1 0 0 / 0.1);
+  box-shadow:
+    0 1px 2px -1px oklch(0 0 0 / 0.45),
+    0 16px 32px -20px oklch(0 0 0 / 0.75),
+    inset 0 1px 0 oklch(1 0 0 / 0.055);
+}
