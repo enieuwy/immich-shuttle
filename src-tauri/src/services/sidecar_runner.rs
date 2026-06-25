@@ -1,4 +1,6 @@
 use std::{
+    fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -36,6 +38,41 @@ pub struct UploadRequest {
     pub into_album: Option<String>,
 }
 
+/// Removes the temp api-key config file when dropped.
+struct TempConfig {
+    path: PathBuf,
+}
+
+impl Drop for TempConfig {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Write a private (0600 on unix) temp immich-go config carrying the API key so
+/// it is passed via `--config` instead of `--api-key` on the command line, where
+/// it would otherwise be readable in the process table by other local users. The
+/// returned guard deletes the file when it drops (i.e. when the run finishes).
+fn write_api_key_config(job_id: &str, api_key: &str) -> Result<TempConfig, String> {
+    let path = std::env::temp_dir().join(format!("immich-shuttle-cfg-{job_id}.yaml"));
+    let escaped = api_key.replace('\\', "\\\\").replace('"', "\\\"");
+    let contents = format!("upload:\n    api-key: \"{escaped}\"\n");
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&path)
+        .map_err(|e| format!("Could not create immich-go config: {e}"))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|e| format!("Could not write immich-go config: {e}"))?;
+    Ok(TempConfig { path })
+}
+
 /// Read the current run log and emit a progress snapshot to the frontend.
 fn emit_progress(app: &AppHandle, job_id: &str, log_path: &Path) {
     let run = parse_run_progress(&std::fs::read_to_string(log_path).unwrap_or_default());
@@ -56,13 +93,14 @@ fn emit_progress(app: &AppHandle, job_id: &str, log_path: &Path) {
 }
 
 pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<SidecarResult, String> {
+    let config = write_api_key_config(&request.job_id, &request.api_key)?;
     let mut args = vec![
         "upload".to_string(),
         "from-folder".to_string(),
         "--server".to_string(),
         request.server_url.clone(),
-        "--api-key".to_string(),
-        request.api_key.clone(),
+        "--config".to_string(),
+        config.path.to_string_lossy().to_string(),
         format!(
             "--manage-raw-jpeg={}",
             if request.stack_raw_jpeg {

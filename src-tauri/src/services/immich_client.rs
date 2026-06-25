@@ -280,17 +280,31 @@ impl ImmichClient {
                 .get("results")
                 .and_then(|r| r.as_array())
                 .ok_or_else(|| "bulk-upload-check returned no results".to_string())?;
-            for result in results {
-                let id = result.get("id").and_then(|v| v.as_str());
-                let action = result.get("action").and_then(|v| v.as_str());
-                if let (Some(id), Some("reject")) = (id, action) {
-                    // action=reject (reason=duplicate) => the server already has it.
-                    present.insert(id.to_string());
-                }
-            }
+            present.extend(duplicates_from_results(results));
         }
         Ok(present)
     }
+}
+
+/// Asset ids the server reports as already-present duplicates. An asset counts
+/// as confirmed-on-server ONLY when action=="reject" AND reason=="duplicate";
+/// any other reject reason is treated as NOT present. This guards
+/// verify-before-wipe (wipe::verify_uploaded) so a local original is never
+/// deleted unless the server actually holds an identical copy.
+fn duplicates_from_results(results: &[Value]) -> Vec<String> {
+    results
+        .iter()
+        .filter_map(|result| {
+            let id = result.get("id").and_then(Value::as_str)?;
+            let action = result.get("action").and_then(Value::as_str)?;
+            let reason = result.get("reason").and_then(Value::as_str);
+            if action == "reject" && reason == Some("duplicate") {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 pub fn normalize_server_url(value: &str) -> String {
@@ -320,5 +334,19 @@ mod tests {
             normalize_server_url("https://immich.example.com/"),
             "https://immich.example.com"
         );
+    }
+
+    #[test]
+    fn only_duplicate_rejects_count_as_present() {
+        use super::duplicates_from_results;
+        use serde_json::json;
+        let results = [
+            json!({ "id": "a", "action": "reject", "reason": "duplicate" }),
+            json!({ "id": "b", "action": "accept" }),
+            json!({ "id": "c", "action": "reject", "reason": "unsupported" }),
+            json!({ "id": "d", "action": "reject" }),
+        ];
+        // Only the duplicate-reason reject is treated as present on the server.
+        assert_eq!(duplicates_from_results(&results), vec!["a".to_string()]);
     }
 }

@@ -5,7 +5,7 @@
   import { Label } from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
   import { Alert, AlertDescription } from "$lib/components/ui/alert";
-  import { CheckCircle2, XCircle, Loader2 } from "@lucide/svelte";
+  import { CheckCircle2, XCircle, Loader2, TriangleAlert } from "@lucide/svelte";
 
   let {
     profile = null,
@@ -26,6 +26,17 @@
   let errorMessage = $state("");
   let validatedUserName = $state("");
   let validating = $derived(validation === "Validating...");
+  // Flag clear-text http:// URLs (the API key header and all photo bytes would
+  // travel unencrypted). Loopback is exempt — it never leaves the machine.
+  let insecure = $derived(
+    [serverUrl, lanServerUrl, wanServerUrl]
+      .map((u) => u.trim())
+      .filter(
+        (u) =>
+          /^http:\/\//i.test(u) &&
+          !/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(u),
+      ),
+  );
 
   $effect(() => {
     serverUrl = profile?.server_url ?? "";
@@ -102,6 +113,17 @@
       </div>
     </div>
   </div>
+
+  {#if insecure.length > 0}
+    <div class="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+      <TriangleAlert class="size-4 shrink-0" />
+      <span>
+        Using an unencrypted <code>http://</code> address — your API key and uploaded
+        photos travel in clear text over the network. Prefer <code>https://</code> unless
+        this is a trusted local network.
+      </span>
+    </div>
+  {/if}
 
   {#if validatedUserName}
     <div class="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm font-medium text-emerald-600 dark:text-emerald-400">
