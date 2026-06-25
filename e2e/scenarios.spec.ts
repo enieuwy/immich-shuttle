@@ -15,7 +15,7 @@ test('default scenario shows the main import workspace', async ({ page }) => {
   await expect(page.getByText('Immich Shuttle').first()).toBeVisible();
   await expect(page.getByText('Source').first()).toBeVisible();
   await expect(page.getByText('Albums').first()).toBeVisible();
-  await expect(page.getByText('Import queue').first()).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Queue' })).toBeVisible();
   await expect(page.getByText(/photos/i).first()).toBeVisible();
 
   await captureScenario(page, 'default');
@@ -33,7 +33,7 @@ test('onboarding scenario shows first-run connection fields', async ({ page }) =
 test('importing scenario shows running queue progress', async ({ page }) => {
   await page.goto('/?scenario=importing');
 
-  await expect(page.getByText('Import queue').first()).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Queue' })).toBeVisible();
   await expect(page.getByText(/Running|Uploaded/).first()).toBeVisible();
   await expect(page.locator('[data-slot="progress"]').first()).toBeVisible();
 
@@ -60,10 +60,9 @@ test('empty scenario shows source and queue empty states', async ({ page }) => {
 test('history tab lists past imports', async ({ page }) => {
   await page.goto('/?scenario=default');
 
-  await page.getByRole('tab', { name: /History/ }).click();
-  await expect(page.getByText('Import history').first()).toBeVisible();
+  await page.getByRole('button', { name: 'History' }).click();
+  await expect(page.getByText('Clear history')).toBeVisible();
   await expect(page.getByText(/uploaded/).first()).toBeVisible();
-  await expect(page.getByText('Clear history').first()).toBeVisible();
 
   await captureScenario(page, 'history');
 });
@@ -117,21 +116,24 @@ test('failed import lists which files failed and why', async ({ page }) => {
 test('preview scenario shows the selection grid and selects files', async ({ page }) => {
   await page.goto('/?scenario=preview');
 
-  await expect(page.getByText('Preview & select').first()).toBeVisible();
-  await expect(page.getByText(/0 of 48 selected/)).toBeVisible();
+  // The preview scenario auto-opens the Preview & select dialog.
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.getByText(/Showing 48 of 48.*0 selected/)).toBeVisible();
 
-  // Tiles load their thumbnails through the lazy loader (no perpetual spinner).
+  // Renderable (JPEG) tiles load their thumbnails through the lazy loader.
   await expect(page.locator('img.object-cover').first()).toBeVisible();
 
   await captureScenario(page, 'preview');
 
-  await page.getByRole('button', { name: /Select all/ }).click();
-  await expect(page.getByText(/48 of 48 selected/)).toBeVisible();
-  await expect(page.getByRole('button', { name: /Import 48 selected/ })).toBeEnabled();
+  await dialog.getByRole('button', { name: 'Select all', exact: true }).click();
+  await expect(dialog.getByText(/Showing 48 of 48.*48 selected/)).toBeVisible();
+  // With a selection, the dialog footer offers "Use selection" (selection is
+  // applied on the main screen; the dialog never imports directly).
+  await expect(dialog.getByRole('button', { name: /Use selection/ })).toBeEnabled();
 
   // Sorting by capture date reorders the grid (newest first).
-  const firstTile = page.locator('button[aria-pressed]').first();
+  const firstTile = dialog.locator('button[aria-label^="Select "]').first();
   await expect(firstTile).toContainText('IMG_1000');
-  await page.getByRole('button', { name: /^Date$/ }).click();
+  await dialog.getByRole('button', { name: /^Date$/ }).click();
   await expect(firstTile).toContainText('IMG_1046');
 });
