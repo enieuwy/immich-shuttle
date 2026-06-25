@@ -63,6 +63,31 @@ mkdir -p "${TMP_DIR}"
 
 curl -fL "${URL}" -o "${TMP_FILE}"
 
+# Verify the downloaded archive against the release checksums before extracting.
+CHECKSUMS_URL="https://github.com/simulot/immich-go/releases/download/v${IMMICH_GO_VERSION}/checksums.txt"
+CHECKSUMS_FILE="${TMP_DIR}/checksums.txt"
+curl -fL "${CHECKSUMS_URL}" -o "${CHECKSUMS_FILE}"
+
+EXPECTED_SHA="$(awk -v f="${RELEASE_ASSET}" '$2 == f { print $1 }' "${CHECKSUMS_FILE}")"
+if [[ -z "${EXPECTED_SHA}" ]]; then
+  echo "No checksum found for ${RELEASE_ASSET} in checksums.txt" >&2
+  exit 1
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_SHA="$(sha256sum "${TMP_FILE}" | awk '{ print $1 }')"
+else
+  ACTUAL_SHA="$(shasum -a 256 "${TMP_FILE}" | awk '{ print $1 }')"
+fi
+
+if [[ "${EXPECTED_SHA}" != "${ACTUAL_SHA}" ]]; then
+  echo "Checksum mismatch for ${RELEASE_ASSET}" >&2
+  echo "  expected ${EXPECTED_SHA}" >&2
+  echo "  actual   ${ACTUAL_SHA}" >&2
+  exit 1
+fi
+echo "Verified checksum for ${RELEASE_ASSET}"
+
 if [[ "${RELEASE_ASSET}" == *.tar.gz ]]; then
   tar -xzf "${TMP_FILE}" -C "${TMP_DIR}"
 elif [[ "${RELEASE_ASSET}" == *.zip ]]; then

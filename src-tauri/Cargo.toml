@@ -1,9 +1,11 @@
 [package]
 name = "immich-shuttle"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Desktop importer for Immich — copy photos and videos from camera cards to your Immich server."
+authors = ["Ellis Nieuwpoort"]
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/enieuwy/immich-shuttle"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

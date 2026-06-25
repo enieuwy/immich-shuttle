@@ -7,7 +7,7 @@ Immich Shuttle is a cross-platform desktop importer for Immich built with Tauri 
 - Multi-profile management with live API key validation and connection testing
 - Secure key storage using system keychain backends
 - Source picker with a drag-and-drop dropzone, removable-media detection (with free-space and DCIM hints), folder/file selection, and a live media scan summary
-- Album multi-select with inline album creation and sharing options
+- Album selection with inline album creation and sharing options (imports into a single target album)
 - Import queue panel with per-job progress bars, live throughput/ETA, duplicate/error stats, and cancel, retry, dismiss, and clear-finished actions
 - Optional wipe mode that deletes only confirmed uploaded files, with an in-app safety warning
 - Immich-branded UI with light, dark, and system themes
@@ -29,7 +29,7 @@ Prebuilt binaries are published on [GitHub Releases](../../releases) for each ta
 1. Launch Immich Shuttle.
 2. Add your Immich server URL and API key.
 3. Choose a source folder or removable device.
-4. Select target albums (or create one inline).
+4. Select a target album (or create one inline).
 5. Start import and monitor queue progress.
 
 ## Requirements
@@ -69,6 +69,19 @@ Install and unlock a Secret Service provider like `gnome-keyring` or `kwallet`.
 npm install
 ./scripts/download-sidecar.sh
 npm run tauri dev
+```
+
+### Signing local macOS builds (optional)
+
+`npm run tauri build` produces an **ad-hoc** signed macOS bundle by default
+(`signingIdentity: "-"` in `src-tauri/tauri.conf.json`), which is what CI ships.
+Ad-hoc signatures change on every rebuild, so macOS keychain "Always Allow"
+grants do not persist across builds. To sign with a stable identity (e.g. a
+self-signed certificate in your login keychain) so the keychain grant sticks,
+export `APPLE_SIGNING_IDENTITY` before building — it overrides the config value:
+
+```bash
+APPLE_SIGNING_IDENTITY="Your Code Signing Identity" npm run tauri build
 ```
 
 ### Design preview (visual UI inspection)
