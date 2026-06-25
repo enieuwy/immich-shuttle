@@ -135,6 +135,11 @@
         </div>
       {:else if $albumsState.loading}
         <p class="px-1 py-1 text-sm text-muted-foreground">Loading albums…</p>
+      {:else if $albumsState.error}
+        <div class="flex h-full flex-col items-center justify-center gap-2 py-4 text-center">
+          <p class="text-sm text-muted-foreground">Couldn't reach your server.</p>
+          <Button size="sm" variant="outline" onclick={() => albumsState.loadAlbums(search || undefined)}>Retry</Button>
+        </div>
       {:else if $albumsState.availableAlbums.length === 0}
         <p class="px-1 py-1 text-sm text-muted-foreground">No albums match.</p>
       {:else}
@@ -177,7 +182,7 @@
     </div>
 
     {#if $albumsState.error}
-      <p class="text-sm text-destructive">{$albumsState.error}</p>
+      <p class="text-xs text-destructive">{$albumsState.error}</p>
     {/if}
   </CardContent>
 
