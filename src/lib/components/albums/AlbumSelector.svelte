@@ -4,7 +4,6 @@
 
   import { albumsState } from "$lib/state/albums";
   import { activeProfile } from "$lib/state/profiles";
-  import { openProfileEditor } from "$lib/state/ui";
   import { Button } from "$lib/components/ui/button";
   import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "$lib/components/ui/dialog";
   import { Input } from "$lib/components/ui/input";
@@ -130,10 +129,9 @@
 
     <div class="album-scroll h-[160px] overflow-y-auto rounded-md border border-border bg-card p-2">
       {#if $albumsState.missingApiKey}
-        <div class="flex h-full flex-col items-center justify-center gap-2 py-4 text-center">
-          <KeyRound class="size-6 text-muted-foreground/60" aria-hidden="true" />
-          <p class="text-sm text-muted-foreground">This profile has no API key yet.</p>
-          <Button size="sm" onclick={() => openProfileEditor.set(true)}>Add API key</Button>
+        <div class="flex h-full flex-col items-center justify-center gap-1.5 py-4 text-center">
+          <KeyRound class="size-5 text-muted-foreground/60" aria-hidden="true" />
+          <p class="text-sm text-muted-foreground">Add an API key to load albums.</p>
         </div>
       {:else if $albumsState.loading}
         <p class="px-1 py-1 text-sm text-muted-foreground">Loading albums…</p>

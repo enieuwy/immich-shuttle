@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { Play, FileText } from "@lucide/svelte";
+  import { Play, FileText, KeyRound } from "@lucide/svelte";
 
   import AppLayout from "$lib/components/layout/AppLayout.svelte";
   import ThemeToggle from "$lib/components/layout/ThemeToggle.svelte";
@@ -114,6 +114,17 @@
   {#snippet actions()}
     <ThemeToggle />
   {/snippet}
+
+  {#if $albumsState.missingApiKey}
+    <div class="flex flex-wrap items-center gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3">
+      <KeyRound class="size-5 shrink-0 text-amber-600 dark:text-amber-400" />
+      <div class="min-w-0 flex-1">
+        <p class="text-sm font-medium text-foreground">This profile has no API key</p>
+        <p class="text-xs text-muted-foreground">Albums, users, and imports won't work until you add one.</p>
+      </div>
+      <Button size="sm" class="shrink-0" onclick={() => openProfileEditor.set(true)}>Add API key</Button>
+    </div>
+  {/if}
 
   <AutoImportBanner />
 
