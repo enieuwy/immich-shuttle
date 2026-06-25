@@ -5,7 +5,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open } from "@tauri-apps/plugin-dialog";
-  import { FolderOpen, FileImage, HardDrive, History, LayoutGrid, Loader2, X, Zap } from "@lucide/svelte";
+  import { FolderOpen, FileImage, HardDrive, History, LayoutGrid, Loader2, X } from "@lucide/svelte";
 
   import { sourceState } from "$lib/state/source";
   import { autoImportState } from "$lib/state/auto-import";
@@ -13,8 +13,6 @@
   import { selectionState } from "$lib/state/selection";
   import { historySourceLastImport } from "$lib/api";
   import type { RemovableDevice } from "$lib/types";
-  import { Switch } from "$lib/components/ui/switch";
-  import { Label } from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
   import { Badge } from "$lib/components/ui/badge";
@@ -177,7 +175,9 @@
 <Card>
   <CardHeader>
     <CardTitle class="flex items-center gap-2 text-sm font-semibold">
-      <HardDrive class="h-4 w-4 text-primary" />
+      <span class="flex size-7 items-center justify-center rounded-lg bg-primary/10 text-primary">
+        <HardDrive class="h-4 w-4" />
+      </span>
       Source
     </CardTitle>
   </CardHeader>
@@ -364,27 +364,6 @@
         </button>
       {/if}
     {/if}
-
-    <div class="flex items-center justify-between gap-3 rounded-lg border border-border/60 px-3 py-2.5">
-      <Label
-        for="auto-import-toggle"
-        class="flex min-w-0 flex-col items-start gap-0.5 cursor-pointer font-normal"
-      >
-        <span class="flex items-center gap-1.5 text-sm font-medium text-foreground">
-          <Zap class="h-3.5 w-3.5 text-primary" />
-          Auto-import on card insert
-        </span>
-        <span class="text-xs text-muted-foreground">
-          Offer a one-click import when a camera card with a DCIM folder is plugged in.
-        </span>
-      </Label>
-      <Switch
-        id="auto-import-toggle"
-        aria-label="Auto-import on card insert"
-        checked={$autoImportState.enabled}
-        onCheckedChange={(v) => autoImportState.setEnabled(v)}
-      />
-    </div>
 
     {#if $sourceState.error}
       <p class="text-sm text-destructive">{$sourceState.error}</p>

@@ -38,7 +38,7 @@
     {#snippet child({ props })}
       <Button variant="ghost" size="sm" class="h-auto min-w-0 justify-between gap-2 px-2 py-1.5" {...props} aria-label={$activeProfile ? `Switch profile (current: ${$activeProfile.display_name})` : "Select profile"}>
         {#if $activeProfile}
-          <span class="grid size-5 shrink-0 place-items-center rounded-full bg-primary text-[10px] text-primary-foreground">
+          <span class="brand-gradient grid size-5 shrink-0 place-items-center rounded-full text-[10px] font-semibold text-white ring-1 ring-white/25">
             {$activeProfile.display_name.charAt(0).toUpperCase()}
           </span>
           <span class="flex min-w-0 flex-col items-start">

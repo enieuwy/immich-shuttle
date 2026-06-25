@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { SlidersHorizontal } from "@lucide/svelte";
+  import { SlidersHorizontal, Zap } from "@lucide/svelte";
   import { Card, CardContent, CardHeader } from "$lib/components/ui/card";
   import { Input } from "$lib/components/ui/input";
   import { Label } from "$lib/components/ui/label";
   import { Separator } from "$lib/components/ui/separator";
   import { Switch } from "$lib/components/ui/switch";
   import { importOptionsState } from "$lib/state/import-options";
+  import { autoImportState } from "$lib/state/auto-import";
 
   let tasksInput = $state("");
 
@@ -25,7 +26,9 @@
 
 <Card>
   <CardHeader class="flex flex-row items-center gap-2">
-    <SlidersHorizontal class="h-4 w-4 text-primary" />
+    <span class="flex size-7 items-center justify-center rounded-lg bg-primary/10 text-primary">
+      <SlidersHorizontal class="h-4 w-4" />
+    </span>
     <h3 class="text-sm font-semibold text-foreground">Import options</h3>
   </CardHeader>
 
@@ -107,6 +110,29 @@
       {#if tasksOutOfRange}
         <p class="mt-2 text-xs text-destructive">Enter a value between 1 and 20.</p>
       {/if}
+    </div>
+
+    <Separator class="my-2" />
+
+    <div class="flex items-center justify-between gap-3 rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <Label
+        for="auto-import-toggle"
+        class="flex min-w-0 flex-col items-start gap-0.5 cursor-pointer font-normal"
+      >
+        <span class="flex items-center gap-1.5 text-sm font-medium text-foreground">
+          <Zap class="h-3.5 w-3.5 text-primary" />
+          Auto-import on card insert
+        </span>
+        <span class="text-xs text-muted-foreground">
+          Offer a one-click import when a camera card with a DCIM folder is plugged in.
+        </span>
+      </Label>
+      <Switch
+        id="auto-import-toggle"
+        aria-label="Auto-import on card insert"
+        checked={$autoImportState.enabled}
+        onCheckedChange={(v) => autoImportState.setEnabled(v)}
+      />
     </div>
   </CardContent>
 </Card>

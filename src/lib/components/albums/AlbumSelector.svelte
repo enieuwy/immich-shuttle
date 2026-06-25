@@ -50,7 +50,9 @@
 <Card class="flex flex-col gap-4 py-4">
   <CardHeader class="px-4">
     <div class="flex items-center gap-2">
-      <Images class="h-4 w-4 text-primary" />
+      <span class="flex size-7 items-center justify-center rounded-lg bg-primary/10 text-primary">
+        <Images class="h-4 w-4" />
+      </span>
       <CardTitle class="text-sm font-semibold text-foreground">Albums</CardTitle>
     </div>
     <CardAction>
