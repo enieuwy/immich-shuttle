@@ -1,6 +1,14 @@
-# Immich Shuttle
+<p align="center">
+  <img src="src/lib/assets/logo.png" alt="Immich Shuttle logo" width="96" height="96" />
+</p>
 
-Immich Shuttle is a cross-platform desktop importer for Immich built with Tauri v2 + Svelte 5.
+<h1 align="center">Immich Shuttle</h1>
+
+<p align="center">A cross-platform desktop importer for Immich, built with Tauri v2 + Svelte 5.</p>
+
+<p align="center">
+  <img src="docs/screenshot.png" alt="Immich Shuttle — source picker, albums, and import queue" width="900" />
+</p>
 
 ## Features
 
