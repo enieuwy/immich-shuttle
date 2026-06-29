@@ -10,9 +10,13 @@
 //! - **All platforms**: for camera RAW (CR2/CR3/NEF/ARW/RAF/RW2/ORF/DNG…), the
 //!   largest JPEG preview embedded in the file is extracted and decoded — pure
 //!   Rust, no RAW decoder, so RAW gets real thumbnails off macOS too.
-//! - Anything no backend can render (e.g. HEIC/video off macOS, or a RAW with no
-//!   embedded preview) → a placeholder result (`data_url: None`) that the UI
-//!   renders as a typed tile.
+//! - **Windows**: whatever the pure-Rust paths can't render (HEIC, video) falls
+//!   back to the Shell thumbnail API (`IShellItemImageFactory`), which delegates
+//!   to the registered OS thumbnail handlers — video via Media Foundation, HEIC
+//!   when the HEIF Image Extensions are installed. Same thumbnails Explorer shows.
+//! - Anything still unrendered (HEIC/video off macOS without the above, or a RAW
+//!   with no embedded preview) → a placeholder result (`data_url: None`) that the
+//!   UI renders as a typed tile.
 //!
 //! Results are cached on disk keyed by path+mtime+size so re-scans are instant.
 
@@ -187,7 +191,118 @@ fn generate(path: &Path, max: u32, jpg: &Path, png: &Path) -> Option<PathBuf> {
         return Some(jpg.to_path_buf());
     }
 
+    // Windows-native fallback: the Shell thumbnail provider handles HEIC, video,
+    // and anything else Explorer can thumbnail (no bundled codec required).
+    #[cfg(windows)]
+    {
+        if generate_with_shell(path, max, jpg) {
+            return Some(jpg.to_path_buf());
+        }
+    }
+
     None
+}
+
+/// Windows-native fallback: ask the Shell thumbnail provider for a bitmap and
+/// re-encode it to JPEG. `IShellItemImageFactory` delegates to whatever thumbnail
+/// handler is registered for the file type, so this covers video (Media
+/// Foundation) and HEIC (with the HEIF Image Extensions installed) — the same
+/// thumbnails Explorer shows — without bundling any codec.
+#[cfg(windows)]
+fn generate_with_shell(src: &Path, max: u32, out: &Path) -> bool {
+    use std::ffi::c_void;
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Graphics::Gdi::{
+        DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+    };
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+    use windows::Win32::UI::Shell::{
+        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_THUMBNAILONLY,
+    };
+
+    unsafe {
+        // COM must be live on this thread; balance only when we actually init it
+        // (S_FALSE = already init here still adds a ref; RPC_E_CHANGED_MODE does not).
+        let init = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let need_uninit = init.is_ok();
+
+        let render = || -> windows::core::Result<bool> {
+            let wide = HSTRING::from(src.as_os_str().to_string_lossy().as_ref());
+            let factory: IShellItemImageFactory =
+                SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)?;
+            // THUMBNAILONLY: never accept a generic file-type icon as a "thumbnail".
+            let hbitmap = factory.GetImage(
+                SIZE {
+                    cx: max as i32,
+                    cy: max as i32,
+                },
+                SIIGBF_THUMBNAILONLY,
+            )?;
+
+            let mut info = BITMAP::default();
+            let got = GetObjectW(
+                HGDIOBJ(hbitmap.0),
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(&mut info as *mut _ as *mut c_void),
+            );
+            if got == 0 || info.bmWidth <= 0 || info.bmHeight <= 0 {
+                let _ = DeleteObject(HGDIOBJ(hbitmap.0));
+                return Ok(false);
+            }
+            let (w, h) = (info.bmWidth, info.bmHeight);
+
+            // Pull the pixels as a 32-bit top-down DIB (negative height).
+            let mut bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut buf = vec![0u8; w as usize * h as usize * 4];
+            let hdc = GetDC(None);
+            let scanned = GetDIBits(
+                hdc,
+                hbitmap,
+                0,
+                h as u32,
+                Some(buf.as_mut_ptr() as *mut c_void),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+            ReleaseDC(None, hdc);
+            let _ = DeleteObject(HGDIOBJ(hbitmap.0));
+            if scanned == 0 {
+                return Ok(false);
+            }
+
+            // GDI hands back BGRA rows; flatten to RGB (thumbnails are opaque).
+            let mut rgb = image::RgbImage::new(w as u32, h as u32);
+            for y in 0..h as u32 {
+                for x in 0..w as u32 {
+                    let i = ((y * w as u32 + x) * 4) as usize;
+                    rgb.put_pixel(x, y, image::Rgb([buf[i + 2], buf[i + 1], buf[i]]));
+                }
+            }
+            let thumb = image::DynamicImage::ImageRgb8(rgb).thumbnail(max, max);
+            Ok(thumb
+                .save_with_format(out, image::ImageFormat::Jpeg)
+                .is_ok())
+        };
+
+        let result = render().unwrap_or(false);
+        if need_uninit {
+            CoUninitialize();
+        }
+        result
+    }
 }
 
 #[cfg(target_os = "macos")]

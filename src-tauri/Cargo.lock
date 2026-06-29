@@ -1842,6 +1842,7 @@ dependencies = [
  "tokio",
  "uuid",
  "walkdir",
+ "windows 0.61.3",
 ]
 
 [[package]]

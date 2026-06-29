@@ -105,8 +105,15 @@ is evidence non-macOS users need RAW/HEIC — earning their keep on demand.
 6. Dev harness `preview` scenario + fixtures; vitest (selection) + e2e.
 
 ## Phase 2 beads
-7. `rawler` RAW backend (Windows/Linux embedded-preview thumbnails).
-8. Windows-native backend (WIC / Shell thumbnail) for HEIC/RAW/video.
+7. ✅ **Done** (as embedded-JPEG extraction, not `rawler`): RAW thumbnails on
+   Windows/Linux by extracting the largest embedded JPEG preview — pure Rust, no
+   RAW decoder. See `thumbnailer::generate_with_raw_preview`.
+8. ✅ **Done**: Windows-native backend via the Shell thumbnail API
+   (`IShellItemImageFactory::GetImage`) for HEIC + video — delegates to the OS
+   thumbnail handlers (video via Media Foundation; HEIC with the HEIF Image
+   Extensions installed), re-encoding the returned HBITMAP to JPEG. Verified on a
+   real Windows 11 box: HEIC and MP4 produce real thumbnails. See
+   `thumbnailer::generate_with_shell`. Linux HEIC/video remain placeholders.
 
 ## Decisions
 - **A. Coverage/strategy:** trait-based hybrid — macOS-native (full) + portable
