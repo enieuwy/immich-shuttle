@@ -8,7 +8,7 @@ const MAX_FILE_ERRORS: usize = 100;
 
 /// Progress recovered from an immich-go run log.
 ///
-/// In `--no-ui` mode immich-go (v0.31.0) writes per-file events ONLY to its
+/// In `--no-ui` mode immich-go (v0.32.0) writes per-file events ONLY to its
 /// `--log-file` as console-slog; stdout carries just a `\r`-refreshed aggregate
 /// line that cannot be read reliably through a pipe (no newline until the very
 /// end). The run log is therefore the single source of truth for progress.
@@ -60,7 +60,7 @@ fn error_message(line: &str) -> Option<String> {
 
 /// Convert immich-go's logged `file=` value into a real local filesystem path.
 ///
-/// immich-go (v0.31.0) logs files as `<fsRoot>:<name>` — e.g.
+/// immich-go (v0.32.0) logs files as `<fsRoot>:<name>` — e.g.
 /// `/Volumes/CANON:DCIM/IMG_0001.JPG` — where `fsRoot` is the source path passed
 /// to it and `name` is the path within. POSIX roots contain no colon, so the
 /// first colon is the separator; on Windows the root carries a drive colon
@@ -199,10 +199,10 @@ pub fn parse_error_log(contents: &str) -> Vec<FileError> {
 mod tests {
     use super::{parse_error_log, parse_run_progress};
 
-    // A realistic console-slog run-log slice captured from immich-go v0.31.0
+    // A realistic console-slog run-log slice captured from immich-go v0.32.0
     // `--no-ui --log-level DEBUG` output: per-asset events plus the directory
     // scan ERR noise and the indented end-of-run summary report.
-    const LOG: &str = "2026-06-24 16:09:14 INF immich-go version:0.31.0\n\
+    const LOG: &str = "2026-06-24 16:09:14 INF immich-go version:0.32.0\n\
 2026-06-24 16:09:14 ERR @tmp: file does not exist\n\
 2026-06-24 16:09:14 ERR PRIVATE/AVCHD/BDMV/STREAM: file does not exist\n\
 2026-06-24 16:09:30 INF discovered image file=Untitled:DCIM/100MSDCF/DSC09008.ARW\n\

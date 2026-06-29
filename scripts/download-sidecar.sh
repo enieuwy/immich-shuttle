@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMMICH_GO_VERSION="0.31.0"
+IMMICH_GO_VERSION="0.32.0"
 
 TARGET="${1:-}"
 if [[ "${TARGET}" == "--target" ]]; then
