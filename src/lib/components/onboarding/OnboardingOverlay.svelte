@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { Send, Plug, FolderOpen, Upload, Check, CheckCircle2 } from "@lucide/svelte";
+  import { Plug, FolderOpen, Upload, Check, CheckCircle2 } from "@lucide/svelte";
 
   import ProfileEditor from "$lib/components/profiles/ProfileEditor.svelte";
   import { Button } from "$lib/components/ui/button";
+  import logoUrl from "$lib/assets/logo.png";
 
   let { onDone = () => {} } = $props<{ onDone?: () => void }>();
 
@@ -18,8 +19,8 @@
 <div class="fixed inset-0 z-50 grid place-items-center bg-background/80 p-4 backdrop-blur-sm">
   <div class="grid w-full max-w-[760px] gap-6 rounded-xl border border-border bg-card p-6 shadow-lg sm:p-8">
     <div class="flex items-start gap-4">
-      <div class="grid size-10 shrink-0 place-items-center rounded-xl brand-gradient shadow-sm">
-        <Send class="size-5 text-white" />
+      <div class="grid size-10 shrink-0 place-items-center rounded-xl bg-card shadow-sm ring-1 ring-border/70">
+        <img src={logoUrl} alt="" class="size-8 rounded-lg" draggable="false" />
       </div>
       <div class="flex flex-col gap-1">
         <h2 class="text-2xl font-semibold tracking-tight brand-text-gradient">Welcome to Immich Shuttle</h2>

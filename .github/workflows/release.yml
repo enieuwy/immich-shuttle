@@ -74,7 +74,7 @@ jobs:
           # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: Immich Shuttle ${{ github.ref_name }}
+          releaseName: ${{ github.ref_name }}
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }}
