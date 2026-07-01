@@ -17,7 +17,7 @@
     "audit:npm": "npm audit --audit-level=high",
     "audit:cargo": "cargo audit --file src-tauri/Cargo.lock",
     "audit": "npm run audit:npm && npm run audit:cargo",
-    "secrets": "gitleaks detect --no-banner --redact || echo 'gitleaks not installed or findings present; CI still checks'",
+    "secrets": "betterleaks git . --no-banner --redact || echo 'betterleaks not installed or findings present; CI still checks'",
     "verify:fast": "npm run check && npm run test && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check",
     "verify": "npm run verify:fast && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings && cargo test --manifest-path src-tauri/Cargo.toml --lib && npm run build && npm run e2e",
     "verify:audit": "npm run verify:fast && npm run audit",
