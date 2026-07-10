@@ -65,6 +65,12 @@ pub fn scan_directory(path: &Path) -> Result<ScanResult, String> {
                     continue;
                 }
             };
+            // Don't follow symlinks discovered inside the tree: a link pointing
+            // outside the selected source could otherwise be scanned (and later
+            // staged/uploaded), leaking files from outside the chosen folder.
+            if entry.path_is_symlink() {
+                continue;
+            }
             let p = entry.path();
             if !p.is_file() {
                 continue;
@@ -110,4 +116,45 @@ pub fn scan_directory(path: &Path) -> Result<ScanResult, String> {
         video_count,
         skipped_unreadable,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn counts_photos_and_videos_by_extension() {
+        let tmp = std::env::temp_dir().join(format!("scan-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("a.jpg"), b"a").unwrap();
+        fs::write(tmp.join("b.mp4"), b"b").unwrap();
+        fs::write(tmp.join("c.txt"), b"c").unwrap(); // unsupported, ignored
+
+        let result = scan_directory(&tmp).unwrap();
+        assert_eq!(result.photo_count, 1);
+        assert_eq!(result.video_count, 1);
+        assert_eq!(result.files.len(), 2);
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_symlinks_pointing_outside_the_tree() {
+        let tmp = std::env::temp_dir().join(format!("scan-link-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let outside = std::env::temp_dir().join(format!("secret-{}.jpg", Uuid::new_v4()));
+        fs::write(&outside, b"secret").unwrap();
+        fs::write(tmp.join("real.jpg"), b"real").unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.join("link.jpg")).unwrap();
+
+        let result = scan_directory(&tmp).unwrap();
+        // Only the real file is scanned; the escaping symlink is skipped.
+        assert_eq!(result.files.len(), 1);
+        assert!(result.files.iter().all(|f| f.name == "real.jpg"));
+
+        fs::remove_dir_all(&tmp).unwrap();
+        let _ = fs::remove_file(&outside);
+    }
 }

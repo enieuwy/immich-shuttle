@@ -5,6 +5,7 @@ pub mod logs;
 pub mod media_scanner;
 pub mod profile_store;
 pub mod sidecar_runner;
+pub mod source_guard;
 pub mod staging;
 pub mod stdout_parser;
 pub mod store;

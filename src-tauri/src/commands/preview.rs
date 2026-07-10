@@ -11,7 +11,22 @@ pub async fn preview_thumbnails(paths: Vec<String>) -> Result<Vec<ThumbResult>, 
         let handles: Vec<_> = chunk
             .iter()
             .cloned()
-            .map(|path| tauri::async_runtime::spawn_blocking(move || thumbnail(&path, MAX_PX)))
+            .map(|path| {
+                tauri::async_runtime::spawn_blocking(move || {
+                    // Only read files under a folder the user selected as a
+                    // source; reject arbitrary paths from the IPC boundary.
+                    if crate::services::source_guard::is_within_approved(&path) {
+                        thumbnail(&path, MAX_PX)
+                    } else {
+                        ThumbResult {
+                            path,
+                            data_url: None,
+                            width: 0,
+                            height: 0,
+                        }
+                    }
+                })
+            })
             .collect();
 
         for handle in handles {
@@ -48,7 +63,11 @@ pub async fn preview_dates(paths: Vec<String>) -> Result<Vec<CaptureDate>, Strin
             .cloned()
             .map(|path| {
                 tauri::async_runtime::spawn_blocking(move || CaptureDate {
-                    captured_at: capture_date(&path),
+                    captured_at: if crate::services::source_guard::is_within_approved(&path) {
+                        capture_date(&path)
+                    } else {
+                        None
+                    },
                     path,
                 })
             })

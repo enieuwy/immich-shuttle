@@ -38,6 +38,7 @@ import { queueState } from "./queue";
 import { profilesState } from "./profiles";
 import { sourceState } from "./source";
 import { albumsState } from "./albums";
+import { importOptionsState } from "./import-options";
 import { get } from "svelte/store";
 import type { ImportJob } from "$lib/types";
 
@@ -75,6 +76,32 @@ describe("queueState", () => {
       date_range: null,
       concurrent_tasks: null,
     });
+  });
+
+  it("forwards a valid date range and omits an invalid one", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+
+    importOptionsState.setDateFrom("2026-01-01");
+    importOptionsState.setDateTo("2026-01-31");
+    await queueState.startImport();
+    expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.date_range).toBe("2026-01-01,2026-01-31");
+
+    // Inverted range is rejected rather than forwarded.
+    importOptionsState.setDateFrom("2026-02-01");
+    importOptionsState.setDateTo("2026-01-01");
+    await queueState.startImport();
+    expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.date_range).toBeNull();
+
+    importOptionsState.clearDateRange();
   });
 
   it("confirmWipe forwards args to importConfirmWipe", async () => {

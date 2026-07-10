@@ -13,7 +13,7 @@ import {
 import { errorsState } from "$lib/state/errors";
 import type { ImportJob } from "$lib/types";
 
-import { importOptionsState } from "$lib/state/import-options";
+import { importOptionsState, toImmichDateRange } from "$lib/state/import-options";
 import { albumsState } from "$lib/state/albums";
 import { activeProfile } from "$lib/state/profiles";
 import { sourceState } from "$lib/state/source";
@@ -179,7 +179,7 @@ export const queueState = {
       keep_files: overrides?.keepFiles ?? options.keepFiles,
       stack_raw_jpeg: options.stackRawJpeg,
       stack_burst: options.stackBurst,
-      date_range: null,
+      date_range: toImmichDateRange(options.dateFrom, options.dateTo),
       concurrent_tasks: options.concurrentTasks,
       select_files: overrides?.selectFiles ?? null,
       into_album: intoAlbum,

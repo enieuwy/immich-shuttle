@@ -22,6 +22,10 @@
   $effect(() => {
     importOptionsState.setConcurrentTasks(tasksValid ? tasksParsed : null);
   });
+
+  const dateFrom = $derived($importOptionsState.dateFrom ?? "");
+  const dateTo = $derived($importOptionsState.dateTo ?? "");
+  const dateRangeInvalid = $derived(dateFrom !== "" && dateTo !== "" && dateFrom > dateTo);
 </script>
 
 <Card>
@@ -109,6 +113,55 @@
 
       {#if tasksOutOfRange}
         <p class="mt-2 text-xs text-destructive">Enter a value between 1 and 20.</p>
+      {/if}
+    </div>
+
+    <Separator class="my-2" />
+
+    <div class="rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex min-w-0 flex-col items-start gap-1">
+          <span class="text-sm font-medium text-foreground">Capture date range</span>
+          <span class="text-xs text-muted-foreground">Only import files captured between these dates. Leave blank to import all.</span>
+        </div>
+        {#if dateFrom !== "" || dateTo !== ""}
+          <button
+            type="button"
+            class="shrink-0 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            onclick={() => importOptionsState.clearDateRange()}
+          >
+            Clear
+          </button>
+        {/if}
+      </div>
+      <div class="mt-2 flex items-center gap-2">
+        <Label for="import-option-date-from" class="sr-only">From date</Label>
+        <Input
+          id="import-option-date-from"
+          class="w-40 shrink-0"
+          type="date"
+          aria-label="From date"
+          aria-invalid={dateRangeInvalid}
+          max={dateTo || undefined}
+          value={dateFrom}
+          onchange={(e) => importOptionsState.setDateFrom(e.currentTarget.value)}
+        />
+        <span class="text-xs text-muted-foreground">to</span>
+        <Label for="import-option-date-to" class="sr-only">To date</Label>
+        <Input
+          id="import-option-date-to"
+          class="w-40 shrink-0"
+          type="date"
+          aria-label="To date"
+          aria-invalid={dateRangeInvalid}
+          min={dateFrom || undefined}
+          value={dateTo}
+          onchange={(e) => importOptionsState.setDateTo(e.currentTarget.value)}
+        />
+      </div>
+
+      {#if dateRangeInvalid}
+        <p class="mt-2 text-xs text-destructive">The start date must be on or before the end date.</p>
       {/if}
     </div>
 

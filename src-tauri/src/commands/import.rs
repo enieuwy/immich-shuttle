@@ -442,6 +442,12 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
         .remove(&job_id)
         .ok_or_else(|| format!("No pending wipe payload for job: {job_id}"))?;
 
+    let pending_count = pending.paths.len();
+    // When verification fails we keep every file AND leave the job actionable so
+    // the user can retry once the server is reachable again (previously the
+    // payload was dropped, making retry impossible).
+    let mut retry_pending: Option<PendingWipe> = None;
+
     if confirm {
         match wipe::verify_uploaded(&pending.server_url, &pending.api_key, &pending.paths).await {
             Ok(verified) => {
@@ -450,7 +456,7 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
                 job.summary = Some(format!(
                     "Verified {} of {} files on the server and deleted {}. Kept {} ({} not found on server).",
                     verified.confirmed.len(),
-                    pending.paths.len(),
+                    pending_count,
                     wipe_result.deleted,
                     kept,
                     verified.unverified.len(),
@@ -481,8 +487,7 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
             }
             Err(err) => {
                 job.summary = Some(format!(
-                    "Could not verify uploads with the server. All {} files were kept.",
-                    pending.paths.len()
+                    "Could not verify uploads with the server. All {pending_count} files were kept — you can retry the wipe."
                 ));
                 job.error = Some(format!(
                     "Wipe verification failed: {err}. Source files kept for safety."
@@ -491,26 +496,31 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
                     "app.log",
                     &format!("import_wipe_verify_failed job_id={job_id} error={err}"),
                 );
+                retry_pending = Some(pending);
             }
         }
     } else {
-        job.summary = Some(format!(
-            "Wipe skipped by user. {} files kept.",
-            pending.paths.len()
-        ));
+        job.summary = Some(format!("Wipe skipped by user. {pending_count} files kept."));
     }
 
-    job.awaiting_wipe_confirmation = false;
-    job.pending_wipe_count = 0;
+    if let Some(payload) = retry_pending {
+        // Put the payload back so a later import_confirm_wipe can retry.
+        if let Ok(mut map) = PENDING_WIPE.lock() {
+            map.insert(job_id.clone(), payload);
+        }
+        job.awaiting_wipe_confirmation = true;
+        job.pending_wipe_count = pending_count as u32;
+    } else {
+        job.awaiting_wipe_confirmation = false;
+        job.pending_wipe_count = 0;
+    }
     set_job(job.clone())?;
 
     let _ = logs::append_log(
         "app.log",
         &format!(
             "import_wipe_confirmed job_id={} confirm={} pending_count={}",
-            job_id,
-            confirm,
-            pending.paths.len()
+            job_id, confirm, pending_count
         ),
     );
 
@@ -519,6 +529,7 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
 
 #[tauri::command]
 pub async fn scan_source(path: String) -> Result<ScanResult, String> {
+    crate::services::source_guard::record_roots(std::slice::from_ref(&path));
     media_scanner::scan_directory(PathBuf::from(path).as_path())
 }
 
@@ -527,6 +538,7 @@ pub async fn scan_sources(paths: Vec<String>) -> Result<ScanResult, String> {
     if paths.is_empty() {
         return Err("At least one path is required".to_string());
     }
+    crate::services::source_guard::record_roots(&paths);
     let mut merged = ScanResult {
         files: Vec::new(),
         total_size_bytes: 0,
