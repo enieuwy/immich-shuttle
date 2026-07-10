@@ -65,6 +65,30 @@ fn set_job(job: ImportJob) -> Result<(), String> {
     Ok(())
 }
 
+/// Re-verify renderer-supplied selected paths against the user-approved source
+/// roots. The frontend sends `select_files` over IPC, so a compromised or buggy
+/// renderer could point staging at files outside the chosen folders; we reject
+/// any entry that does not canonicalize to a path nested under a source root.
+fn validate_selected_under_sources(
+    select_files: &[String],
+    source_paths: &[String],
+) -> Result<(), String> {
+    let roots: Vec<PathBuf> = source_paths
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p)))
+        .collect();
+    for sel in select_files {
+        let canon = std::fs::canonicalize(sel)
+            .map_err(|e| format!("Selected file is not accessible: {sel} ({e})"))?;
+        if !roots.iter().any(|root| canon.starts_with(root)) {
+            return Err(format!(
+                "Selected file is outside the chosen source folders: {sel}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<String, String> {
     if input.source_paths.is_empty() {
@@ -111,11 +135,17 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     let stack_raw_jpeg = input.stack_raw_jpeg;
     let stack_burst = input.stack_burst;
     let date_range = input.date_range.clone();
-    let concurrent_tasks = input.concurrent_tasks;
+    // The UI limits this to 1..=20; re-clamp here since the value arrives over
+    // IPC and must not be trusted to be in range (unbounded values would be
+    // forwarded straight to immich-go's --concurrent-tasks).
+    let concurrent_tasks = input.concurrent_tasks.map(|n| n.clamp(1, 20));
     let album_ids = input.album_ids.clone();
     let into_album = input.into_album.clone();
     let select_files = input.select_files.clone().unwrap_or_default();
     let staging_requested = !select_files.is_empty();
+    if staging_requested {
+        validate_selected_under_sources(&select_files, &source_paths)?;
+    }
     let started_at = now_ms();
     let job_id_clone = job_id.clone();
     let server_url = url_resolver::resolve_server_url(&profile).await;
@@ -216,8 +246,10 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let log_contents = std::fs::read_to_string(&request.log_path).unwrap_or_default();
         let file_errors = crate::services::stdout_parser::parse_error_log(&log_contents);
         let run = crate::services::stdout_parser::parse_run_progress(&log_contents);
-        let mut progress = run.progress;
-        progress.errors = file_errors.len() as u32;
+        // parse_run_progress counts every distinct errored file (uncapped);
+        // file_errors is capped at MAX_FILE_ERRORS for the UI payload. Keep the
+        // true count so the final tally never undercounts a mass-failure run.
+        let progress = run.progress;
         // For a staged (selected) import the log's paths point at the temp
         // symlink dir, which is cleaned up below — so wipe must target the user's
         // selected originals instead. SHA-1 verify_uploaded still gates deletion
@@ -274,7 +306,10 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                         job_id_clone.clone(),
                         PendingWipe {
                             paths: completed_asset_paths.clone(),
-                            server_url: profile.server_url.clone(),
+                            // Verify against the URL the upload actually used
+                            // (post-failover), not the primary configured one,
+                            // or the existence check can hit the wrong server.
+                            server_url: request.server_url.clone(),
                             api_key: api_key_for_album_assignment.clone(),
                         },
                     );

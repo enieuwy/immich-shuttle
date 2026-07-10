@@ -81,6 +81,29 @@ describe("albumsState", () => {
     expect(s.error).toBeNull();
   });
 
+  it("loads albums even when usersList fails (non-admin 403)", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+
+    vi.mocked(api.albumsList).mockResolvedValueOnce([
+      { id: "a1", album_name: "Family", shared_with: [] },
+    ]);
+    vi.mocked(api.usersList).mockRejectedValueOnce(new Error("403 Forbidden"));
+    await albumsState.loadAlbums();
+
+    const s = get(albumsState);
+    expect(s.error).toBeNull();
+    expect(s.availableAlbums.map((a) => a.id)).toContain("a1");
+    expect(s.availableUsers).toEqual([]);
+  });
+
   it("auto-retries a connection error and recovers", async () => {
     await profilesState.saveProfile({
       id: "p1",

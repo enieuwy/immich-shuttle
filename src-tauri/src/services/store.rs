@@ -35,14 +35,17 @@ fn store_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("store.json"))
 }
 
-fn load(app: &tauri::AppHandle) -> StoreData {
-    let Ok(path) = store_path(app) else {
-        return StoreData::default();
-    };
-    let Ok(raw) = fs::read_to_string(path) else {
-        return StoreData::default();
-    };
-    serde_json::from_str::<StoreData>(&raw).unwrap_or_default()
+fn load(app: &tauri::AppHandle) -> Result<StoreData, String> {
+    let path = store_path(app)?;
+    match fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str::<StoreData>(&raw)
+            .map_err(|e| format!("Could not parse store at {}: {e}", path.display())),
+        // A missing file is the first-run case, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoreData::default()),
+        // File exists but is locked/unreadable — refuse to fall back to an empty
+        // store, or the next save would overwrite the user's real history.
+        Err(e) => Err(format!("Could not read store at {}: {e}", path.display())),
+    }
 }
 
 fn save(app: &tauri::AppHandle, data: &StoreData) -> Result<(), String> {
@@ -67,7 +70,15 @@ pub fn append_history(app: &tauri::AppHandle, record: ImportRecord) {
         return;
     };
 
-    let mut data = load(app);
+    let mut data = match load(app) {
+        Ok(data) => data,
+        // Reading the existing store failed — do NOT overwrite it with a fresh
+        // empty state, or we'd wipe the user's real history/source metadata.
+        Err(err) => {
+            let _ = logs::append_log("app.log", &format!("history_append_failed reason={err}"));
+            return;
+        }
+    };
     let key = source_key(&record.source_paths);
     data.sources.insert(
         key,
@@ -89,7 +100,10 @@ pub fn list_history(app: &tauri::AppHandle) -> Vec<ImportRecord> {
         return Vec::new();
     };
 
-    let mut history = load(app).history;
+    let mut history = match load(app) {
+        Ok(data) => data.history,
+        Err(_) => return Vec::new(),
+    };
     history.sort_by_key(|record| std::cmp::Reverse(record.finished_at));
     history
 }
@@ -98,7 +112,7 @@ pub fn clear_history(app: &tauri::AppHandle) -> Result<(), String> {
     let _guard = STORE_LOCK
         .lock()
         .map_err(|_| "Could not lock import history store".to_string())?;
-    let mut data = load(app);
+    let mut data = load(app)?;
     data.history.clear();
     save(app, &data)
 }
@@ -109,6 +123,7 @@ pub fn last_import_for(app: &AppHandle, source_paths: &[String]) -> Option<i64> 
     };
 
     load(app)
+        .ok()?
         .sources
         .get(&source_key(source_paths))
         .map(|source| source.last_imported_at)

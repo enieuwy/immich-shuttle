@@ -28,6 +28,14 @@ describe("sourceState", () => {
     expect(state.scanResult?.photo_count).toBe(1);
   });
 
+  it("does not duplicate a source path selected twice", async () => {
+    await sourceState.selectSources(["/tmp/photos"]);
+    await sourceState.selectSources(["/tmp/photos", "/tmp/videos"]);
+    const state = get(sourceState);
+    expect(state.selectedPaths).toEqual(["/tmp/photos", "/tmp/videos"]);
+    expect(vi.mocked(api.scanSources)).toHaveBeenLastCalledWith(["/tmp/photos", "/tmp/videos"]);
+  });
+
   it("loads removable devices", async () => {
     await sourceState.loadDevices();
     expect(vi.mocked(api.devicesListRemovable)).toHaveBeenCalled();

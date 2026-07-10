@@ -45,7 +45,7 @@ export const sourceState = {
     if (paths.length === 0) return;
     state.update((s) => ({
       ...s,
-      selectedPaths: [...s.selectedPaths, ...paths],
+      selectedPaths: Array.from(new Set([...s.selectedPaths, ...paths])),
       scanning: true,
       error: null,
     }));

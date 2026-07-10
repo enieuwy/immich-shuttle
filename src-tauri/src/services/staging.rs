@@ -36,7 +36,16 @@ pub fn create_staging_dir(selected: &[String]) -> Result<PathBuf, String> {
             .and_then(|b| src.strip_prefix(b).ok())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from(src.file_name().unwrap_or_default()));
+        // Strip any `..`/`.`/root components so a crafted selection can never
+        // resolve to a destination outside the temp staging sandbox.
+        let Some(rel) = safe_relative(&rel) else {
+            continue;
+        };
         let dest = root.join(&rel);
+        // Belt-and-suspenders: never write outside `root`.
+        if !dest.starts_with(&root) {
+            continue;
+        }
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Could not create staging subdir: {e}"))?;
@@ -106,6 +115,25 @@ fn common_ancestor(paths: &[String]) -> Option<PathBuf> {
     Some(out)
 }
 
+/// Keep only the `Normal` components of `rel`, dropping any root/prefix/`.`/`..`
+/// segments. This guarantees `root.join(result)` stays nested under `root`,
+/// closing the path-traversal hole where a selection like `../../evil.jpg`
+/// could otherwise link/copy outside the temp staging dir. Returns `None` when
+/// nothing usable remains.
+fn safe_relative(rel: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for comp in rel.components() {
+        if let Component::Normal(part) = comp {
+            out.push(part);
+        }
+    }
+    if out.as_os_str().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +167,67 @@ mod tests {
     #[test]
     fn empty_selection_errors() {
         assert!(create_staging_dir(&[]).is_err());
+    }
+
+    #[test]
+    fn safe_relative_strips_traversal() {
+        assert_eq!(
+            safe_relative(Path::new("../../evil.jpg")),
+            Some(PathBuf::from("evil.jpg"))
+        );
+        assert_eq!(
+            safe_relative(Path::new("a/../../b/c.jpg")),
+            Some(PathBuf::from("a/b/c.jpg"))
+        );
+        assert_eq!(safe_relative(Path::new("../..")), None);
+    }
+
+    #[test]
+    fn staged_files_never_escape_root() {
+        // Two selections whose common ancestor leaves a `..`-laden relative path
+        // for the first entry (the path-traversal PoC). Every staged file must
+        // still land under the returned staging root.
+        let tmp = std::env::temp_dir().join(format!("stage-trav-{}", Uuid::new_v4()));
+        fs::create_dir_all(tmp.join("album/normal")).unwrap();
+        let escape = tmp.join("evilfile.jpg");
+        let normal = tmp.join("album/normal/file2.jpg");
+        fs::write(&escape, b"x").unwrap();
+        fs::write(&normal, b"y").unwrap();
+
+        // Craft the first entry with literal `..` segments relative to the second.
+        let crafted = format!("{}/album/../evilfile.jpg", tmp.to_string_lossy());
+        let staged = create_staging_dir(&[crafted, normal.to_string_lossy().to_string()]).unwrap();
+
+        for entry in walkdir_files(&staged) {
+            assert!(
+                entry.starts_with(&staged),
+                "staged path escaped root: {}",
+                entry.display()
+            );
+        }
+        // The escaping original is untouched (never overwritten in place).
+        assert_eq!(fs::read(&escape).unwrap(), b"x");
+
+        cleanup_staging_dir(&staged);
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    fn walkdir_files(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
     }
 }

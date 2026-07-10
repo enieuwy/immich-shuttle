@@ -50,10 +50,19 @@ export const albumsState = {
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       if (generation !== loadGeneration) return; // superseded by a newer load
       try {
-        const [availableAlbums, availableUsers] = await Promise.all([
-          albumsList(profile.id, query),
-          usersList(profile.id),
-        ]);
+        const availableAlbums = await albumsList(profile.id, query);
+        if (generation !== loadGeneration) return;
+        // Non-admin Immich users get 403 from usersList; that must not block the
+        // album list. Degrade the share-with-users picker to empty instead.
+        let availableUsers: AlbumUser[] = [];
+        try {
+          availableUsers = await usersList(profile.id);
+        } catch (usersError) {
+          console.warn(
+            "usersList failed (non-admin?):",
+            usersError instanceof Error ? usersError.message : String(usersError),
+          );
+        }
         if (generation !== loadGeneration) return;
         state.update((s) => ({ ...s, availableAlbums, availableUsers, loading: false, error: null }));
         return;

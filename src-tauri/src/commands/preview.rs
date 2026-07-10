@@ -105,7 +105,17 @@ fn parse_exif_datetime(s: &str) -> Option<i64> {
     let hour = num(8, 10)?;
     let minute = num(10, 12)?;
     let second = num(12, 14)?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    // Reject impossible clock and calendar values (e.g. 24:00:00, minute/second
+    // 60, Feb 31) so a corrupt EXIF stamp falls back to filesystem mtime instead
+    // of sorting the file to a plausible-but-wrong date.
+    if !(1..=days_in_month(year, month)).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+    {
         return None;
     }
     Some(civil_to_epoch(year, month, day, hour, minute, second))
@@ -121,6 +131,20 @@ fn civil_to_epoch(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
     days * 86400 + hour * 3600 + min * 60 + sec
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +169,22 @@ mod tests {
     fn rejects_short_or_invalid() {
         assert_eq!(parse_exif_datetime("2021:01"), None);
         assert_eq!(parse_exif_datetime("2021:13:01 00:00:00"), None);
+    }
+
+    #[test]
+    fn rejects_out_of_range_time_and_calendar() {
+        // Hour/minute/second bounds.
+        assert_eq!(parse_exif_datetime("2021:01:01 24:00:00"), None);
+        assert_eq!(parse_exif_datetime("2021:01:01 00:60:00"), None);
+        assert_eq!(parse_exif_datetime("2021:01:01 00:00:60"), None);
+        // Impossible calendar days.
+        assert_eq!(parse_exif_datetime("2021:02:31 00:00:00"), None);
+        assert_eq!(parse_exif_datetime("2021:04:31 00:00:00"), None);
+        assert_eq!(parse_exif_datetime("2021:02:29 00:00:00"), None); // 2021 not leap
+                                                                      // Valid leap day passes.
+        assert!(parse_exif_datetime("2020:02:29 12:30:45").is_some());
+        // Boundary values accepted.
+        assert!(parse_exif_datetime("2021:12:31 23:59:59").is_some());
     }
 
     #[test]
