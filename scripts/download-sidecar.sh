@@ -29,18 +29,22 @@ case "${TARGET}" in
   aarch64-apple-darwin)
     RELEASE_ASSET="immich-go_Darwin_arm64.tar.gz"
     OUTPUT_NAME="immich-go-aarch64-apple-darwin"
+    EXPECTED_SHA="0c1ce06932a21a738d9adaf2ddafdbf654113fc2791d31b6d2ea0044928e2f43"
     ;;
   x86_64-apple-darwin)
     RELEASE_ASSET="immich-go_Darwin_x86_64.tar.gz"
     OUTPUT_NAME="immich-go-x86_64-apple-darwin"
+    EXPECTED_SHA="35b9456d36c0bbb7d5087d08622b087f849f4f6d9631b15737a22cef39e5a314"
     ;;
   x86_64-unknown-linux-gnu)
     RELEASE_ASSET="immich-go_Linux_x86_64.tar.gz"
     OUTPUT_NAME="immich-go-x86_64-unknown-linux-gnu"
+    EXPECTED_SHA="6e2ad86bafdadb9466d6515de7cb882726c0aea1a21d51164dff361d7d480a97"
     ;;
   x86_64-pc-windows-msvc)
     RELEASE_ASSET="immich-go_Windows_x86_64.zip"
     OUTPUT_NAME="immich-go-x86_64-pc-windows-msvc.exe"
+    EXPECTED_SHA="37326f95d6654f7f67a5fde3263e96aa8f9cf288dcbb9a2164aafae0aaa144af"
     ;;
   *)
     echo "Unsupported target triple: ${TARGET}" >&2
@@ -63,17 +67,11 @@ mkdir -p "${TMP_DIR}"
 
 curl -fL "${URL}" -o "${TMP_FILE}"
 
-# Verify the downloaded archive against the release checksums before extracting.
-CHECKSUMS_URL="https://github.com/simulot/immich-go/releases/download/v${IMMICH_GO_VERSION}/checksums.txt"
-CHECKSUMS_FILE="${TMP_DIR}/checksums.txt"
-curl -fL "${CHECKSUMS_URL}" -o "${CHECKSUMS_FILE}"
-
-EXPECTED_SHA="$(awk -v f="${RELEASE_ASSET}" '$2 == f { print $1 }' "${CHECKSUMS_FILE}")"
-if [[ -z "${EXPECTED_SHA}" ]]; then
-  echo "No checksum found for ${RELEASE_ASSET} in checksums.txt" >&2
-  exit 1
-fi
-
+# Verify the downloaded archive against the SHA-256 pinned in THIS repo, not a
+# checksums.txt fetched from the same mutable upstream release. If an attacker
+# replaced the release asset they could also replace checksums.txt, so trusting
+# it would defeat the check; the repo-pinned value is the trust root. Bump both
+# IMMICH_GO_VERSION and the EXPECTED_SHA values together when upgrading.
 if command -v sha256sum >/dev/null 2>&1; then
   ACTUAL_SHA="$(sha256sum "${TMP_FILE}" | awk '{ print $1 }')"
 else
@@ -82,11 +80,11 @@ fi
 
 if [[ "${EXPECTED_SHA}" != "${ACTUAL_SHA}" ]]; then
   echo "Checksum mismatch for ${RELEASE_ASSET}" >&2
-  echo "  expected ${EXPECTED_SHA}" >&2
+  echo "  expected ${EXPECTED_SHA} (pinned in scripts/download-sidecar.sh)" >&2
   echo "  actual   ${ACTUAL_SHA}" >&2
   exit 1
 fi
-echo "Verified checksum for ${RELEASE_ASSET}"
+echo "Verified checksum for ${RELEASE_ASSET} against repo-pinned SHA-256"
 
 if [[ "${RELEASE_ASSET}" == *.tar.gz ]]; then
   tar -xzf "${TMP_FILE}" -C "${TMP_DIR}"

@@ -51,7 +51,12 @@ pub fn start_polling(app: AppHandle) {
         let mut last: Option<String> = None;
         loop {
             ticker.tick().await;
-            let current = list_removable_devices();
+            // Disk metadata refresh + is_dir() probes can block for seconds on a
+            // sleeping/disconnected drive; keep it off the async executor.
+            let current = match tauri::async_runtime::spawn_blocking(list_removable_devices).await {
+                Ok(devices) => devices,
+                Err(_) => continue,
+            };
             let serialized = match serde_json::to_string(&current) {
                 Ok(v) => v,
                 Err(_) => continue,

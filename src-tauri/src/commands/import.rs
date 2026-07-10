@@ -148,7 +148,6 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     }
     let started_at = now_ms();
     let job_id_clone = job_id.clone();
-    let server_url = url_resolver::resolve_server_url(&profile).await;
     let api_key_clone = api_key;
     let app_clone = app.clone();
     let log_path = logs::logs_dir()?.join(format!("run-{job_id}.log"));
@@ -193,6 +192,10 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             Some(dir) => vec![dir.to_string_lossy().to_string()],
             None => source_paths.clone(),
         };
+        // Resolve the reachable endpoint inside the task: the LAN/WAN probe can
+        // take up to a few seconds, so keep it off the IPC path that returns the
+        // job id to the frontend.
+        let server_url = url_resolver::resolve_server_url(&profile).await;
         let request = UploadRequest {
             job_id: job_id_clone.clone(),
             server_url,
@@ -530,7 +533,13 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
 #[tauri::command]
 pub async fn scan_source(path: String) -> Result<ScanResult, String> {
     crate::services::source_guard::record_roots(std::slice::from_ref(&path));
-    media_scanner::scan_directory(PathBuf::from(path).as_path())
+    // Recursive directory walks can take seconds/minutes on large libraries or
+    // network shares; run off the async executor so IPC stays responsive.
+    tauri::async_runtime::spawn_blocking(move || {
+        media_scanner::scan_directory(PathBuf::from(path).as_path())
+    })
+    .await
+    .map_err(|e| format!("Scan task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -539,22 +548,26 @@ pub async fn scan_sources(paths: Vec<String>) -> Result<ScanResult, String> {
         return Err("At least one path is required".to_string());
     }
     crate::services::source_guard::record_roots(&paths);
-    let mut merged = ScanResult {
-        files: Vec::new(),
-        total_size_bytes: 0,
-        photo_count: 0,
-        video_count: 0,
-        skipped_unreadable: 0,
-    };
-    for p in paths {
-        let result = media_scanner::scan_directory(PathBuf::from(p).as_path())?;
-        merged.files.extend(result.files);
-        merged.total_size_bytes += result.total_size_bytes;
-        merged.photo_count += result.photo_count;
-        merged.video_count += result.video_count;
-        merged.skipped_unreadable += result.skipped_unreadable;
-    }
-    Ok(merged)
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut merged = ScanResult {
+            files: Vec::new(),
+            total_size_bytes: 0,
+            photo_count: 0,
+            video_count: 0,
+            skipped_unreadable: 0,
+        };
+        for p in paths {
+            let result = media_scanner::scan_directory(PathBuf::from(p).as_path())?;
+            merged.files.extend(result.files);
+            merged.total_size_bytes += result.total_size_bytes;
+            merged.photo_count += result.photo_count;
+            merged.video_count += result.video_count;
+            merged.skipped_unreadable += result.skipped_unreadable;
+        }
+        Ok(merged)
+    })
+    .await
+    .map_err(|e| format!("Scan task failed: {e}"))?
 }
 
 #[tauri::command]
