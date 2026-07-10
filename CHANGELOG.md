@@ -5,6 +5,9 @@
 ### Compatibility
 - Bumped the bundled **immich-go** upload engine from 0.31.0 to **0.32.0**, which adds full **Immich v3.0.0** compatibility (server-version detection; drops the `deviceId`/`deviceAssetId` upload fields removed from v3's `AssetMediaCreateDto`; V2/V3-aware error parsing). immich-go 0.31.0 sent the old upload payload and would fail against a v3 server. immich-go 0.32.0 remains backward-compatible with Immich v2.
 
+### Security
+- Bumped transitive dependencies to clear three RustSec advisories flagged by `cargo audit`: `quick-xml` 0.38.4 → 0.41.0 (via `plist` 1.8.0 → 1.10.0) fixing RUSTSEC-2026-0194/0195 (two high-severity XML-parser DoS issues), and `crossbeam-epoch` 0.9.18 → 0.9.20 fixing RUSTSEC-2026-0204. Lockfile-only; no manifest changes.
+
 ### Branding
 - New original app icon and in-app logo — the "Send-lens" mark (an open lens ring with an upward arrow, reading as *sending photos into Immich*) in the indigo→teal brand gradient — replacing the default Tauri scaffold logo. The full macOS/Windows/Linux icon set is regenerated from it; editable SVG masters live at `src/lib/assets/logo.svg` and `src-tauri/icons/icon.svg`.
 
@@ -34,6 +37,8 @@
 - Added `npm run verify` (full CI mirror) and `npm run verify:fast`, plus version-controlled git hooks (`.githooks`, wired via `core.hooksPath` on install): a fast **pre-commit** (svelte-check + Vitest + rustfmt) and a full **pre-push** (everything CI runs) to keep CI green
 - The `immich-go` sidecar download now verifies each archive's SHA-256 against the upstream release `checksums.txt` before extracting, failing the build on any mismatch
 - Per-push CI builds Linux + Windows and runs the full test suite (svelte-check, Vitest, `cargo test`, Playwright) on Linux; macOS bundles build on `v*` release tags via the release workflow, to conserve Actions minutes. Bumped CI to Node 22 and `actions/*@v5`.
+- Bumped the `tauri` crate 2.10.2 → 2.11.5 so the Rust runtime tracks the same 2.11 minor as `@tauri-apps/api`, resolving the tauri-cli version-mismatch that was failing the Windows/Linux release builds.
+- Moved `renovate.json` into `.github/` and pruned a stale internal scoping doc from `docs/`.
 
 ### Distribution
 - Release workflow now publishes prebuilt installers (macOS `.dmg`, Linux `.AppImage`/`.deb`, Windows `.exe`) to GitHub Releases on each `v*` tag
