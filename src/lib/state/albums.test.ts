@@ -149,6 +149,31 @@ describe("albumsState", () => {
     expect(get(albumsState).selectedAlbumIds).toEqual(["a2"]);
   });
 
+  it("forwards the share role (defaulting to viewer) to albumShareUsers", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+
+    vi.mocked(api.albumShareUsers).mockClear();
+    // Least-privilege default when the caller omits the role.
+    await albumsState.createAlbum("Holiday", ["u1"], false);
+    expect(vi.mocked(api.albumShareUsers)).toHaveBeenLastCalledWith("p1", "a2", ["u1"], "viewer");
+
+    await albumsState.createAlbum("Team", ["u1", "u2"], false, "editor");
+    expect(vi.mocked(api.albumShareUsers)).toHaveBeenLastCalledWith(
+      "p1",
+      "a2",
+      ["u1", "u2"],
+      "editor",
+    );
+  });
+
   it("stores the public share link after creating a linked album", async () => {
     await profilesState.saveProfile({
       id: "p1",

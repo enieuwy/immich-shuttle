@@ -93,15 +93,14 @@ pub fn delete_profile(profile_id: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Mutex};
-
-    use once_cell::sync::Lazy;
+    use std::fs;
+    use std::sync::{LazyLock, Mutex};
 
     use crate::models::profile::Profile;
 
     use super::{delete_profile, get_profile, load_config, upsert_profile};
 
-    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn use_temp_config_home(suffix: &str) -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();

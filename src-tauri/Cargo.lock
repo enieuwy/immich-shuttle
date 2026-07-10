@@ -1922,7 +1922,6 @@ dependencies = [
  "image",
  "kamadak-exif",
  "keyring",
- "once_cell",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

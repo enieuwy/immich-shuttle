@@ -24,12 +24,13 @@ pub async fn album_share_users(
     profile_id: String,
     album_id: String,
     user_ids: Vec<String>,
+    role: String,
 ) -> Result<(), String> {
     let profile = profile_store::get_profile(&profile_id)?;
     let api_key = keychain::get_api_key(&profile_id)?
         .ok_or_else(|| format!("No API key found for profile: {profile_id}"))?;
     let client = ImmichClient::new(&profile.server_url, &api_key);
-    client.share_album_users(&album_id, &user_ids).await
+    client.share_album_users(&album_id, &user_ids, &role).await
 }
 
 #[tauri::command]

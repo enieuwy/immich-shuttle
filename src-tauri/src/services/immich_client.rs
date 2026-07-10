@@ -1,6 +1,5 @@
-use std::time::Duration;
+use std::{sync::LazyLock, time::Duration};
 
-use once_cell::sync::Lazy;
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -8,7 +7,7 @@ use serde_json::{json, Value};
 /// One shared HTTP client (connection pool + TLS config) reused across every
 /// request. Building a fresh `Client` per call is wasteful and was a likely
 /// source of flaky "error sending request" failures during the startup burst.
-static HTTP: Lazy<Client> = Lazy::new(|| {
+static HTTP: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
@@ -17,6 +16,23 @@ static HTTP: Lazy<Client> = Lazy::new(|| {
 });
 
 use crate::models::album::{Album, AlbumShareLink, AlbumUser};
+
+/// Percent-encode a value for use as a single URL path segment. Everything
+/// outside RFC 3986 unreserved characters is escaped — crucially `/`, so an id
+/// can never introduce additional path segments or `../` traversal into an
+/// authenticated request path.
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerVersion {
@@ -248,12 +264,21 @@ impl ImmichClient {
         &self,
         album_id: &str,
         user_ids: &[String],
+        role: &str,
     ) -> Result<(), String> {
+        // Only the two roles Immich accepts; reject anything else rather than
+        // forwarding an arbitrary string as an authorization level.
+        let role = match role {
+            "viewer" | "editor" => role,
+            other => return Err(format!("Invalid album share role: {other}")),
+        };
         self.request_json(
             Method::PUT,
-            &format!("/albums/{album_id}/users"),
+            // Percent-encode the id so it can't smuggle extra path segments
+            // (e.g. `../`) into the authenticated request path.
+            &format!("/albums/{}/users", encode_path_segment(album_id)),
             Some(json!({
-                "albumUsers": user_ids.iter().map(|id| json!({"userId": id, "role": "editor"})).collect::<Vec<_>>()
+                "albumUsers": user_ids.iter().map(|id| json!({"userId": id, "role": role})).collect::<Vec<_>>()
             })),
         )
         .await?;
@@ -376,5 +401,19 @@ mod tests {
         ];
         // Only the duplicate-reason reject is treated as present on the server.
         assert_eq!(duplicates_from_results(&results), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn encode_path_segment_escapes_separators_and_traversal() {
+        use super::encode_path_segment;
+        // A normal UUID is untouched.
+        assert_eq!(
+            encode_path_segment("6b2f1c4e-0000-4a1b-9c3d-abcdef012345"),
+            "6b2f1c4e-0000-4a1b-9c3d-abcdef012345"
+        );
+        // Slashes (segment separators) are escaped, so no extra path can be added.
+        assert_eq!(encode_path_segment("../admin"), "..%2Fadmin");
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+        assert!(!encode_path_segment("x/../y").contains('/'));
     }
 }

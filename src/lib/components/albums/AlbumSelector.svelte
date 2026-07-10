@@ -16,6 +16,7 @@
   let showCreate = $state(false);
   let newAlbumName = $state("");
   let selectedShareUserIds = $state<string[]>([]);
+  let shareRole = $state<"viewer" | "editor">("viewer");
   let createPublicLink = $state(false);
 
   $effect(() => {
@@ -31,9 +32,10 @@
     if (!newAlbumName.trim()) {
       return;
     }
-    await albumsState.createAlbum(newAlbumName.trim(), selectedShareUserIds, createPublicLink);
+    await albumsState.createAlbum(newAlbumName.trim(), selectedShareUserIds, createPublicLink, shareRole);
     newAlbumName = "";
     selectedShareUserIds = [];
+    shareRole = "viewer";
     createPublicLink = false;
     showCreate = false;
   }
@@ -212,6 +214,35 @@
               </label>
             {/each}
           </div>
+          {#if selectedShareUserIds.length > 0}
+            <div class="flex flex-col gap-1.5 pt-1">
+              <span class="text-xs font-medium text-muted-foreground">Access level</span>
+              <div class="flex gap-2">
+                <label class="flex flex-1 items-center gap-2 rounded-md border border-border bg-background p-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="shareRole"
+                    value="viewer"
+                    class="h-4 w-4 accent-primary"
+                    checked={shareRole === "viewer"}
+                    onchange={() => (shareRole = "viewer")}
+                  />
+                  <span class="text-sm leading-tight text-foreground">Viewer<br /><span class="text-xs text-muted-foreground">Can view only</span></span>
+                </label>
+                <label class="flex flex-1 items-center gap-2 rounded-md border border-border bg-background p-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="shareRole"
+                    value="editor"
+                    class="h-4 w-4 accent-primary"
+                    checked={shareRole === "editor"}
+                    onchange={() => (shareRole = "editor")}
+                  />
+                  <span class="text-sm leading-tight text-foreground">Editor<br /><span class="text-xs text-muted-foreground">Can add &amp; delete</span></span>
+                </label>
+              </div>
+            </div>
+          {/if}
         </div>
 
         <label class="flex items-center gap-2 cursor-pointer">

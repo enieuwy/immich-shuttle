@@ -1,6 +1,6 @@
 import { get, writable } from "svelte/store";
 
-import { albumCreate, albumShareLink, albumShareUsers, albumsList, usersList } from "$lib/api";
+import { albumCreate, albumShareLink, albumShareUsers, albumsList, usersList, type AlbumShareRole } from "$lib/api";
 import { errorsState } from "$lib/state/errors";
 import type { Album, AlbumUser } from "$lib/types";
 
@@ -114,7 +114,12 @@ export const albumsState = {
   clearSelection() {
     state.update((s) => ({ ...s, selectedAlbumIds: [] }));
   },
-  async createAlbum(name: string, shareUserIds: string[], createPublicLink: boolean) {
+  async createAlbum(
+    name: string,
+    shareUserIds: string[],
+    createPublicLink: boolean,
+    shareRole: AlbumShareRole = "viewer",
+  ) {
     const profile = get(activeProfile);
     if (!profile) {
       throw new Error("Select a profile before creating an album.");
@@ -122,7 +127,7 @@ export const albumsState = {
     try {
       const created = await albumCreate(profile.id, name);
       if (shareUserIds.length > 0) {
-        await albumShareUsers(profile.id, created.id, shareUserIds);
+        await albumShareUsers(profile.id, created.id, shareUserIds, shareRole);
       }
       let shareLinkUrl: string | null = null;
       if (createPublicLink) {

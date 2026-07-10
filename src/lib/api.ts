@@ -48,11 +48,19 @@ export function albumCreate(profileId: string, name: string): Promise<Album> {
   return invokeCommand<Album>("album_create", { profileId, name });
 }
 
-export function albumShareUsers(profileId: string, albumId: string, userIds: string[]): Promise<void> {
+export type AlbumShareRole = "viewer" | "editor";
+
+export function albumShareUsers(
+  profileId: string,
+  albumId: string,
+  userIds: string[],
+  role: AlbumShareRole,
+): Promise<void> {
   return invokeCommand<void>("album_share_users", {
     profileId,
     albumId,
     userIds,
+    role,
   });
 }
 

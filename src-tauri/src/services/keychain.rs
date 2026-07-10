@@ -1,6 +1,5 @@
 use keyring::Entry;
-use once_cell::sync::Lazy;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 const KEYCHAIN_SERVICE: &str = "immich-shuttle";
 
@@ -9,7 +8,7 @@ const KEYCHAIN_SERVICE: &str = "immich-shuttle";
 /// several fire at startup (albums + users + server info) — queue behind this
 /// lock instead of racing the prompt and failing. Once the user grants access
 /// the queued reads proceed and succeed, so no app restart is needed.
-static KEYCHAIN_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static KEYCHAIN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn keychain_guard() -> MutexGuard<'static, ()> {
     KEYCHAIN_LOCK

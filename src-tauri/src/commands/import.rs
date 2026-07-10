@@ -3,11 +3,10 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
     },
 };
 
-use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 use crate::{
@@ -22,13 +21,13 @@ use crate::{
     },
 };
 
-static JOBS: Lazy<Mutex<Vec<ImportJob>>> = Lazy::new(|| Mutex::new(Vec::new()));
-static PENDING_WIPE: Lazy<Mutex<HashMap<String, PendingWipe>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static RUNNING_IMPORTS: Lazy<Mutex<HashMap<String, Arc<AtomicBool>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static JOB_INPUTS: Lazy<Mutex<HashMap<String, ImportInput>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static JOBS: LazyLock<Mutex<Vec<ImportJob>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static PENDING_WIPE: LazyLock<Mutex<HashMap<String, PendingWipe>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static RUNNING_IMPORTS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static JOB_INPUTS: LazyLock<Mutex<HashMap<String, ImportInput>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct PendingWipe {
     paths: Vec<String>,
