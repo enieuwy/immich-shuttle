@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 - 2026-07-10
 
 ### Compatibility
 - Bumped the bundled **immich-go** upload engine from 0.31.0 to **0.32.0**, which adds full **Immich v3.0.0** compatibility (server-version detection; drops the `deviceId`/`deviceAssetId` upload fields removed from v3's `AssetMediaCreateDto`; V2/V3-aware error parsing). immich-go 0.31.0 sent the old upload payload and would fail against a v3 server. immich-go 0.32.0 remains backward-compatible with Immich v2.
 
 ### Security
 - Bumped transitive dependencies to clear three RustSec advisories flagged by `cargo audit`: `quick-xml` 0.38.4 → 0.41.0 (via `plist` 1.8.0 → 1.10.0) fixing RUSTSEC-2026-0194/0195 (two high-severity XML-parser DoS issues), and `crossbeam-epoch` 0.9.18 → 0.9.20 fixing RUSTSEC-2026-0204. Lockfile-only; no manifest changes.
+- Hardened file-system boundaries from a security audit: preview and scan commands now honour a source allowlist so a compromised renderer can't read arbitrary local files over IPC; staged relative paths are stripped of `..`/root components and containment-checked to block writes escaping the temp staging dir; renderer-supplied `select_files` are re-validated against approved source roots before staging; and symlinks are skipped during scans so links pointing outside the selected source can't be staged or uploaded.
+- Fixed data-loss and correctness bugs: history is no longer wiped when the store file is locked or corrupt (aborts instead of overwriting with empty state); a failed post-import wipe verification now retains the pending payload so the delete can be retried instead of being silently dropped; wipe existence checks target the resolved upload URL after failover; `concurrent_tasks` is clamped to 1–20; the true (uncapped) error count is reported on mass-failure runs; and impossible EXIF timestamps fall back to file mtime.
 
 ### Branding
 - New original app icon and in-app logo — the "Send-lens" mark (an open lens ring with an upward arrow, reading as *sending photos into Immich*) in the indigo→teal brand gradient — replacing the default Tauri scaffold logo. The full macOS/Windows/Linux icon set is regenerated from it; editable SVG masters live at `src/lib/assets/logo.svg` and `src-tauri/icons/icon.svg`.
@@ -25,6 +27,7 @@
 ### Preview & selection
 - New pre-import **preview grid**: click "Preview & select" on a scanned source to see your media as a thumbnail grid and pick exactly what to import. Thumbnails are generated on demand and cached — on macOS via the OS (`sips` for photos incl. HEIC/RAW, Quick Look for video); on Windows/Linux via a built-in decoder for JPEG/PNG/TIFF/WebP/GIF/BMP **plus camera RAW** (CR2/CR3/NEF/ARW/RAF/RW2/ORF/DNG…), where the largest embedded JPEG preview is extracted — pure Rust, no RAW decoder. On **Windows**, HEIC and video are additionally thumbnailed natively via the Shell thumbnail API (`IShellItemImageFactory`) — the same previews Explorer shows (video via Media Foundation; HEIC when the HEIF Image Extensions are installed), falling back to a typed placeholder when no OS thumbnail handler is present. HEIC/video still fall back to a placeholder tile on Linux. Selecting a subset stages just those files (via symlinks) for upload and always keeps the originals.
 - The preview grid can sort by **capture date** (EXIF `DateTimeOriginal`, falling back to file modification time) as well as by name, so you can review a shoot newest-first.
+- New **date-range import filter**: From/To pickers (with Clear) in Import options, validated so From ≤ To and forwarded to immich-go as `--date-range=YYYY-MM-DD,YYYY-MM-DD`, so you can import only media captured within a chosen window.
 
 ### Automation
 - Optional "Auto-import on card insert": when enabled (off by default), inserting a removable card that contains a DCIM folder surfaces a "card detected — import now?" banner with a one-click Start. Accepting imports to the active profile with no albums and source files always kept (deletion stays a separate, explicit, verified step); nothing uploads or deletes without your action. Toggle lives in the Source panel.

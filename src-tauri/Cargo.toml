@@ -1,6 +1,6 @@
 [package]
 name = "immich-shuttle"
-version = "0.1.0"
+version = "0.2.0"
 description = "Desktop importer for Immich — copy photos and videos from camera cards to your Immich server."
 authors = ["Ellis Nieuwpoort"]
 edition = "2021"
