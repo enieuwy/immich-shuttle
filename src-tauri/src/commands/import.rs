@@ -89,6 +89,45 @@ fn validate_selected_under_sources(
     Ok(())
 }
 
+/// Final classification of an import process that ran to completion.
+struct RunOutcome {
+    status: JobStatus,
+    /// Whether the uploaded originals may proceed to the verify-then-delete wipe.
+    wipe_eligible: bool,
+}
+
+/// Decide the final job status and wipe eligibility from a completed run's
+/// tallies. Kept pure (no globals, no I/O) because this is the verify-before-
+/// delete safety surface: a regression here could delete originals after a
+/// failed run or wrongly withhold deletion.
+///
+/// A run is a failure only when nothing landed on the server (no uploads, no
+/// duplicate matches) AND it ended badly (non-zero exit or per-file errors); a
+/// partial run that uploaded or matched duplicates succeeds, surfacing errors.
+/// Wipe is eligible only for a successful run with keep-files off and at least
+/// one completed path.
+fn classify_completed_run(
+    uploaded: u32,
+    duplicates: u32,
+    exit_nonzero: bool,
+    file_errors_len: usize,
+    keep_files: bool,
+    completed_paths_len: usize,
+) -> RunOutcome {
+    let nothing_landed = uploaded == 0 && duplicates == 0;
+    let failed = nothing_landed && (exit_nonzero || file_errors_len > 0);
+    let status = if failed {
+        JobStatus::Failed
+    } else {
+        JobStatus::Completed
+    };
+    let wipe_eligible = !failed && !keep_files && completed_paths_len > 0;
+    RunOutcome {
+        status,
+        wipe_eligible,
+    }
+}
+
 #[tauri::command]
 pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<String, String> {
     if input.source_paths.is_empty() {
@@ -291,18 +330,21 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 file_errors: file_errors.clone(),
             }
         } else {
-            // The process ran to completion. It is a failure only when nothing
-            // reached the server AND it ended badly; a partial run that uploaded
-            // or matched duplicates succeeds with any per-file errors surfaced.
-            let nothing_landed = progress.uploaded == 0 && progress.duplicates == 0;
-            let failed = nothing_landed && (exit_nonzero || !file_errors.is_empty());
-            let status = if failed {
-                JobStatus::Failed
-            } else {
-                JobStatus::Completed
-            };
-
-            let wipe_eligible = !failed && !keep_files && !completed_asset_paths.is_empty();
+            // The process ran to completion. classify_completed_run owns the
+            // failure + verify-before-delete decision so it can be unit-tested in
+            // isolation from the async command body.
+            let RunOutcome {
+                status,
+                wipe_eligible,
+            } = classify_completed_run(
+                progress.uploaded,
+                progress.duplicates,
+                exit_nonzero,
+                file_errors.len(),
+                keep_files,
+                completed_asset_paths.len(),
+            );
+            let failed = matches!(status, JobStatus::Failed);
             if wipe_eligible {
                 if let Ok(mut pending) = PENDING_WIPE.lock() {
                     pending.insert(
@@ -667,4 +709,61 @@ pub async fn import_clear_finished() -> Result<Vec<ImportJob>, String> {
         }
     }
     import_list_jobs().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_failed(o: &RunOutcome) -> bool {
+        matches!(o.status, JobStatus::Failed)
+    }
+
+    #[test]
+    fn nothing_landed_and_bad_exit_is_failed_not_wipe_eligible() {
+        let o = classify_completed_run(0, 0, true, 0, false, 3);
+        assert!(is_failed(&o));
+        assert!(!o.wipe_eligible, "a failed run must never be wipe-eligible");
+    }
+
+    #[test]
+    fn nothing_landed_with_file_errors_is_failed() {
+        let o = classify_completed_run(0, 0, false, 2, false, 3);
+        assert!(is_failed(&o));
+        assert!(!o.wipe_eligible);
+    }
+
+    #[test]
+    fn uploads_present_succeed_despite_errors_and_bad_exit() {
+        // A partial run that uploaded something is a success even with per-file
+        // errors and a non-zero exit; deletion of the originals stays eligible.
+        let o = classify_completed_run(5, 0, true, 4, false, 5);
+        assert!(!is_failed(&o));
+        assert!(o.wipe_eligible);
+    }
+
+    #[test]
+    fn duplicates_only_count_as_landed() {
+        // Everything was already on the server (all duplicates): success, and the
+        // originals are still eligible for deletion.
+        let o = classify_completed_run(0, 7, false, 0, false, 7);
+        assert!(!is_failed(&o));
+        assert!(o.wipe_eligible);
+    }
+
+    #[test]
+    fn keep_files_blocks_wipe_on_success() {
+        let o = classify_completed_run(5, 0, false, 0, true, 5);
+        assert!(!is_failed(&o));
+        assert!(!o.wipe_eligible, "keep-files must suppress deletion");
+    }
+
+    #[test]
+    fn no_completed_paths_blocks_wipe() {
+        // Success but nothing to delete (e.g. immich-go reported no completed
+        // local paths): not wipe-eligible, so we never delete on an empty set.
+        let o = classify_completed_run(0, 3, false, 0, false, 0);
+        assert!(!is_failed(&o));
+        assert!(!o.wipe_eligible);
+    }
 }

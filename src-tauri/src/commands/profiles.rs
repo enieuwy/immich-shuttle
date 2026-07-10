@@ -19,6 +19,7 @@ pub async fn profile_upsert(input: ProfileInput) -> Result<Profile, String> {
         return Err("Server URL is required".to_string());
     }
 
+    let is_new = input.id.is_none();
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let profile = Profile {
         id: id.clone(),
@@ -30,19 +31,34 @@ pub async fn profile_upsert(input: ProfileInput) -> Result<Profile, String> {
         wan_server_url: input.wan_server_url,
     };
 
-    if let Some(api_key) = input.api_key {
-        if !api_key.trim().is_empty() {
+    let stored_key = match input.api_key {
+        Some(api_key) if !api_key.trim().is_empty() => {
             keychain::store_api_key(&id, api_key.trim())?;
+            true
+        }
+        _ => false,
+    };
+
+    match profile_store::upsert_profile(profile) {
+        Ok(saved) => Ok(saved),
+        Err(err) => {
+            // Roll back a just-stored credential for a brand-new profile so a
+            // failed save can't orphan an API key under an unreferenced UUID
+            // (each retry would otherwise mint a new UUID and leak another key).
+            if is_new && stored_key {
+                let _ = keychain::delete_api_key(&id);
+            }
+            Err(err)
         }
     }
-
-    profile_store::upsert_profile(profile)
 }
 
 #[tauri::command]
 pub async fn profile_delete(id: String) -> Result<(), String> {
-    keychain::delete_api_key(&id)?;
-    profile_store::delete_profile(&id)
+    // Remove the profile first: if this fails the credential stays intact so the
+    // profile remains usable, rather than leaving a broken, keyless profile.
+    profile_store::delete_profile(&id)?;
+    keychain::delete_api_key(&id)
 }
 
 #[tauri::command]

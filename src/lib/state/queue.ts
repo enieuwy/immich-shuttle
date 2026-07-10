@@ -46,32 +46,45 @@ type ImportProgressEvent = {
 
 const firstSamples = new Map<string, { time: number; uploaded: number }>();
 
-function recomputeRates(
+type RateSample = { time: number; uploaded: number };
+type RateInfo = { itemsPerSec: number; etaSeconds: number | null };
+
+/**
+ * Compute per-job upload rate and ETA from the first observed sample. `now` and
+ * `samples` are injectable so the timing-dependent math can be unit-tested
+ * deterministically; production callers use the module clock and shared map.
+ */
+export function recomputeRates(
   jobs: ImportJob[],
-): Record<string, { itemsPerSec: number; etaSeconds: number | null }> {
-  const rates: Record<string, { itemsPerSec: number; etaSeconds: number | null }> = {};
+  now: () => number = Date.now,
+  samples: Map<string, RateSample> = firstSamples,
+): Record<string, RateInfo> {
+  const rates: Record<string, RateInfo> = {};
   const present = new Set<string>();
   for (const job of jobs) {
     present.add(job.id);
     if (job.status !== "running") {
-      firstSamples.delete(job.id);
+      // Non-running jobs must not retain a stale first sample, or a later
+      // resume would compute the rate from a pre-pause baseline.
+      samples.delete(job.id);
       continue;
     }
-    let sample = firstSamples.get(job.id);
+    let sample = samples.get(job.id);
     if (!sample) {
-      sample = { time: Date.now(), uploaded: job.progress.uploaded };
-      firstSamples.set(job.id, sample);
+      sample = { time: now(), uploaded: job.progress.uploaded };
+      samples.set(job.id, sample);
     }
-    const elapsed = (Date.now() - sample.time) / 1000;
+    const elapsed = (now() - sample.time) / 1000;
     const delta = job.progress.uploaded - sample.uploaded;
     const itemsPerSec = elapsed > 0 && delta > 0 ? delta / elapsed : 0;
     const remaining = Math.max(0, job.progress.total - job.progress.uploaded);
     const etaSeconds = itemsPerSec > 0 ? Math.round(remaining / itemsPerSec) : null;
     rates[job.id] = { itemsPerSec, etaSeconds };
   }
-  for (const id of firstSamples.keys()) {
+  // Drop samples for jobs that disappeared from the queue.
+  for (const id of samples.keys()) {
     if (!present.has(id)) {
-      firstSamples.delete(id);
+      samples.delete(id);
     }
   }
   return rates;

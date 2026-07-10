@@ -80,8 +80,15 @@ impl ImmichClient {
                         .await
                         .map_err(|e| format!("Failed reading API response: {e}"))?;
                     if !status.is_success() {
-                        last_err =
-                            format!("API {method} {path} failed at {url} ({status}): {text}");
+                        let err = format!("API {method} {path} failed at {url} ({status}): {text}");
+                        // Only a 404 justifies trying the alternate `/api` path
+                        // variant. Any other status (401/403/5xx) is authoritative
+                        // for this endpoint, so surface it instead of letting a
+                        // later candidate's 404 mask e.g. an expired API key.
+                        if status.as_u16() != 404 {
+                            return Err(err);
+                        }
+                        last_err = err;
                         continue;
                     }
                     if text.trim().is_empty() {

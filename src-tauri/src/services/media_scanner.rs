@@ -157,4 +157,59 @@ mod tests {
         fs::remove_dir_all(&tmp).unwrap();
         let _ = fs::remove_file(&outside);
     }
+
+    #[test]
+    fn nonexistent_path_returns_err() {
+        let missing = std::env::temp_dir().join(format!("scan-missing-{}", Uuid::new_v4()));
+        assert!(scan_directory(&missing).is_err());
+    }
+
+    #[test]
+    fn single_supported_file_returns_one_photo() {
+        let tmp = std::env::temp_dir().join(format!("scan-one-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let photo = tmp.join("shot.JPG"); // uppercase ext must normalize to .jpg
+        fs::write(&photo, b"hello").unwrap();
+
+        let result = scan_directory(&photo).unwrap();
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.photo_count, 1);
+        assert_eq!(result.video_count, 0);
+        assert_eq!(result.total_size_bytes, 5);
+        assert!(!result.files[0].is_video);
+        assert_eq!(result.files[0].extension, ".jpg");
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn single_video_file_is_flagged_video() {
+        let tmp = std::env::temp_dir().join(format!("scan-vid-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let clip = tmp.join("clip.mov");
+        fs::write(&clip, b"vid").unwrap();
+
+        let result = scan_directory(&clip).unwrap();
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.video_count, 1);
+        assert_eq!(result.photo_count, 0);
+        assert!(result.files[0].is_video);
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn single_unsupported_file_returns_empty() {
+        let tmp = std::env::temp_dir().join(format!("scan-uns-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let doc = tmp.join("notes.txt");
+        fs::write(&doc, b"x").unwrap();
+
+        let result = scan_directory(&doc).unwrap();
+        assert!(result.files.is_empty());
+        assert_eq!(result.photo_count, 0);
+        assert_eq!(result.video_count, 0);
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
 }

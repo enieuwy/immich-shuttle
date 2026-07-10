@@ -22,7 +22,7 @@
 
 use std::{
     fs,
-    io::Cursor,
+    io::{Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -373,52 +373,117 @@ fn generate_with_image(src: &Path, max: u32, out: &Path) -> bool {
     rgb.save_with_format(out, image::ImageFormat::Jpeg).is_ok()
 }
 
-/// Find the byte offset of the largest (by pixel area) JPEG embedded in a RAW
-/// container. Cameras embed a full-size preview and often a small thumbnail;
-/// byte stuffing means a real `FF D8 FF` SOI never appears inside JPEG entropy
-/// data, so scanning for it reliably locates the embedded streams.
-fn best_embedded_jpeg_offset(data: &[u8]) -> Option<usize> {
-    let mut best: Option<(u64, usize)> = None;
-    let mut i = 0usize;
-    while i + 3 <= data.len() {
-        if data[i] == 0xFF && data[i + 1] == 0xD8 && data[i + 2] == 0xFF {
-            if let Ok((w, h)) =
-                image::ImageReader::with_format(Cursor::new(&data[i..]), image::ImageFormat::Jpeg)
-                    .into_dimensions()
-            {
-                let area = u64::from(w) * u64::from(h);
-                let better = match best {
-                    Some((a, _)) => area > a,
-                    None => true,
-                };
-                if better {
-                    best = Some((area, i));
-                }
+/// Scan `src` for embedded JPEG SOI markers (`FF D8 FF`) using a small rolling
+/// buffer, so we never hold the whole (often 20-100MB) RAW file in memory.
+/// Returns the absolute byte offset of each embedded JPEG stream. Byte stuffing
+/// means a real `FF D8 FF` never appears inside JPEG entropy data, so these
+/// offsets reliably mark the start of each embedded stream (false positives from
+/// raw sensor data are rejected later when dimension parsing fails).
+fn find_embedded_jpeg_offsets(src: &Path) -> Vec<u64> {
+    let mut file = match fs::File::open(src) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    const CHUNK: usize = 1 << 16; // 64 KiB
+    let mut buf = vec![0u8; CHUNK + 2]; // +2 so a boundary-straddling marker survives
+    let mut offsets = Vec::new();
+    let mut base: u64 = 0; // absolute offset of buf[0]
+    let mut carry = 0usize; // bytes retained from the previous chunk at buf[0..carry]
+    loop {
+        let n = match file.read(&mut buf[carry..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let filled = carry + n;
+        let mut i = 0usize;
+        while i + 3 <= filled {
+            if buf[i] == 0xFF && buf[i + 1] == 0xD8 && buf[i + 2] == 0xFF {
+                offsets.push(base + i as u64);
             }
-            i += 3;
-        } else {
             i += 1;
         }
+        // Retain the last 2 bytes so a marker split across the chunk boundary is
+        // still matched on the next pass.
+        let keep = filled.min(2);
+        let drop = filled - keep;
+        buf.copy_within(drop..filled, 0);
+        base += drop as u64;
+        carry = keep;
     }
-    best.map(|(_, off)| off)
+    offsets
+}
+
+/// Read up to `len` bytes from `src` starting at `offset`, capping the request so
+/// a corrupt length can't blow up memory. Real camera previews are a few MB.
+fn read_file_range(src: &Path, offset: u64, len: usize) -> Option<Vec<u8>> {
+    const MAX_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
+    let len = len.min(MAX_PREVIEW_BYTES);
+    let mut file = fs::File::open(src).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = vec![0u8; len];
+    let mut read = 0usize;
+    while read < len {
+        match file.read(&mut buf[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(_) => return None,
+        }
+    }
+    buf.truncate(read);
+    Some(buf)
 }
 
 /// Decode the largest embedded JPEG preview from a camera RAW file and write a
-/// JPEG thumbnail. Pure Rust (no RAW decoder); works on every platform.
+/// JPEG thumbnail. Pure Rust (no RAW decoder); works on every platform. Memory
+/// is bounded to a small header probe per candidate plus one preview read for
+/// the chosen stream — never the whole RAW file.
 fn generate_with_raw_preview(src: &Path, max: u32, out: &Path) -> bool {
-    let data = match fs::read(src) {
-        Ok(d) => d,
-        Err(_) => return false,
+    let offsets = find_embedded_jpeg_offsets(src);
+    if offsets.is_empty() {
+        return false;
+    }
+    let file_len = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+
+    // Selection: read only a small header per candidate to get its dimensions
+    // (the JPEG SOF marker sits near the start), never the full stream.
+    const PROBE_BYTES: usize = 256 * 1024;
+    let mut best: Option<(u64, u64)> = None; // (pixel area, offset)
+    for &off in &offsets {
+        let header = match read_file_range(src, off, PROBE_BYTES) {
+            Some(b) if !b.is_empty() => b,
+            _ => continue,
+        };
+        if let Ok((w, h)) =
+            image::ImageReader::with_format(Cursor::new(&header), image::ImageFormat::Jpeg)
+                .into_dimensions()
+        {
+            let area = u64::from(w) * u64::from(h);
+            if best.is_none_or(|(a, _)| area > a) {
+                best = Some((area, off));
+            }
+        }
+    }
+
+    let Some((_, off)) = best else {
+        return false;
     };
-    let offset = match best_embedded_jpeg_offset(&data) {
-        Some(o) => o,
+    // Read the chosen stream up to the next embedded marker (or EOF). Trailing
+    // raw sensor bytes are harmless: the JPEG decoder stops at the EOI marker.
+    let end = offsets
+        .iter()
+        .copied()
+        .find(|&o| o > off)
+        .unwrap_or(file_len);
+    let span = end.saturating_sub(off).max(1) as usize;
+    let bytes = match read_file_range(src, off, span) {
+        Some(b) => b,
         None => return false,
     };
-    let decoded =
-        match image::load_from_memory_with_format(&data[offset..], image::ImageFormat::Jpeg) {
-            Ok(img) => img,
-            Err(_) => return false,
-        };
+    let decoded = match image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg) {
+        Ok(img) => img,
+        Err(_) => return false,
+    };
     let thumb = decoded.thumbnail(max, max);
     // JPEG has no alpha channel; flatten to RGB before encoding.
     let rgb = image::DynamicImage::ImageRgb8(thumb.to_rgb8());
@@ -449,6 +514,7 @@ fn apply_orientation(src: &Path, img: image::DynamicImage) -> image::DynamicImag
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn renders_png_via_image_backend() {
@@ -503,28 +569,72 @@ mod tests {
     }
 
     #[test]
-    fn picks_largest_embedded_jpeg() {
-        // Simulate a RAW container: junk, a small thumbnail JPEG, more junk, the
-        // full-size preview JPEG, trailing bytes. The picker must choose the preview.
+    fn finds_all_embedded_jpeg_offsets() {
+        // junk, small thumbnail JPEG, junk, full-size preview JPEG, trailing bytes.
+        let small = jpeg_of(16, 16);
+        let big = jpeg_of(200, 120);
+        let mut data = vec![0x00, 0x11, 0x22, 0x33];
+        let small_off = data.len() as u64;
+        data.extend_from_slice(&small);
+        data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let big_off = data.len() as u64;
+        data.extend_from_slice(&big);
+        data.extend_from_slice(&[0x99, 0x88]);
+
+        let src =
+            std::env::temp_dir().join(format!("immich_shuttle_offsets_{}.cr2", Uuid::new_v4()));
+        fs::write(&src, &data).unwrap();
+        let offsets = find_embedded_jpeg_offsets(&src);
+        let _ = fs::remove_file(&src);
+        assert!(
+            offsets.contains(&small_off),
+            "should find the thumbnail SOI"
+        );
+        assert!(offsets.contains(&big_off), "should find the preview SOI");
+    }
+
+    #[test]
+    fn generate_picks_largest_preview() {
+        // The 200x120 preview must be chosen over the 16x16 thumbnail; the written
+        // thumbnail preserves the preview's landscape aspect (a thumbnail would be
+        // square), proving the picker read the larger stream.
         let small = jpeg_of(16, 16);
         let big = jpeg_of(200, 120);
         let mut data = vec![0x00, 0x11, 0x22, 0x33];
         data.extend_from_slice(&small);
         data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        let big_off = data.len();
         data.extend_from_slice(&big);
-        data.extend_from_slice(&[0x99, 0x88]);
-
-        let off = best_embedded_jpeg_offset(&data).expect("an embedded jpeg");
-        assert_eq!(
-            off, big_off,
-            "should pick the larger preview, not the thumbnail"
+        let src = std::env::temp_dir().join(format!("immich_shuttle_pick_{}.cr2", Uuid::new_v4()));
+        let out = std::env::temp_dir().join(format!("immich_shuttle_pick_{}.jpg", Uuid::new_v4()));
+        fs::write(&src, &data).unwrap();
+        let _ = fs::remove_file(&out);
+        assert!(generate_with_raw_preview(&src, 64, &out));
+        let (w, h) = image::image_dimensions(&out).unwrap();
+        assert!(
+            w > h,
+            "aspect should match the 200x120 preview, got {w}x{h}"
         );
-        let (w, h) =
-            image::ImageReader::with_format(Cursor::new(&data[off..]), image::ImageFormat::Jpeg)
-                .into_dimensions()
-                .unwrap();
-        assert_eq!((w, h), (200, 120));
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&out);
+    }
+
+    #[test]
+    fn finds_marker_across_chunk_boundary() {
+        // Place the SOI at byte 65536 so it straddles the 64 KiB read window and
+        // is only matched via the carried bytes on the next pass.
+        let big = jpeg_of(80, 60);
+        let mut data = vec![0u8; 65536];
+        let off = data.len() as u64;
+        data.extend_from_slice(&big);
+        let src =
+            std::env::temp_dir().join(format!("immich_shuttle_boundary_{}.cr2", Uuid::new_v4()));
+        fs::write(&src, &data).unwrap();
+        let offsets = find_embedded_jpeg_offsets(&src);
+        let _ = fs::remove_file(&src);
+        assert!(
+            offsets.contains(&off),
+            "SOI straddling the chunk boundary must be found; got {offsets:?}"
+        );
     }
 
     #[test]
