@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.3.0 - 2026-07-12
+
+### Import organization
+- New **folder-to-album/tag organization** for imports, so a nested library can be preserved on the server instead of collapsing into one album. Import options now offer: **Single album** (default, unchanged), **Album per folder name**, **Album per folder path**, and **Tag by folder path** — mapped to immich-go `--folder-as-album=FOLDER|PATH`, `--album-path-joiner`, and `--folder-as-tags` (previously hardcoded to `--folder-as-album=NONE`). In the folder modes the album picker is bypassed; the single-album mode keeps honoring the selected `--into-album`.
+
+### Automation
+- **Per-device auto-import rules**: teach each camera card its own destination once and re-inserting it replays the whole setup. A saved rule (kept per card, keyed by volume label with a mount-path fallback) records the target **profile, album, keep/wipe policy, stacking, and organization mode**. When a card with a rule is inserted, the auto-import banner shows its target and one click imports with those settings; a new "Remember settings for this card" control in Import options saves, updates, or forgets a card's rule. Cards without a rule keep the previous safe default (active profile, no album, originals kept). Deletion still goes through the separate verify-before-wipe step.
+
+### Security
+- Public album **share links now default to `showMetadata: false`**, so a public link no longer exposes capture/location metadata; the payload is built by a tested helper.
+- **Album sharing defaults to the Viewer role**: the create-album dialog gained a Viewer/Editor access selector (defaulting to least-privilege Viewer) threaded through to the `album_share_users` command, which validates the role server-side — previously every shared user was silently granted Editor. The `album_id` is percent-encoded as a single path segment so a renderer-supplied id can't smuggle `/` or `../` into the authenticated request path.
+- **LAN/WAN failover now verifies server identity**: the resolver only switches to an alternate endpoint after an unauthenticated `/server/ping` confirms it is a real Immich server, instead of switching on bare TCP port reachability — so the API key and uploads are never routed to an unrelated service merely listening on the configured host:port. Plaintext HTTP endpoints remain fully supported.
+- The immich-go **API-key config** is now written into a fresh random per-run directory (0700 on unix) with exclusive `create_new` + 0600, instead of a predictable shared-temp path, so a local user can't pre-create or symlink-hijack it.
+- The immich-go **run log** dropped from `DEBUG` to `INFO` (DEBUG can echo an `x-api-key` header), the log file is pre-created 0600, and the logs directory is 0700 on unix.
+- Removed the unused `opener:default` renderer capability (the only opener use is a fixed-path Rust command), narrowing the renderer's OS-opener surface.
+- **Supply chain**: every third-party GitHub Action in `build.yml`/`release.yml` is pinned to a full commit SHA (matching `ci.yml`), and the `immich-go` sidecar download verifies a SHA-256 pinned in the repo rather than a checksum fetched from the same mutable release.
+
+### Performance
+- Blocking I/O moved off the async executor via `spawn_blocking`: recursive source scans (`WalkDir`), removable-device polling (disk refresh + directory probes), and LAN/WAN URL resolution no longer stall the runtime or the IPC path — `import_start` returns the job id immediately instead of blocking on endpoint probing.
+- RAW **preview extraction is memory-bounded**: instead of loading a whole 20–100 MB RAW to find its embedded JPEG, the file is streamed with a 64 KB rolling buffer, cutting per-file memory from ~100 MB to a few MB (concurrent 8-file scans no longer spike ~800 MB).
+
+### Fixes
+- The Immich API client aborts its URL-candidate loop on any non-404 status, so an authentic 401/403 (e.g. an expired API key) is surfaced instead of being masked by the next candidate's 404.
+- A just-stored keychain credential is rolled back when a new-profile save fails (no orphaned keys under unreferenced UUIDs), and a profile is removed before its key so a failed delete can't leave a broken keyless profile.
+- Removed dead persisted `recent_album_ids` config state (round-tripped to disk but never read or written).
+
+### Maintenance
+- Replaced `once_cell::sync::Lazy` with `std::sync::LazyLock` throughout and dropped the direct `once_cell` dependency.
+- Extracted pure, unit-tested helpers on the sidecar argument builder, import-run classification, media scanner, and upload-rate math; added coverage for share roles, path-segment encoding, folder-organization flag mapping, the device-rules store, rule pre-fill/replay, and `startImport` overrides.
+
 ## v0.2.0 - 2026-07-10
 
 ### Compatibility
