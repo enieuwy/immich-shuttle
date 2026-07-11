@@ -11,11 +11,11 @@ import {
   importStart,
 } from "$lib/api";
 import { errorsState } from "$lib/state/errors";
-import type { ImportJob } from "$lib/types";
+import type { ImportJob, ImportOrganization } from "$lib/types";
 
 import { importOptionsState, toImmichDateRange } from "$lib/state/import-options";
 import { albumsState } from "$lib/state/albums";
-import { activeProfile } from "$lib/state/profiles";
+import { activeProfile, profilesState } from "$lib/state/profiles";
 import { sourceState } from "$lib/state/source";
 
 type QueueState = {
@@ -164,12 +164,21 @@ export const queueState = {
     keepFiles?: boolean;
     albumIds?: string[];
     selectFiles?: string[];
+    /** Import under a specific profile instead of the active one (device rules). */
+    profileId?: string;
+    /** Use this album name directly, bypassing albumIds -> name resolution. */
+    intoAlbum?: string | null;
+    stackRawJpeg?: boolean;
+    stackBurst?: boolean;
+    organization?: ImportOrganization;
   }) {
-    const profile = get(activeProfile);
     const source = get(sourceState);
     const options = get(importOptionsState);
     const albums = get(albumsState);
 
+    const profile = overrides?.profileId
+      ? (get(profilesState).profiles.find((p) => p.id === overrides.profileId) ?? null)
+      : get(activeProfile);
     if (!profile) {
       throw new Error("Select a profile before starting import.");
     }
@@ -178,25 +187,29 @@ export const queueState = {
       throw new Error("Select a source before starting import.");
     }
 
-    // immich-go assigns albums by name (--into-album), single album per run.
+    // immich-go assigns albums by name (--into-album), single album per run. A
+    // device rule can supply the name directly; otherwise resolve it from the
+    // first selected album id.
     const albumIds = overrides?.albumIds ?? albums.selectedAlbumIds;
     const intoAlbum =
-      albumIds.length > 0
-        ? (albums.availableAlbums.find((a) => a.id === albumIds[0])?.album_name ?? null)
-        : null;
+      overrides?.intoAlbum !== undefined
+        ? overrides.intoAlbum
+        : albumIds.length > 0
+          ? (albums.availableAlbums.find((a) => a.id === albumIds[0])?.album_name ?? null)
+          : null;
 
     await importStart({
       profile_id: profile.id,
       source_paths: sourcePaths,
       album_ids: albumIds,
       keep_files: overrides?.keepFiles ?? options.keepFiles,
-      stack_raw_jpeg: options.stackRawJpeg,
-      stack_burst: options.stackBurst,
+      stack_raw_jpeg: overrides?.stackRawJpeg ?? options.stackRawJpeg,
+      stack_burst: overrides?.stackBurst ?? options.stackBurst,
       date_range: toImmichDateRange(options.dateFrom, options.dateTo),
       concurrent_tasks: options.concurrentTasks,
       select_files: overrides?.selectFiles ?? null,
       into_album: intoAlbum,
-      organization: options.organization,
+      organization: overrides?.organization ?? options.organization,
     });
     await refreshJobs();
   },

@@ -2,12 +2,17 @@
   import { HardDrive, Play, X } from "@lucide/svelte";
 
   import { autoImportState } from "$lib/state/auto-import";
+  import { profilesState } from "$lib/state/profiles";
   import { Badge } from "$lib/components/ui/badge";
   import { Button } from "$lib/components/ui/button";
 
   let starting = $state(false);
 
   const device = $derived($autoImportState.candidate);
+  const rule = $derived($autoImportState.candidateRule);
+  const ruleProfileName = $derived(
+    rule ? ($profilesState.profiles.find((p) => p.id === rule.profileId)?.display_name ?? null) : null,
+  );
 
   function fmtGb(bytes: number): string {
     return `${Math.round(bytes / 1024 ** 3)} GB`;
@@ -33,11 +38,22 @@
     </div>
     <div class="min-w-0 flex-1">
       <div class="flex items-center gap-2">
-        <span class="text-sm font-semibold text-foreground">Card detected — import now?</span>
+        <span class="text-sm font-semibold text-foreground">
+          {rule ? "Card detected — import with saved settings?" : "Card detected — import now?"}
+        </span>
         <Badge variant="secondary">DCIM</Badge>
+        {#if rule}
+          <Badge variant="secondary">Saved rule</Badge>
+        {/if}
       </div>
       <p class="truncate text-xs text-muted-foreground" title={device.mount_path}>
-        {device.name} · {fmtGb(device.available_space)} free · keeps source files
+        {#if rule}
+          {device.name} → {ruleProfileName ?? "saved profile"}{rule.albumName
+            ? ` · album “${rule.albumName}”`
+            : ""} · {rule.keepFiles ? "keeps source files" : "deletes after verify"}
+        {:else}
+          {device.name} · {fmtGb(device.available_space)} free · keeps source files
+        {/if}
       </p>
     </div>
     <div class="flex shrink-0 items-center gap-2">

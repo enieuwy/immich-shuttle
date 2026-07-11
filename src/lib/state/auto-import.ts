@@ -1,7 +1,8 @@
 import { get, writable } from "svelte/store";
 
-import { errorsState } from "$lib/state/errors";
+import { deviceRulesState, type DeviceRule } from "$lib/state/device-rules";
 import { activeProfile } from "$lib/state/profiles";
+import { errorsState } from "$lib/state/errors";
 import { queueState } from "$lib/state/queue";
 import { sourceState } from "$lib/state/source";
 import type { RemovableDevice } from "$lib/types";
@@ -21,11 +22,14 @@ type AutoImportState = {
   enabled: boolean;
   /** The freshly-inserted DCIM device awaiting the user's decision, if any. */
   candidate: RemovableDevice | null;
+  /** The saved routing for `candidate`, when one exists — pre-fills the prompt. */
+  candidateRule: DeviceRule | null;
 };
 
 const state = writable<AutoImportState>({
   enabled: getStoredEnabled(),
   candidate: null,
+  candidateRule: null,
 });
 
 // Mounts we've already accounted for, so a card that stays inserted (or is
@@ -101,25 +105,39 @@ export const autoImportState = {
     remember();
 
     if (fresh) {
-      state.update((s) => (s.candidate ? s : { ...s, candidate: fresh }));
+      const rule = deviceRulesState.getRule(fresh);
+      state.update((s) => (s.candidate ? s : { ...s, candidate: fresh, candidateRule: rule }));
     }
   },
 
-  /** Start an import from the candidate card: active profile, no albums, keep files forced. */
+  /**
+   * Start an import from the candidate card. When the card has a saved rule the
+   * import replays it (profile / album / wipe policy / options); otherwise it
+   * falls back to the safe default: active profile, no album, keep originals.
+   */
   async accept(): Promise<void> {
-    const device = get(state).candidate;
+    const { candidate: device, candidateRule: rule } = get(state);
     if (!device) {
       return;
     }
-    state.update((s) => ({ ...s, candidate: null }));
+    state.update((s) => ({ ...s, candidate: null, candidateRule: null }));
     try {
       // Reflect the selection in the source picker so progress is visible there.
       await sourceState.selectSources([device.mount_path]);
-      await queueState.startImport({
-        sourcePaths: [device.mount_path],
-        keepFiles: true,
-        albumIds: [],
-      });
+      await queueState.startImport(
+        rule
+          ? {
+              sourcePaths: [device.mount_path],
+              profileId: rule.profileId,
+              albumIds: [],
+              intoAlbum: rule.albumName,
+              keepFiles: rule.keepFiles,
+              stackRawJpeg: rule.stackRawJpeg,
+              stackBurst: rule.stackBurst,
+              organization: rule.organization,
+            }
+          : { sourcePaths: [device.mount_path], keepFiles: true, albumIds: [] },
+      );
     } catch (error) {
       errorsState.addError(
         error instanceof Error ? error.message : "Could not start auto-import.",
@@ -133,7 +151,7 @@ export const autoImportState = {
     if (device) {
       dismissedMounts.add(device.mount_path);
     }
-    state.update((s) => ({ ...s, candidate: null }));
+    state.update((s) => ({ ...s, candidate: null, candidateRule: null }));
   },
 
   /** Test/preview-only: reset internal detection bookkeeping. */
@@ -141,6 +159,6 @@ export const autoImportState = {
     seenMounts.clear();
     dismissedMounts.clear();
     baselineSeeded = false;
-    state.set({ enabled: getStoredEnabled(), candidate: null });
+    state.set({ enabled: getStoredEnabled(), candidate: null, candidateRule: null });
   },
 };

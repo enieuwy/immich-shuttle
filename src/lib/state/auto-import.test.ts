@@ -32,6 +32,7 @@ vi.mock("$lib/api", () => ({
 
 import * as api from "$lib/api";
 import { autoImportState } from "./auto-import";
+import { deviceRulesState } from "./device-rules";
 import { profilesState } from "./profiles";
 import { sourceState } from "./source";
 import type { RemovableDevice } from "$lib/types";
@@ -69,6 +70,7 @@ beforeEach(async () => {
   localStorage.clear();
   sourceState.clearSource();
   autoImportState._reset();
+  deviceRulesState._reset();
   await withActiveProfile();
 });
 
@@ -156,5 +158,58 @@ describe("autoImportState", () => {
 
     autoImportState.setEnabled(false);
     expect(get(autoImportState).candidate).toBeNull();
+  });
+
+  it("pre-fills the candidate rule when the inserted card has a saved rule", () => {
+    deviceRulesState.saveRule(card, {
+      profileId: "p2",
+      albumName: "Family",
+      keepFiles: false,
+      stackRawJpeg: false,
+      stackBurst: true,
+      organization: "folder_path",
+    });
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+
+    expect(get(autoImportState).candidateRule?.profileId).toBe("p2");
+  });
+
+  it("accept replays a saved rule's profile, album, and wipe policy", async () => {
+    deviceRulesState.saveRule(card, {
+      profileId: "p2",
+      albumName: "Family",
+      keepFiles: false,
+      stackRawJpeg: false,
+      stackBurst: true,
+      organization: "folder_path",
+    });
+    // p2 must exist for the profileId override to resolve.
+    await profilesState.saveProfile({
+      id: "p2",
+      display_name: "Family",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+    await autoImportState.accept();
+
+    const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
+    expect(payload).toMatchObject({
+      profile_id: "p2",
+      source_paths: [card.mount_path],
+      into_album: "Family",
+      keep_files: false,
+      stack_raw_jpeg: false,
+      stack_burst: true,
+      organization: "folder_path",
+    });
   });
 });

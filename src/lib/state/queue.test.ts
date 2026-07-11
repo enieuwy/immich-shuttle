@@ -222,4 +222,45 @@ describe("queueState", () => {
 
     importOptionsState.setOrganization("single_album");
   });
+
+  it("honors profileId, intoAlbum, and stack overrides (device rules)", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    await profilesState.saveProfile({
+      id: "p2",
+      display_name: "Family",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+
+    await queueState.startImport({
+      sourcePaths: ["/Volumes/SD/DCIM"],
+      profileId: "p2",
+      intoAlbum: "Family",
+      albumIds: [],
+      keepFiles: false,
+      stackRawJpeg: false,
+      stackBurst: true,
+      organization: "folder_name",
+    });
+
+    const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
+    expect(payload).toMatchObject({
+      profile_id: "p2",
+      into_album: "Family",
+      keep_files: false,
+      stack_raw_jpeg: false,
+      stack_burst: true,
+      organization: "folder_name",
+    });
+  });
 });

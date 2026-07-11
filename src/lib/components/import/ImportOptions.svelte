@@ -7,6 +7,7 @@
   import { Switch } from "$lib/components/ui/switch";
   import { importOptionsState } from "$lib/state/import-options";
   import { autoImportState } from "$lib/state/auto-import";
+  import DeviceRuleControl from "$lib/components/source/DeviceRuleControl.svelte";
   import type { ImportOrganization } from "$lib/types";
 
   let tasksInput = $state("");
@@ -223,5 +224,7 @@
         onCheckedChange={(v) => autoImportState.setEnabled(v)}
       />
     </div>
+
+    <DeviceRuleControl />
   </CardContent>
 </Card>
