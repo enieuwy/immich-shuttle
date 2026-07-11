@@ -376,6 +376,54 @@ pub fn normalize_server_url(value: &str) -> String {
     }
 }
 
+/// Confirm a candidate endpoint is a reachable Immich server WITHOUT sending the
+/// API key, by hitting the unauthenticated `/server/ping` endpoint and checking
+/// for the `{"res":"pong"}` reply. Failover uses this so an upload (and the API
+/// key) is never routed to an arbitrary service that merely holds the LAN/WAN
+/// port open. Over plaintext HTTP a deliberate impersonator can still answer
+/// this probe; that residual risk is inherent to the user's transport choice.
+pub async fn probe_is_immich(server_url: &str) -> bool {
+    let root = normalize_server_url(server_url);
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return false;
+    }
+    // Mirror request_json's `/api` path handling: a URL already ending in `/api`
+    // is used verbatim, otherwise try the bare path then the `/api`-prefixed one.
+    let candidates = if root.ends_with("/api") {
+        vec![format!("{root}/server/ping")]
+    } else {
+        vec![
+            format!("{root}/server/ping"),
+            format!("{root}/api/server/ping"),
+        ]
+    };
+    for url in candidates {
+        let resp = HTTP
+            .get(&url)
+            .header("accept", "application/json")
+            // Short bound so failover stays snappy; covers connect + response.
+            .timeout(Duration::from_millis(2000))
+            .send()
+            .await;
+        let Ok(resp) = resp else { continue };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(text) = resp.text().await else {
+            continue;
+        };
+        if serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.get("res").and_then(Value::as_str).map(|s| s == "pong"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::normalize_server_url;
