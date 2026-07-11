@@ -179,6 +179,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     let concurrent_tasks = input.concurrent_tasks.map(|n| n.clamp(1, 20));
     let album_ids = input.album_ids.clone();
     let into_album = input.into_album.clone();
+    let organization = input.organization;
     let select_files = input.select_files.clone().unwrap_or_default();
     let staging_requested = !select_files.is_empty();
     if staging_requested {
@@ -247,6 +248,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             date_range,
             concurrent_tasks,
             into_album,
+            organization,
         };
         let mut error_lines: Vec<String> = Vec::new();
         let mut exit_nonzero = false;

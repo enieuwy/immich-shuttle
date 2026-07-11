@@ -1,5 +1,7 @@
 import { writable } from "svelte/store";
 
+import type { ImportOrganization } from "$lib/types";
+
 type ImportOptionsState = {
   keepFiles: boolean;
   stackRawJpeg: boolean;
@@ -9,6 +11,8 @@ type ImportOptionsState = {
   dateFrom: string | null;
   /** Inclusive capture-date upper bound as "YYYY-MM-DD", or null. */
   dateTo: string | null;
+  /** How to map the source folder tree onto Immich albums/tags. */
+  organization: ImportOrganization;
 };
 
 const initialState: ImportOptionsState = {
@@ -18,6 +22,7 @@ const initialState: ImportOptionsState = {
   concurrentTasks: null,
   dateFrom: null,
   dateTo: null,
+  organization: "single_album",
 };
 
 const state = writable<ImportOptionsState>(initialState);
@@ -42,6 +47,9 @@ export const importOptionsState = {
   },
   setDateTo(dateTo: string | null) {
     state.update((s) => ({ ...s, dateTo: dateTo || null }));
+  },
+  setOrganization(organization: ImportOrganization) {
+    state.update((s) => ({ ...s, organization }));
   },
   clearDateRange() {
     state.update((s) => ({ ...s, dateFrom: null, dateTo: null }));

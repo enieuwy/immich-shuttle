@@ -181,4 +181,45 @@ describe("queueState", () => {
     expect(payload?.album_ids).toEqual(["a1"]);
     expect(payload?.into_album).toBe("Trip");
   });
+
+  it("defaults organization to single_album", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+
+    await queueState.startImport();
+
+    const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
+    expect(payload?.organization).toBe("single_album");
+  });
+
+  it("forwards the selected folder organization mode to importStart", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+
+    importOptionsState.setOrganization("folder_path");
+    await queueState.startImport();
+    expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.organization).toBe("folder_path");
+
+    importOptionsState.setOrganization("folder_tags");
+    await queueState.startImport();
+    expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.organization).toBe("folder_tags");
+
+    importOptionsState.setOrganization("single_album");
+  });
 });

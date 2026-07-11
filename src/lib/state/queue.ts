@@ -196,6 +196,7 @@ export const queueState = {
       concurrent_tasks: options.concurrentTasks,
       select_files: overrides?.selectFiles ?? null,
       into_album: intoAlbum,
+      organization: options.organization,
     });
     await refreshJobs();
   },

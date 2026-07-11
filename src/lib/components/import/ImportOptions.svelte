@@ -7,6 +7,7 @@
   import { Switch } from "$lib/components/ui/switch";
   import { importOptionsState } from "$lib/state/import-options";
   import { autoImportState } from "$lib/state/auto-import";
+  import type { ImportOrganization } from "$lib/types";
 
   let tasksInput = $state("");
 
@@ -83,6 +84,41 @@
         checked={!$importOptionsState.keepFiles}
         onCheckedChange={(v) => importOptionsState.setKeepFiles(!v)}
       />
+    </div>
+
+    <Separator class="my-2" />
+
+    <div class="rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <div class="flex items-start justify-between gap-3">
+        <Label
+          for="import-option-organization"
+          class="flex min-w-0 flex-col items-start gap-1 font-normal"
+        >
+          <span class="text-sm font-medium text-foreground">Organize into albums</span>
+          <span class="text-xs text-muted-foreground">
+            Group uploads by the source folder structure instead of one album.
+          </span>
+        </Label>
+        <select
+          id="import-option-organization"
+          class="h-9 w-52 shrink-0 rounded-md border border-input bg-transparent px-2 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-label="Organize into albums"
+          value={$importOptionsState.organization}
+          onchange={(e) =>
+            importOptionsState.setOrganization(e.currentTarget.value as ImportOrganization)}
+        >
+          <option value="single_album">Single album (selected)</option>
+          <option value="folder_name">Album per folder name</option>
+          <option value="folder_path">Album per folder path</option>
+          <option value="folder_tags">Tag by folder path</option>
+        </select>
+      </div>
+
+      {#if $importOptionsState.organization !== "single_album"}
+        <p class="mt-2 text-xs text-muted-foreground">
+          Albums or tags are derived from the source folders; the album picker is ignored for this mode.
+        </p>
+      {/if}
     </div>
 
     <Separator class="my-2" />

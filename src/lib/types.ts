@@ -47,6 +47,8 @@ export interface JobProgress {
   errors: number;
 }
 
+export type ImportOrganization = "single_album" | "folder_name" | "folder_path" | "folder_tags";
+
 export interface ImportInput {
   profile_id: string;
   source_paths: string[];
@@ -58,6 +60,7 @@ export interface ImportInput {
   concurrent_tasks: number | null;
   select_files?: string[] | null;
   into_album?: string | null;
+  organization?: ImportOrganization;
 }
 
 export interface FileError {
