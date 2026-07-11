@@ -290,12 +290,7 @@ impl ImmichClient {
             .request_json(
                 Method::POST,
                 "/shared-links",
-                Some(json!({
-                    "type": "ALBUM",
-                    "albumId": album_id,
-                    "allowUpload": false,
-                    "showMetadata": true
-                })),
+                Some(share_link_payload(album_id)),
             )
             .await?;
 
@@ -360,6 +355,18 @@ fn duplicates_from_results(results: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Payload for creating a public album share link. `showMetadata` is false so a
+/// public link never leaks capture/location metadata by default; there is no UI
+/// control to opt into exposure, so the private default is the only behavior.
+fn share_link_payload(album_id: &str) -> Value {
+    json!({
+        "type": "ALBUM",
+        "albumId": album_id,
+        "allowUpload": false,
+        "showMetadata": false
+    })
+}
+
 pub fn normalize_server_url(value: &str) -> String {
     let trimmed = value.trim().trim_end_matches('/');
     if let Some(root) = trimmed.strip_suffix("/api") {
@@ -415,5 +422,16 @@ mod tests {
         assert_eq!(encode_path_segment("../admin"), "..%2Fadmin");
         assert_eq!(encode_path_segment("a/b"), "a%2Fb");
         assert!(!encode_path_segment("x/../y").contains('/'));
+    }
+
+    #[test]
+    fn share_link_defaults_to_private_metadata() {
+        use super::share_link_payload;
+        let payload = share_link_payload("album-123");
+        assert_eq!(payload["type"], "ALBUM");
+        assert_eq!(payload["albumId"], "album-123");
+        assert_eq!(payload["allowUpload"], false);
+        // Public links must not expose capture/location metadata by default.
+        assert_eq!(payload["showMetadata"], false);
     }
 }

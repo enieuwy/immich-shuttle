@@ -5,6 +5,13 @@ pub fn logs_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "Could not resolve local data directory".to_string())?;
     let dir = base.join("immich-shuttle").join("logs");
     fs::create_dir_all(&dir).map_err(|e| format!("Could not create log directory: {e}"))?;
+    // Run logs can contain an immich-go x-api-key header at higher verbosity;
+    // keep the directory owner-only so other local users cannot read them.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
     Ok(dir)
 }
 

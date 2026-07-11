@@ -11,6 +11,7 @@ use std::{
 
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_shell::{process::CommandEvent, ShellExt};
+use uuid::Uuid;
 
 use crate::services::stdout_parser::parse_run_progress;
 
@@ -38,39 +39,76 @@ pub struct UploadRequest {
     pub into_album: Option<String>,
 }
 
-/// Removes the temp api-key config file when dropped.
+/// Removes the private per-run config directory (with the api-key file inside)
+/// when dropped.
 struct TempConfig {
+    dir: PathBuf,
     path: PathBuf,
 }
 
 impl Drop for TempConfig {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
-/// Write a private (0600 on unix) temp immich-go config carrying the API key so
-/// it is passed via `--config` instead of `--api-key` on the command line, where
-/// it would otherwise be readable in the process table by other local users. The
-/// returned guard deletes the file when it drops (i.e. when the run finishes).
-fn write_api_key_config(job_id: &str, api_key: &str) -> Result<TempConfig, String> {
-    let path = std::env::temp_dir().join(format!("immich-shuttle-cfg-{job_id}.yaml"));
+/// Write the immich-go config carrying the API key into a fresh private per-run
+/// directory, so it is passed via `--config` instead of `--api-key` on the
+/// command line (where it would be visible in the process table). The directory
+/// name is random (never the logged job id), created 0700 on unix, and the
+/// config file is created with exclusive semantics (`create_new`) at 0600 — a
+/// local attacker can neither pre-create nor symlink-hijack the path. The
+/// returned guard removes the whole directory when the run finishes.
+fn write_api_key_config(api_key: &str) -> Result<TempConfig, String> {
+    let dir = std::env::temp_dir().join(format!("immich-shuttle-{}", Uuid::new_v4()));
+    let mut dir_builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        dir_builder.mode(0o700);
+    }
+    dir_builder
+        .create(&dir)
+        .map_err(|e| format!("Could not create immich-go config directory: {e}"))?;
+    // Construct the guard before writing so a write failure still cleans up the dir.
+    let guard = TempConfig {
+        dir: dir.clone(),
+        path: dir.join("config.yaml"),
+    };
+
     let escaped = api_key.replace('\\', "\\\\").replace('"', "\\\"");
     let contents = format!("upload:\n    api-key: \"{escaped}\"\n");
 
     let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
     let mut file = opts
-        .open(&path)
+        .open(&guard.path)
         .map_err(|e| format!("Could not create immich-go config: {e}"))?;
     file.write_all(contents.as_bytes())
         .map_err(|e| format!("Could not write immich-go config: {e}"))?;
-    Ok(TempConfig { path })
+    Ok(guard)
+}
+
+/// Create the run log file with 0600 permissions on unix before immich-go opens
+/// it via `--log-file`, so the persisted log is not world-readable. The run log
+/// name embeds a fresh UUID, so it never pre-exists; `create(true)` without
+/// truncation leaves an existing file untouched.
+fn create_private_log(path: &Path) -> Result<(), String> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+        .map(|_| ())
+        .map_err(|e| format!("Could not create run log: {e}"))
 }
 
 /// Read the current run log and emit a progress snapshot to the frontend.
@@ -93,7 +131,10 @@ fn emit_progress(app: &AppHandle, job_id: &str, log_path: &Path) {
 }
 
 pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<SidecarResult, String> {
-    let config = write_api_key_config(&request.job_id, &request.api_key)?;
+    let config = write_api_key_config(&request.api_key)?;
+    // Pre-create the run log 0600 so immich-go's --log-file output (which can
+    // carry an x-api-key header) is not world-readable on shared machines.
+    create_private_log(&request.log_path)?;
     let mut args = vec![
         "upload".to_string(),
         "from-folder".to_string(),
@@ -124,7 +165,9 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
         "--log-file".to_string(),
         request.log_path.to_string_lossy().to_string(),
         "--log-level".to_string(),
-        "DEBUG".to_string(),
+        // INFO by default: DEBUG can echo request headers (incl. x-api-key) into
+        // the persisted run log. Raise only behind an explicit diagnostics opt-in.
+        "INFO".to_string(),
     ];
     if let Some(range) = request.date_range.as_deref() {
         let range = range.trim();

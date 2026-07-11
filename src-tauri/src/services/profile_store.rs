@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{fs, path::PathBuf};
 
 use dirs::config_dir;
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,6 @@ pub struct Defaults {
 pub struct AppConfig {
     pub profiles: Vec<Profile>,
     pub defaults: Defaults,
-    pub recent_album_ids: HashMap<String, Vec<String>>,
 }
 
 impl Default for AppConfig {
@@ -24,7 +23,6 @@ impl Default for AppConfig {
             defaults: Defaults {
                 keep_files_on_disk: true,
             },
-            recent_album_ids: HashMap::new(),
         }
     }
 }
@@ -87,7 +85,6 @@ pub fn upsert_profile(profile: Profile) -> Result<Profile, String> {
 pub fn delete_profile(profile_id: &str) -> Result<(), String> {
     let mut cfg = load_config()?;
     cfg.profiles.retain(|p| p.id != profile_id);
-    cfg.recent_album_ids.remove(profile_id);
     save_config(&cfg)
 }
 
