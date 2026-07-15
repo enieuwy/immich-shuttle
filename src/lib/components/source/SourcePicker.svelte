@@ -58,6 +58,7 @@
   });
 
   onMount(() => {
+    let disposed = false;
     let unlistenDevice: (() => void) | undefined;
     let unlistenDrop: (() => void) | undefined;
 
@@ -71,7 +72,10 @@
         });
       }
     }).then((fn) => {
-      unlistenDevice = fn;
+      // If the component unmounted before the listener resolved, drop it now
+      // instead of leaving a stale handler attached for the process lifetime.
+      if (disposed) fn();
+      else unlistenDevice = fn;
     });
 
     void getCurrentWindow()
@@ -85,16 +89,14 @@
         }
       })
       .then((fn) => {
-        unlistenDrop = fn;
+        if (disposed) fn();
+        else unlistenDrop = fn;
       });
 
     return () => {
-      if (unlistenDevice) {
-        unlistenDevice();
-      }
-      if (unlistenDrop) {
-        unlistenDrop();
-      }
+      disposed = true;
+      unlistenDevice?.();
+      unlistenDrop?.();
     };
   });
 

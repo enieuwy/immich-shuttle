@@ -70,6 +70,7 @@
   }
 
   onMount(() => {
+    let disposed = false;
     let unlistenClose: (() => void) | undefined;
     void profilesState.loadProfiles().then(() => {
       if (getProfilesSnapshot().profiles.length === 0) {
@@ -93,14 +94,16 @@
         }
       })
       .then((fn) => {
-        unlistenClose = fn;
+        // Drop the handler if the component unmounted before registration
+        // resolved, so a remount can't stack duplicate close-confirm prompts.
+        if (disposed) fn();
+        else unlistenClose = fn;
       });
 
     return () => {
+      disposed = true;
       queueState.stopPolling();
-      if (unlistenClose) {
-        unlistenClose();
-      }
+      unlistenClose?.();
     };
   });
 
