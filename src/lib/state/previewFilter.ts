@@ -19,17 +19,23 @@ export function toYmd(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
-/** Start-of-day local epoch seconds for a "YYYY-MM-DD" string, or null if invalid. */
+/**
+ * Start-of-day epoch seconds for a "YYYY-MM-DD" string, or null if invalid.
+ * Parsed as UTC (trailing `Z`) to match the backend, which builds capture
+ * epochs by treating the EXIF wall-clock datetime as UTC (see
+ * `civil_to_epoch`); a local parse here would shift photos near midnight into
+ * the wrong day for browsers outside UTC.
+ */
 export function dayStartEpoch(ymd: string): number | null {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const t = new Date(`${ymd}T00:00:00`).getTime();
+  const t = new Date(`${ymd}T00:00:00Z`).getTime();
   return Number.isNaN(t) ? null : Math.floor(t / 1000);
 }
 
-/** End-of-day (inclusive) local epoch seconds for a "YYYY-MM-DD" string, or null. */
+/** End-of-day (inclusive) UTC epoch seconds for a "YYYY-MM-DD" string, or null. */
 export function dayEndEpoch(ymd: string): number | null {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
-  const t = new Date(`${ymd}T23:59:59.999`).getTime();
+  const t = new Date(`${ymd}T23:59:59.999Z`).getTime();
   return Number.isNaN(t) ? null : Math.floor(t / 1000);
 }
 

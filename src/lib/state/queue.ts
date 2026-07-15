@@ -92,18 +92,39 @@ export function recomputeRates(
 
 async function refreshJobs() {
   try {
-    const jobs = await importListJobs();
-    const rates = recomputeRates(jobs);
-    const runningIds = new Set(jobs.filter((j) => j.status === "running").map((j) => j.id));
-    state.update((s) => ({
-      ...s,
-      jobs,
-      rates,
-      currentFiles: Object.fromEntries(
-        Object.entries(s.currentFiles).filter(([id]) => runningIds.has(id)),
-      ),
-      error: null,
-    }));
+    const polled = await importListJobs();
+    const runningIds = new Set(polled.filter((j) => j.status === "running").map((j) => j.id));
+    state.update((s) => {
+      const prevById = new Map(s.jobs.map((j) => [j.id, j]));
+      // The backend's stored job progress is only refreshed at import start and
+      // end; live per-file counts arrive via the "import-progress" event stream
+      // between polls. For a still-running job, take the field-wise max of the
+      // polled and current progress (the run log is append-only, so counts only
+      // grow) so the 2s poll can't reset the bar/ETA to the stale start value.
+      const jobs = polled.map((job) => {
+        const prev = prevById.get(job.id);
+        if (job.status !== "running" || !prev) return job;
+        return {
+          ...job,
+          progress: {
+            total: Math.max(prev.progress.total, job.progress.total),
+            uploaded: Math.max(prev.progress.uploaded, job.progress.uploaded),
+            duplicates: Math.max(prev.progress.duplicates, job.progress.duplicates),
+            errors: Math.max(prev.progress.errors, job.progress.errors),
+          },
+        };
+      });
+      const rates = recomputeRates(jobs);
+      return {
+        ...s,
+        jobs,
+        rates,
+        currentFiles: Object.fromEntries(
+          Object.entries(s.currentFiles).filter(([id]) => runningIds.has(id)),
+        ),
+        error: null,
+      };
+    });
   } catch (error) {
     errorsState.addError("Could not refresh import queue.");
     state.update((s) => ({ ...s, error: error instanceof Error ? error.message : String(error) }));

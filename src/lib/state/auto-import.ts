@@ -81,32 +81,43 @@ export const autoImportState = {
     const present = new Set(devices.map((d) => d.mount_path));
     prune(present);
 
-    const remember = () => {
+    const rememberAll = () => {
       for (const mount of present) {
         seenMounts.add(mount);
       }
     };
 
+    // Startup baseline and the not-prompting states (disabled / no active
+    // profile) account for everything currently plugged in, so re-enabling
+    // later doesn't surface a backlog of cards that were present all along.
     if (!baselineSeeded) {
       baselineSeeded = true;
-      remember();
+      rememberAll();
       return;
     }
 
-    const { enabled } = get(state);
+    const { enabled, candidate } = get(state);
     if (!enabled || !get(activeProfile)) {
-      remember();
+      rememberAll();
+      return;
+    }
+
+    // A prompt is already showing: leave every other freshly-inserted card
+    // unseen so it gets its own turn once this one is resolved, instead of being
+    // marked seen on this poll and suppressed forever.
+    if (candidate) {
       return;
     }
 
     const fresh = devices.find(
       (d) => d.has_dcim && !seenMounts.has(d.mount_path) && !dismissedMounts.has(d.mount_path),
     );
-    remember();
-
     if (fresh) {
+      // Only the card we actually surface is marked seen; sibling cards inserted
+      // in the same batch stay unseen and prompt on a later poll.
+      seenMounts.add(fresh.mount_path);
       const rule = deviceRulesState.getRule(fresh);
-      state.update((s) => (s.candidate ? s : { ...s, candidate: fresh, candidateRule: rule }));
+      state.update((s) => ({ ...s, candidate: fresh, candidateRule: rule }));
     }
   },
 

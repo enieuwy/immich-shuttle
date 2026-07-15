@@ -149,6 +149,27 @@ describe("albumsState", () => {
     expect(get(albumsState).selectedAlbumIds).toEqual(["a2"]);
   });
 
+  it("still registers the album when sharing fails after creation", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+
+    vi.mocked(api.albumShareUsers).mockRejectedValueOnce(new Error("share failed"));
+    // Creation succeeds but the follow-up share fails: the album must not be
+    // orphaned server-side, so createAlbum resolves and still registers/selects
+    // it locally instead of throwing.
+    const created = await albumsState.createAlbum("Holiday", ["u1"], false);
+    expect(created.id).toBe("a2");
+    expect(get(albumsState).availableAlbums.some((a) => a.id === "a2")).toBe(true);
+    expect(get(albumsState).selectedAlbumIds).toEqual(["a2"]);
+  });
+
   it("forwards the share role (defaulting to viewer) to albumShareUsers", async () => {
     await profilesState.saveProfile({
       id: "p1",

@@ -70,10 +70,15 @@ impl ImmichClient {
         body: Option<Value>,
     ) -> Result<Value, String> {
         let root = self.server_url.trim_end_matches('/');
+        // Try the `/api`-prefixed path first: standard Immich serves its API
+        // under `/api` and the web UI at the root, so probing the bare root
+        // first wasted a request (a 404, or an HTML 200 that fails JSON parse)
+        // on every call. The bare root stays as a fallback for reverse proxies
+        // that already strip `/api`.
         let candidates = if root.ends_with("/api") {
             vec![format!("{root}{path}")]
         } else {
-            vec![format!("{root}{path}"), format!("{root}/api{path}")]
+            vec![format!("{root}/api{path}"), format!("{root}{path}")]
         };
 
         let mut last_err = String::from("Unknown request error");
@@ -389,13 +394,14 @@ pub async fn probe_is_immich(server_url: &str) -> bool {
         return false;
     }
     // Mirror request_json's `/api` path handling: a URL already ending in `/api`
-    // is used verbatim, otherwise try the bare path then the `/api`-prefixed one.
+    // is used verbatim, otherwise try the `/api`-prefixed path first (standard
+    // Immich) and fall back to the bare path for `/api`-stripping proxies.
     let candidates = if root.ends_with("/api") {
         vec![format!("{root}/server/ping")]
     } else {
         vec![
-            format!("{root}/server/ping"),
             format!("{root}/api/server/ping"),
+            format!("{root}/server/ping"),
         ]
     };
     for url in candidates {

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+- **Duplicate files are now wiped from the source drive.** Files the server already had ("server has duplicate") were counted but never added to the post-import wipe candidate list, so they were left behind on the SD card even when the user chose to delete originals. They now join the candidate list (still gated by the per-file SHA-1 existence check before any deletion); the `uploaded` counter stays a separate tally.
+- **Import history can always be reset.** A corrupt/unparseable history store no longer blocks "Clear history" (it falls back to an empty store and overwrites the bad file), and a panic while the store lock is held no longer permanently disables all history/metadata operations for the session (the lock recovers from poisoning).
+- **A single unstageable file no longer aborts a selected-subset import** — staging skips the failed file and continues, failing the run only if nothing could be staged. Same-named files chosen from drives with no common ancestor no longer overwrite each other in the staging dir (collisions are nested under a numeric subfolder).
+- **Album creation survives a failed share.** If sharing or public-link creation fails after the album is created on the server, the album is still registered and selected in the UI (no orphaned/duplicate albums) with a specific warning, instead of throwing a generic error and desyncing state.
+- **Date-range preview filtering is timezone-correct.** Day boundaries are parsed as UTC to match the backend's UTC EXIF capture epochs, so photos captured near midnight are no longer filtered into the wrong day in browsers outside UTC.
+- **Album/user/server-info commands honor LAN/WAN failover**, resolving the reachable endpoint like imports do, instead of always hitting the primary URL and failing when only a failover server is up.
+- **Concurrent profile edits no longer lose data**: profile upsert/delete now serialize their read-modify-write of `config.json`.
+- **Auto-import no longer suppresses sibling cards.** Inserting two cards at once, or a card while another prompt is open, previously marked the extra cards "seen" forever; now only the surfaced card is marked seen and the others prompt in turn.
+- **Live import progress no longer flickers.** The 2-second queue poll took the field-wise maximum of polled vs. event-driven progress for running jobs, so it can't reset the bar/ETA to the stale start-of-run value.
+- Immich API calls try the `/api` path first, eliminating a wasted request (a 404 or HTML 200) that previously preceded every metadata/validation call.
+- The persistent `app.log` is excluded from run-log rotation, so it can't be deleted as the oldest file.
+
 ## v0.3.0 - 2026-07-12
 
 ### Import organization

@@ -12,6 +12,14 @@ use crate::{models::history::ImportRecord, services::logs};
 
 static STORE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// Lock the store mutex, recovering the guard if a previous holder panicked.
+/// Poisoning only signals that some earlier operation aborted mid-flight; the
+/// store data itself lives on disk, so a single panic must not permanently
+/// brick every future history/metadata operation for the session.
+fn lock_store() -> std::sync::MutexGuard<'static, ()> {
+    STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct StoreData {
     #[serde(default)]
@@ -62,13 +70,7 @@ fn save(app: &tauri::AppHandle, data: &StoreData) -> Result<(), String> {
 }
 
 pub fn append_history(app: &tauri::AppHandle, record: ImportRecord) {
-    let Ok(_guard) = STORE_LOCK.lock() else {
-        let _ = logs::append_log(
-            "app.log",
-            "history_append_failed reason=store_lock_poisoned",
-        );
-        return;
-    };
+    let _guard = lock_store();
 
     let mut data = match load(app) {
         Ok(data) => data,
@@ -96,9 +98,7 @@ pub fn append_history(app: &tauri::AppHandle, record: ImportRecord) {
 }
 
 pub fn list_history(app: &tauri::AppHandle) -> Vec<ImportRecord> {
-    let Ok(_guard) = STORE_LOCK.lock() else {
-        return Vec::new();
-    };
+    let _guard = lock_store();
 
     let mut history = match load(app) {
         Ok(data) => data.history,
@@ -109,18 +109,17 @@ pub fn list_history(app: &tauri::AppHandle) -> Vec<ImportRecord> {
 }
 
 pub fn clear_history(app: &tauri::AppHandle) -> Result<(), String> {
-    let _guard = STORE_LOCK
-        .lock()
-        .map_err(|_| "Could not lock import history store".to_string())?;
-    let mut data = load(app)?;
+    let _guard = lock_store();
+    // A corrupt/unparseable store must still be resettable — fall back to an
+    // empty store so "Clear history" can overwrite and repair it instead of
+    // propagating the parse error and leaving the user permanently stuck.
+    let mut data = load(app).unwrap_or_default();
     data.history.clear();
     save(app, &data)
 }
 
 pub fn last_import_for(app: &AppHandle, source_paths: &[String]) -> Option<i64> {
-    let Ok(_guard) = STORE_LOCK.lock() else {
-        return None;
-    };
+    let _guard = lock_store();
 
     load(app)
         .ok()?

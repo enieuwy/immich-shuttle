@@ -24,9 +24,10 @@ const photoB = file("b.jpg");
 const video = file("c.mp4", true);
 const files = [photoA, photoB, video];
 
-// captured_at epoch seconds
-const JAN_1 = Math.floor(new Date("2026-01-01T12:00:00").getTime() / 1000);
-const JUN_15 = Math.floor(new Date("2026-06-15T12:00:00").getTime() / 1000);
+// captured_at epoch seconds. Parsed as UTC to mirror the backend, which builds
+// capture epochs from EXIF wall-clock time treated as UTC.
+const JAN_1 = Math.floor(new Date("2026-01-01T12:00:00Z").getTime() / 1000);
+const JUN_15 = Math.floor(new Date("2026-06-15T12:00:00Z").getTime() / 1000);
 
 const dates = new Map<string, number | null>([
   [photoA.path, JAN_1],
@@ -39,7 +40,7 @@ describe("date helpers", () => {
     expect(toYmd(new Date("2026-06-24T08:00:00"))).toBe("2026-06-24");
   });
 
-  it("dayStartEpoch / dayEndEpoch bracket the local day", () => {
+  it("dayStartEpoch / dayEndEpoch bracket the UTC day", () => {
     const start = dayStartEpoch("2026-06-15")!;
     const end = dayEndEpoch("2026-06-15")!;
     expect(start).toBeLessThan(JUN_15);

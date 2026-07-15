@@ -118,8 +118,13 @@ fn is_error_line(line: &str) -> bool {
 /// so it doubles as the live-progress source.
 pub fn parse_run_progress(contents: &str) -> RunProgress {
     let mut total: u32 = 0;
+    let mut uploaded: u32 = 0;
     let mut duplicates: u32 = 0;
-    let mut paths: Vec<String> = Vec::new();
+    // Both freshly uploaded files AND files the server already holds are safe to
+    // wipe from the local source (a server copy exists either way), so both feed
+    // completed_paths; `uploaded` stays a separate tally for the progress
+    // counter. Deletion is still gated by a SHA-1 existence check downstream.
+    let mut completed_paths: Vec<String> = Vec::new();
     let mut seen_paths: HashSet<String> = HashSet::new();
     let mut error_files: HashSet<String> = HashSet::new();
 
@@ -139,18 +144,24 @@ pub fn parse_run_progress(contents: &str) -> RunProgress {
             if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
                 let path = fs_path_from_file_attr(&file);
                 if seen_paths.insert(path.clone()) {
-                    paths.push(path);
+                    completed_paths.push(path);
+                    uploaded = uploaded.saturating_add(1);
                 }
             }
         } else if message.starts_with("server has duplicate") {
             duplicates = duplicates.saturating_add(1);
+            if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
+                let path = fs_path_from_file_attr(&file);
+                if seen_paths.insert(path.clone()) {
+                    completed_paths.push(path);
+                }
+            }
         } else if message.starts_with("discovered image") || message.starts_with("discovered video")
         {
             total = total.saturating_add(1);
         }
     }
 
-    let uploaded = paths.len() as u32;
     RunProgress {
         progress: JobProgress {
             total,
@@ -158,7 +169,7 @@ pub fn parse_run_progress(contents: &str) -> RunProgress {
             duplicates,
             errors: error_files.len() as u32,
         },
-        completed_paths: paths,
+        completed_paths,
     }
 }
 
@@ -230,15 +241,21 @@ mod tests {
     }
 
     #[test]
-    fn converts_uploaded_paths_to_real_fs_paths() {
+    fn completed_paths_include_uploads_and_server_duplicates() {
+        // Duplicates already on the server are safe-to-wipe candidates too, so
+        // they join the completed paths (in log order: the duplicate line comes
+        // before the two uploads) while `uploaded` stays a separate count.
         let run = parse_run_progress(LOG);
         assert_eq!(
             run.completed_paths,
             vec![
+                "Untitled/DCIM/100MSDCF/DSC08936.ARW",
                 "Untitled/DCIM/100MSDCF/DSC09008.ARW",
                 "Untitled/DCIM/100MSDCF/DSC09009.ARW",
             ]
         );
+        assert_eq!(run.progress.uploaded, 2);
+        assert_eq!(run.progress.duplicates, 1);
     }
 
     #[test]

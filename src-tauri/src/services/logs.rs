@@ -46,6 +46,10 @@ pub fn rotate_recent_logs(max_files: usize) -> Result<(), String> {
         .map_err(|e| format!("Could not list logs directory: {e}"))?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().is_file())
+        // Never rotate away the persistent app log. Rotation is meant to cap the
+        // per-run `run-<job>.log` files; app.log is the single durable log the
+        // UI reads and must survive regardless of its relative age.
+        .filter(|entry| entry.file_name().to_string_lossy() != "app.log")
         .collect::<Vec<_>>();
 
     entries.sort_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok());

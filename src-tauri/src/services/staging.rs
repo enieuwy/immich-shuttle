@@ -9,6 +9,7 @@
 //! links then a copy. Cleanup removes only the links, never the originals.
 
 use std::{
+    collections::HashSet,
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -26,6 +27,7 @@ pub fn create_staging_dir(selected: &[String]) -> Result<PathBuf, String> {
 
     let base = common_ancestor(selected);
     let mut linked = 0_usize;
+    let mut used: HashSet<PathBuf> = HashSet::new();
     for entry in selected {
         let src = Path::new(entry);
         if !src.is_file() {
@@ -41,16 +43,32 @@ pub fn create_staging_dir(selected: &[String]) -> Result<PathBuf, String> {
         let Some(rel) = safe_relative(&rel) else {
             continue;
         };
-        let dest = root.join(&rel);
+        // Disambiguate name collisions — e.g. the same filename picked from two
+        // drives with no common ancestor, which both collapse to the same
+        // relative path — by nesting later hits under a numeric subfolder, so a
+        // second file never silently overwrites the first in the staging dir.
+        let mut dest = root.join(&rel);
+        let mut n = 1_usize;
+        while used.contains(&dest) {
+            dest = root.join(n.to_string()).join(&rel);
+            n += 1;
+        }
         // Belt-and-suspenders: never write outside `root`.
         if !dest.starts_with(&root) {
             continue;
         }
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Could not create staging subdir: {e}"))?;
+            if fs::create_dir_all(parent).is_err() {
+                continue;
+            }
         }
-        link_file(src, &dest)?;
+        // A single unreadable/locked/failed file must not abort the whole batch;
+        // skip it and keep staging the rest. The `linked == 0` check below still
+        // fails the run when nothing could be staged at all.
+        if link_file(src, &dest).is_err() {
+            continue;
+        }
+        used.insert(dest);
         linked += 1;
     }
 
@@ -167,6 +185,33 @@ mod tests {
     #[test]
     fn empty_selection_errors() {
         assert!(create_staging_dir(&[]).is_err());
+    }
+
+    #[test]
+    fn disambiguates_colliding_destination_names() {
+        // Two selections that resolve to the same relative path (here, one file
+        // picked twice — the same shape as identically-named files from two
+        // drives with no common ancestor) must both be staged, not silently
+        // overwrite each other.
+        let tmp = std::env::temp_dir().join(format!("stage-collide-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let a = tmp.join("photo.jpg");
+        fs::write(&a, b"a").unwrap();
+
+        let staged = create_staging_dir(&[
+            a.to_string_lossy().to_string(),
+            a.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            walkdir_files(&staged).len(),
+            2,
+            "both entries must be staged without collision"
+        );
+
+        cleanup_staging_dir(&staged);
+        fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]

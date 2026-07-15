@@ -126,13 +126,26 @@ export const albumsState = {
     }
     try {
       const created = await albumCreate(profile.id, name);
+      // The album now exists on the server. Sharing and public-link creation are
+      // best-effort follow-ups: if either fails we must still register the album
+      // locally (otherwise it's orphaned server-side and desynced from the UI)
+      // and tell the user precisely what didn't happen.
+      const warnings: string[] = [];
       if (shareUserIds.length > 0) {
-        await albumShareUsers(profile.id, created.id, shareUserIds, shareRole);
+        try {
+          await albumShareUsers(profile.id, created.id, shareUserIds, shareRole);
+        } catch {
+          warnings.push("could not share it with the selected users");
+        }
       }
       let shareLinkUrl: string | null = null;
       if (createPublicLink) {
-        const link = await albumShareLink(profile.id, created.id);
-        shareLinkUrl = link.url;
+        try {
+          const link = await albumShareLink(profile.id, created.id);
+          shareLinkUrl = link.url;
+        } catch {
+          warnings.push("could not create a public link");
+        }
       }
       state.update((s) => ({
         ...s,
@@ -141,6 +154,9 @@ export const albumsState = {
         selectedAlbumIds: [created.id],
         shareLinkUrl,
       }));
+      if (warnings.length > 0) {
+        errorsState.addError(`Album "${name}" created, but ${warnings.join(" and ")}.`);
+      }
       return created;
     } catch (error) {
       errorsState.addError("Could not create album.");

@@ -101,6 +101,27 @@ describe("autoImportState", () => {
     expect(get(autoImportState).candidate?.mount_path).toBe(card.mount_path);
   });
 
+  it("surfaces a second card inserted alongside the first once resolved", async () => {
+    const card2: RemovableDevice = { ...card, name: "SONY", mount_path: "/Volumes/SONY" };
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]); // baseline empty
+
+    // Both cards appear in the same poll: only one can prompt at a time.
+    autoImportState.observe([card, card2]);
+    const first = get(autoImportState).candidate;
+    expect(first).not.toBeNull();
+
+    // Re-polling while the prompt is open must not silently consume the sibling.
+    autoImportState.observe([card, card2]);
+
+    // Resolve the first; the second must now surface, not stay suppressed.
+    autoImportState.dismiss();
+    autoImportState.observe([card, card2]);
+    const second = get(autoImportState).candidate;
+    expect(second).not.toBeNull();
+    expect(second?.mount_path).not.toBe(first?.mount_path);
+  });
+
   it("ignores inserted drives without a DCIM folder", () => {
     autoImportState.setEnabled(true);
     autoImportState.observe([]);

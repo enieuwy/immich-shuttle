@@ -1,9 +1,23 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{LazyLock, Mutex},
+};
 
 use dirs::config_dir;
 use serde::{Deserialize, Serialize};
 
 use crate::models::profile::Profile;
+
+static CONFIG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Serialize the read-modify-write of config.json so concurrent profile
+/// upserts/deletes can't read the same snapshot and clobber each other's
+/// changes. Recovers from poisoning — the file on disk is the source of truth,
+/// so one panicking writer must not brick every future profile edit.
+fn lock_config() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Defaults {
@@ -72,6 +86,7 @@ pub fn get_profile(profile_id: &str) -> Result<Profile, String> {
 }
 
 pub fn upsert_profile(profile: Profile) -> Result<Profile, String> {
+    let _guard = lock_config();
     let mut cfg = load_config()?;
     if let Some(existing) = cfg.profiles.iter_mut().find(|p| p.id == profile.id) {
         *existing = profile.clone();
@@ -83,6 +98,7 @@ pub fn upsert_profile(profile: Profile) -> Result<Profile, String> {
 }
 
 pub fn delete_profile(profile_id: &str) -> Result<(), String> {
+    let _guard = lock_config();
     let mut cfg = load_config()?;
     cfg.profiles.retain(|p| p.id != profile_id);
     save_config(&cfg)
