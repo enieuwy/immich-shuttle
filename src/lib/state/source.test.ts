@@ -61,4 +61,42 @@ describe("sourceState", () => {
     expect(state.scanResult).toBeNull();
     expect(vi.mocked(api.scanSources)).toHaveBeenCalledTimes(2);
   });
+
+  it("drops a stale scan result when a newer selection supersedes it", async () => {
+    const stale = {
+      files: [],
+      total_size_bytes: 1,
+      photo_count: 99,
+      video_count: 0,
+      skipped_unreadable: 0,
+    };
+    const fresh = {
+      files: [],
+      total_size_bytes: 2,
+      photo_count: 1,
+      video_count: 0,
+      skipped_unreadable: 0,
+    };
+    let call = 0;
+    const gate = Promise.withResolvers<void>();
+    vi.mocked(api.scanSources).mockImplementation(async () => {
+      call += 1;
+      // The first (superseded) scan blocks until released, so it resolves LAST.
+      if (call === 1) {
+        await gate.promise;
+        return stale;
+      }
+      return fresh;
+    });
+
+    const first = sourceState.selectSources(["/a"]);
+    const second = sourceState.selectSources(["/b"]);
+    await second;
+    gate.resolve();
+    await first;
+
+    const state = get(sourceState);
+    expect(state.scanResult?.photo_count).toBe(1);
+    expect(state.scanning).toBe(false);
+  });
 });

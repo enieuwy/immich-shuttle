@@ -38,13 +38,27 @@ mod tests {
         }
     }
 
+    /// Test guard for a stub HTTP server. Its accept loop is aborted on drop so
+    /// no background task or open socket outlives the test that spawned it.
+    struct HttpStub {
+        url: String,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for HttpStub {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
     /// Spawn a minimal HTTP responder that replies to every request with the
-    /// given status line and JSON body. Returns its `http://127.0.0.1:<port>`
-    /// base URL. Used to stand in for (and to impersonate) an Immich server.
-    async fn spawn_http_stub(status_line: &'static str, body: &'static str) -> String {
+    /// given status line and JSON body. Used to stand in for (and to impersonate)
+    /// an Immich server; the returned guard exposes `.url` and stops the server
+    /// when dropped.
+    async fn spawn_http_stub(status_line: &'static str, body: &'static str) -> HttpStub {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
         let addr = listener.local_addr().expect("stub addr");
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     continue;
@@ -59,7 +73,10 @@ mod tests {
                 let _ = sock.shutdown().await;
             }
         });
-        format!("http://127.0.0.1:{}", addr.port())
+        HttpStub {
+            url: format!("http://127.0.0.1:{}", addr.port()),
+            handle,
+        }
     }
 
     #[tokio::test]
@@ -72,19 +89,19 @@ mod tests {
     async fn returns_lan_when_it_responds_as_immich() {
         let lan = spawn_http_stub("200 OK", "{\"res\":\"pong\"}").await;
         let resolved = resolve_server_url(&profile(
-            Some(lan.clone()),
+            Some(lan.url.clone()),
             Some("https://wan.example.com".into()),
         ))
         .await;
-        assert_eq!(resolved, lan);
+        assert_eq!(resolved, lan.url);
     }
 
     #[tokio::test]
     async fn falls_back_to_wan_when_lan_is_invalid() {
         let wan = spawn_http_stub("200 OK", "{\"res\":\"pong\"}").await;
         let resolved =
-            resolve_server_url(&profile(Some("not-a-url".into()), Some(wan.clone()))).await;
-        assert_eq!(resolved, wan);
+            resolve_server_url(&profile(Some("not-a-url".into()), Some(wan.url.clone()))).await;
+        assert_eq!(resolved, wan.url);
     }
 
     #[tokio::test]
@@ -94,14 +111,14 @@ mod tests {
         // an unrelated/attacker-controlled listener. Failover falls through to
         // the primary instead.
         let lan = spawn_http_stub("200 OK", "{\"service\":\"not-immich\"}").await;
-        let resolved = resolve_server_url(&profile(Some(lan), None)).await;
+        let resolved = resolve_server_url(&profile(Some(lan.url.clone()), None)).await;
         assert_eq!(resolved, "https://immich.example.com");
     }
 
     #[tokio::test]
     async fn does_not_select_an_endpoint_that_errors() {
         let lan = spawn_http_stub("500 Internal Server Error", "boom").await;
-        let resolved = resolve_server_url(&profile(Some(lan), None)).await;
+        let resolved = resolve_server_url(&profile(Some(lan.url.clone()), None)).await;
         assert_eq!(resolved, "https://immich.example.com");
     }
 }

@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 
+const { listenMock } = vi.hoisted(() => ({ listenMock: vi.fn() }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }));
+
 vi.mock("$lib/api", () => ({
   importListJobs: vi.fn(async () => []),
   importStart: vi.fn(async () => "job-1"),
@@ -262,5 +265,20 @@ describe("queueState", () => {
       stack_burst: true,
       organization: "folder_name",
     });
+  });
+
+  it("tears down the progress listener when stopped mid-registration", async () => {
+    const unlisten = vi.fn();
+    const { promise, resolve } = Promise.withResolvers<() => void>();
+    listenMock.mockReturnValueOnce(promise);
+
+    queueState.startPolling();
+    queueState.stopPolling();
+    // Registration resolves only after polling was already stopped.
+    resolve(unlisten);
+    await promise;
+    await Promise.resolve();
+
+    expect(unlisten).toHaveBeenCalledTimes(1);
   });
 });

@@ -105,7 +105,100 @@ fn is_error_line(line: &str) -> bool {
     line.len() >= 24 && line.is_char_boundary(19) && &line[19..24] == " ERR "
 }
 
-/// Derive progress + completed-upload paths from an immich-go run log.
+/// Incremental accumulator for run-log progress.
+///
+/// immich-go's run log is append-only, so progress can be folded from only the
+/// newly-appended bytes each tick instead of re-reading and re-parsing the whole
+/// (multi-MB on large imports) log every time — keeping per-tick work
+/// proportional to new output rather than total log size.
+#[derive(Default)]
+pub struct ProgressAccumulator {
+    total: u32,
+    uploaded: u32,
+    duplicates: u32,
+    // Both freshly uploaded files AND files the server already holds are safe to
+    // wipe from the local source (a server copy exists either way), so both feed
+    // completed_paths; `uploaded` stays a separate tally for the progress
+    // counter. Deletion is still gated by a SHA-1 existence check downstream.
+    completed_paths: Vec<String>,
+    seen_paths: HashSet<String>,
+    error_files: HashSet<String>,
+    /// A trailing line not yet terminated by '\n'; reparsed once its rest arrives.
+    pending: String,
+}
+
+impl ProgressAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold a chunk of newly-read log text. Only complete lines (terminated by
+    /// '\n') are parsed; a trailing partial line is buffered for the next call.
+    pub fn push_chunk(&mut self, chunk: &str) {
+        self.pending.push_str(chunk);
+        while let Some(nl) = self.pending.find('\n') {
+            let line: String = self.pending.drain(..=nl).collect();
+            self.apply_line(line.trim_end_matches(['\r', '\n']));
+        }
+    }
+
+    /// Flush a buffered final line that never received a trailing newline. Call
+    /// once the run has ended.
+    pub fn finish(&mut self) {
+        if !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            self.apply_line(line.trim_end_matches(['\r', '\n']));
+        }
+    }
+
+    pub fn snapshot(&self) -> RunProgress {
+        RunProgress {
+            progress: JobProgress {
+                total: self.total,
+                uploaded: self.uploaded,
+                duplicates: self.duplicates,
+                errors: self.error_files.len() as u32,
+            },
+            completed_paths: self.completed_paths.clone(),
+        }
+    }
+
+    fn apply_line(&mut self, line: &str) {
+        if is_error_line(line) {
+            if let Some(file) = attr_value(line, "file", &["error", "reason", "discovered_at"])
+                .filter(|f| !f.is_empty())
+            {
+                self.error_files.insert(file);
+            }
+            return;
+        }
+        let Some(message) = info_line_message(line) else {
+            return;
+        };
+        if message.starts_with("uploaded successfully") {
+            if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
+                let path = fs_path_from_file_attr(&file);
+                if self.seen_paths.insert(path.clone()) {
+                    self.completed_paths.push(path);
+                    self.uploaded = self.uploaded.saturating_add(1);
+                }
+            }
+        } else if message.starts_with("server has duplicate") {
+            self.duplicates = self.duplicates.saturating_add(1);
+            if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
+                let path = fs_path_from_file_attr(&file);
+                if self.seen_paths.insert(path.clone()) {
+                    self.completed_paths.push(path);
+                }
+            }
+        } else if message.starts_with("discovered image") || message.starts_with("discovered video")
+        {
+            self.total = self.total.saturating_add(1);
+        }
+    }
+}
+
+/// Derive progress + completed-upload paths from a full immich-go run log.
 ///
 /// Counts per-asset event lines (not the indented end-of-run summary, whose
 /// messages start with extra whitespace):
@@ -113,64 +206,11 @@ fn is_error_line(line: &str) -> bool {
 /// - `uploaded successfully` -> uploaded (de-duplicated, with real fs path)
 /// - `server has duplicate` -> duplicates already on the server
 /// - ERROR lines carrying a `file=` -> per-file upload errors (de-duplicated)
-///
-/// Safe to call repeatedly while the run is in flight (the log is append-only),
-/// so it doubles as the live-progress source.
 pub fn parse_run_progress(contents: &str) -> RunProgress {
-    let mut total: u32 = 0;
-    let mut uploaded: u32 = 0;
-    let mut duplicates: u32 = 0;
-    // Both freshly uploaded files AND files the server already holds are safe to
-    // wipe from the local source (a server copy exists either way), so both feed
-    // completed_paths; `uploaded` stays a separate tally for the progress
-    // counter. Deletion is still gated by a SHA-1 existence check downstream.
-    let mut completed_paths: Vec<String> = Vec::new();
-    let mut seen_paths: HashSet<String> = HashSet::new();
-    let mut error_files: HashSet<String> = HashSet::new();
-
-    for line in contents.lines() {
-        if is_error_line(line) {
-            if let Some(file) = attr_value(line, "file", &["error", "reason", "discovered_at"])
-                .filter(|f| !f.is_empty())
-            {
-                error_files.insert(file);
-            }
-            continue;
-        }
-        let Some(message) = info_line_message(line) else {
-            continue;
-        };
-        if message.starts_with("uploaded successfully") {
-            if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
-                let path = fs_path_from_file_attr(&file);
-                if seen_paths.insert(path.clone()) {
-                    completed_paths.push(path);
-                    uploaded = uploaded.saturating_add(1);
-                }
-            }
-        } else if message.starts_with("server has duplicate") {
-            duplicates = duplicates.saturating_add(1);
-            if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
-                let path = fs_path_from_file_attr(&file);
-                if seen_paths.insert(path.clone()) {
-                    completed_paths.push(path);
-                }
-            }
-        } else if message.starts_with("discovered image") || message.starts_with("discovered video")
-        {
-            total = total.saturating_add(1);
-        }
-    }
-
-    RunProgress {
-        progress: JobProgress {
-            total,
-            uploaded,
-            duplicates,
-            errors: error_files.len() as u32,
-        },
-        completed_paths,
-    }
+    let mut acc = ProgressAccumulator::new();
+    acc.push_chunk(contents);
+    acc.finish();
+    acc.snapshot()
 }
 
 /// Parse per-file upload failures out of immich-go's run log (written via
@@ -208,7 +248,7 @@ pub fn parse_error_log(contents: &str) -> Vec<FileError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_error_log, parse_run_progress};
+    use super::{parse_error_log, parse_run_progress, ProgressAccumulator};
 
     // A realistic console-slog run-log slice captured from immich-go v0.32.0
     // `--no-ui --log-level DEBUG` output: per-asset events plus the directory
@@ -342,5 +382,37 @@ mod tests {
             ));
         }
         assert_eq!(parse_error_log(&log).len(), 100);
+    }
+
+    // ---- incremental progress accumulator (ProgressAccumulator) ----
+
+    #[test]
+    fn incremental_chunks_match_full_parse() {
+        let full = parse_run_progress(LOG);
+        // Feed the log one byte at a time (each chunk splits lines arbitrarily);
+        // the running snapshot must equal a whole-log parse.
+        let mut acc = ProgressAccumulator::new();
+        let mut buf = [0u8; 4];
+        for ch in LOG.chars() {
+            acc.push_chunk(ch.encode_utf8(&mut buf));
+        }
+        acc.finish();
+        let inc = acc.snapshot();
+        assert_eq!(inc.progress.total, full.progress.total);
+        assert_eq!(inc.progress.uploaded, full.progress.uploaded);
+        assert_eq!(inc.progress.duplicates, full.progress.duplicates);
+        assert_eq!(inc.progress.errors, full.progress.errors);
+        assert_eq!(inc.completed_paths, full.completed_paths);
+    }
+
+    #[test]
+    fn finish_flushes_trailing_line_without_newline() {
+        // The final "uploaded successfully" line has no trailing '\n'; it must
+        // only be counted after finish(), not while still buffered.
+        let mut acc = ProgressAccumulator::new();
+        acc.push_chunk("2026-06-24 16:10:21 INF uploaded successfully file=Card:IMG_0001.JPG");
+        assert_eq!(acc.snapshot().progress.uploaded, 0);
+        acc.finish();
+        assert_eq!(acc.snapshot().progress.uploaded, 1);
     }
 }

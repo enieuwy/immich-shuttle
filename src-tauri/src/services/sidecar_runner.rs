@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -14,7 +14,7 @@ use tauri_plugin_shell::{process::CommandEvent, ShellExt};
 use uuid::Uuid;
 
 use crate::models::job::Organization;
-use crate::services::stdout_parser::parse_run_progress;
+use crate::services::stdout_parser::{ProgressAccumulator, RunProgress};
 
 #[derive(Debug, Clone, Default)]
 pub struct SidecarResult {
@@ -113,9 +113,64 @@ fn create_private_log(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("Could not create run log: {e}"))
 }
 
-/// Read the current run log and emit a progress snapshot to the frontend.
-fn emit_progress(app: &AppHandle, job_id: &str, log_path: &Path) {
-    let run = parse_run_progress(&std::fs::read_to_string(log_path).unwrap_or_default());
+/// Reads an append-only run log incrementally: each poll parses only bytes
+/// appended since the last read and folds them into a running snapshot, so
+/// per-tick work stays proportional to new output rather than total log size
+/// (the log grows to many MB on large imports and was previously re-read whole
+/// twice per second).
+struct ProgressReader {
+    log_path: PathBuf,
+    offset: u64,
+    /// Undecoded bytes trailing the last '\n'; held so a chunk that splits a
+    /// multibyte char (non-ASCII filenames) is never decoded mid-sequence.
+    carry: Vec<u8>,
+    acc: ProgressAccumulator,
+}
+
+impl ProgressReader {
+    fn new(log_path: PathBuf) -> Self {
+        Self {
+            log_path,
+            offset: 0,
+            carry: Vec::new(),
+            acc: ProgressAccumulator::new(),
+        }
+    }
+
+    /// Fold newly-appended bytes (through the last complete line) and return the
+    /// current snapshot.
+    fn poll(&mut self) -> RunProgress {
+        if let Ok(mut file) = fs::File::open(&self.log_path) {
+            if file.seek(SeekFrom::Start(self.offset)).is_ok() {
+                let mut buf = Vec::new();
+                if let Ok(n) = file.read_to_end(&mut buf) {
+                    self.offset += n as u64;
+                    self.carry.extend_from_slice(&buf);
+                    if let Some(last_nl) = self.carry.iter().rposition(|&b| b == b'\n') {
+                        let complete: Vec<u8> = self.carry.drain(..=last_nl).collect();
+                        self.acc.push_chunk(&String::from_utf8_lossy(&complete));
+                    }
+                }
+            }
+        }
+        self.acc.snapshot()
+    }
+
+    /// Authoritative final snapshot: drain any remaining bytes and flush a
+    /// trailing line that never got a newline.
+    fn finish(&mut self) -> RunProgress {
+        let _ = self.poll();
+        if !self.carry.is_empty() {
+            let rest = std::mem::take(&mut self.carry);
+            self.acc.push_chunk(&String::from_utf8_lossy(&rest));
+        }
+        self.acc.finish();
+        self.acc.snapshot()
+    }
+}
+
+/// Emit a progress snapshot to the frontend.
+fn emit_progress(app: &AppHandle, job_id: &str, run: &RunProgress) {
     let current_file = run.completed_paths.last().and_then(|p| {
         Path::new(p)
             .file_name()
@@ -236,7 +291,9 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
 
     // immich-go's --no-ui stdout is a `\r`-refreshed aggregate that never
     // line-flushes through the pipe, so progress is polled from the run log
-    // (append-only, written in real time) on a fixed cadence instead.
+    // (append-only, written in real time) on a fixed cadence instead. The reader
+    // parses only newly-appended bytes each tick.
+    let mut progress = ProgressReader::new(request.log_path.clone());
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -250,7 +307,8 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
 
         tokio::select! {
             _ = ticker.tick() => {
-                emit_progress(&app, &request.job_id, &request.log_path);
+                let snapshot = progress.poll();
+                emit_progress(&app, &request.job_id, &snapshot);
             }
             maybe_event = rx.recv() => {
                 match maybe_event {
@@ -273,7 +331,8 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
     }
 
     // Final authoritative snapshot so the UI lands on the run log's last counts.
-    emit_progress(&app, &request.job_id, &request.log_path);
+    let snapshot = progress.finish();
+    emit_progress(&app, &request.job_id, &snapshot);
 
     Ok(SidecarResult {
         error_lines,

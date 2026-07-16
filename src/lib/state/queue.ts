@@ -36,6 +36,10 @@ const state = writable<QueueState>({
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let progressUnlisten: UnlistenFn | null = null;
+// In-flight `listen()` registration. Tracked so stopPolling can coordinate with
+// a registration that has not resolved yet (the resolved handle would otherwise
+// escape teardown and leak the listener across mount/unmount cycles).
+let progressPending: Promise<UnlistenFn> | null = null;
 
 type ImportProgressEvent = {
   job_id: string;
@@ -142,8 +146,8 @@ export const queueState = {
     if (pollTimer) {
       return;
     }
-    if (!progressUnlisten) {
-      void listen<ImportProgressEvent>("import-progress", (event) => {
+    if (!progressUnlisten && !progressPending) {
+      progressPending = listen<ImportProgressEvent>("import-progress", (event) => {
         const payload = event.payload;
         if (!payload?.job_id) {
           return;
@@ -162,8 +166,17 @@ export const queueState = {
             : s.currentFiles;
           return { ...s, jobs, rates, currentFiles };
         });
-      }).then((unlisten) => {
-        progressUnlisten = unlisten;
+      });
+      void progressPending.then((unlisten) => {
+        progressPending = null;
+        // If polling was stopped while this registration was in flight, tear the
+        // listener down immediately rather than leaking it; otherwise retain the
+        // handle so stopPolling can unlisten later.
+        if (pollTimer) {
+          progressUnlisten = unlisten;
+        } else {
+          unlisten();
+        }
       });
     }
     pollTimer = setInterval(() => {

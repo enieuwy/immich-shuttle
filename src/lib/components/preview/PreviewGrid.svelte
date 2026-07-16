@@ -42,7 +42,17 @@
       return;
     }
     datesFetchedFor = key;
+    // New dataset: drop the previous set's cached thumbnails and loader queue so
+    // memory stays bounded across preview sessions instead of retaining every
+    // directory ever viewed. The old loader's in-flight work is neutralized by
+    // its own dispose guard.
+    loader.dispose();
+    loader = makeLoader();
+    thumbs = new Map();
     void previewDates(paths).then((rows: CaptureDate[]) => {
+      // A newer file set may have superseded this fetch; only apply the dates if
+      // the key we requested for is still the active dataset.
+      if (key !== datesFetchedFor) return;
       const next = new Map<string, number | null>();
       for (const row of rows) {
         next.set(row.path, row.captured_at);
@@ -163,14 +173,17 @@
   // Loads requested tiles in small ordered chunks, merging each chunk the moment
   // it resolves so tiles paint incrementally top-down and one slow RAW/video
   // can't gate the whole viewport.
-  const loader = createThumbnailLoader({
-    fetch: previewThumbnails,
-    onResults: (results) => {
-      const next = new Map(thumbs);
-      for (const r of results) next.set(r.path, r);
-      thumbs = next;
-    },
-  });
+  function makeLoader() {
+    return createThumbnailLoader({
+      fetch: previewThumbnails,
+      onResults: (results) => {
+        const next = new Map(thumbs);
+        for (const r of results) next.set(r.path, r);
+        thumbs = next;
+      },
+    });
+  }
+  let loader = makeLoader();
 
   // Loaded thumbnails keyed by file path. Reassigned (new Map) on every merge so
   // Svelte reactivity fires for the affected tiles.

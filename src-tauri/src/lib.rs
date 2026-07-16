@@ -10,6 +10,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             crate::services::device_detector::start_polling(app.handle().clone());
+            // Evict stale thumbnails so the on-disk cache can't grow without
+            // bound across sessions. Off-thread: it stats/deletes cache files.
+            tauri::async_runtime::spawn_blocking(crate::services::thumbnailer::prune_cache);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

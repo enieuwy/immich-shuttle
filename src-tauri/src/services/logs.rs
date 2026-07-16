@@ -37,7 +37,31 @@ pub fn append_log(file_name: &str, line: &str) -> Result<(), String> {
         .append(true)
         .open(&path)
         .map_err(|e| format!("Could not open log file: {e}"))?;
-    writeln!(file, "{line}").map_err(|e| format!("Could not write log line: {e}"))
+    writeln!(file, "{line}").map_err(|e| format!("Could not write log line: {e}"))?;
+
+    // app.log is the single durable log and is deliberately never rotated away,
+    // so cap its unbounded growth here: once it crosses a size threshold, trim
+    // it to the newest APP_LOG_KEEP_LINES. The metadata stat runs on every
+    // append (cheap); the rewrite is rare and preserves recent history, which is
+    // all `read_recent` (last 500 lines) ever needs.
+    if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > APP_LOG_MAX_BYTES {
+        let _ = trim_to_trailing_lines(&path, APP_LOG_KEEP_LINES);
+    }
+    Ok(())
+}
+
+/// Size threshold past which a durable log is trimmed to its trailing window.
+const APP_LOG_MAX_BYTES: u64 = 1_000_000;
+/// Number of most-recent lines retained when a durable log is trimmed.
+const APP_LOG_KEEP_LINES: usize = 5_000;
+
+/// Rewrite `path` in place keeping only its last `keep` lines.
+fn trim_to_trailing_lines(path: &std::path::Path, keep: usize) -> Result<(), String> {
+    let content = fs::read_to_string(path).map_err(|e| format!("Could not read log file: {e}"))?;
+    let trimmed = tail_lines(&content, keep);
+    // Preserve owner-only perms established on the logs dir; a plain write keeps
+    // the existing file mode.
+    fs::write(path, format!("{trimmed}\n")).map_err(|e| format!("Could not trim log file: {e}"))
 }
 
 pub fn rotate_recent_logs(max_files: usize) -> Result<(), String> {
@@ -66,7 +90,8 @@ pub fn rotate_recent_logs(max_files: usize) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::tail_lines;
+    use super::{tail_lines, trim_to_trailing_lines};
+    use std::io::Write;
 
     #[test]
     fn tail_lines_returns_recent_lines() {
@@ -78,5 +103,27 @@ mod tests {
     #[test]
     fn tail_lines_returns_all_when_under_limit() {
         assert_eq!(tail_lines("a\nb", 10), "a\nb");
+    }
+
+    #[test]
+    fn trim_to_trailing_lines_caps_file_and_keeps_newest() {
+        let dir = std::env::temp_dir().join(format!("logs-trim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.log");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..1_000 {
+            writeln!(f, "line {i}").unwrap();
+        }
+        drop(f);
+
+        trim_to_trailing_lines(&path, 100).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 100);
+        assert_eq!(lines.first().copied(), Some("line 900"));
+        assert_eq!(lines.last().copied(), Some("line 999"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -53,6 +53,56 @@ fn cache_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Max total bytes retained in the on-disk thumbnail cache. Thumbnails are
+/// <=256px JPEG/PNG tiles (tens of KB each), so this budget holds many thousands
+/// of them while bounding disk use across long sessions and repeated scans.
+const CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Best-effort maintenance: evict the oldest cached thumbnails until the cache
+/// is back under `CACHE_MAX_BYTES`. Called at startup so the cache can't grow
+/// without bound. All I/O errors are swallowed — a cache hiccup must never block
+/// the app or a scan.
+pub fn prune_cache() {
+    if let Ok(dir) = cache_dir() {
+        prune_dir_to_size(&dir, CACHE_MAX_BYTES);
+    }
+}
+
+/// Delete the oldest files (by mtime) in `dir` until its total size is at most
+/// `max_bytes`. No-op when already under budget.
+fn prune_dir_to_size(dir: &Path, max_bytes: u64) {
+    let Ok(read) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<(std::time::SystemTime, u64, PathBuf)> = read
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            Some((meta.modified().ok()?, meta.len(), e.path()))
+        })
+        .collect();
+
+    let total: u64 = entries.iter().map(|(_, len, _)| len).sum();
+    if total <= max_bytes {
+        return;
+    }
+
+    // Oldest first, so freshly generated (likely still-visible) tiles survive.
+    entries.sort_by_key(|(mtime, _, _)| *mtime);
+    let mut to_free = total - max_bytes;
+    for (_, len, path) in entries {
+        if to_free == 0 {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            to_free = to_free.saturating_sub(len);
+        }
+    }
+}
+
 fn cache_key(path: &Path, max: u32) -> String {
     let mtime = fs::metadata(path)
         .ok()
@@ -661,5 +711,37 @@ mod tests {
         let _ = fs::remove_file(&out);
         assert!(!generate_with_raw_preview(&src, 64, &out));
         let _ = fs::remove_file(&src);
+    }
+
+    #[test]
+    fn prune_dir_evicts_oldest_until_under_budget() {
+        let dir = std::env::temp_dir().join(format!("immich_shuttle_prune_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Five 1 KiB files written oldest-first; a short gap between writes keeps
+        // their mtimes strictly ordered (filesystem mtime resolution is sub-ms).
+        let mut paths = Vec::new();
+        for i in 0..5u64 {
+            let p = dir.join(format!("t{i}.jpg"));
+            fs::write(&p, vec![0u8; 1024]).unwrap();
+            paths.push(p);
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+
+        // Budget of 2.5 KiB must leave the two newest (t3, t4) and drop t0..t2.
+        prune_dir_to_size(&dir, 2560);
+
+        assert!(!paths[0].exists() && !paths[1].exists() && !paths[2].exists());
+        assert!(paths[3].exists() && paths[4].exists());
+
+        let total: u64 = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        assert!(total <= 2560);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
