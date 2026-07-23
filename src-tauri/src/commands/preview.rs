@@ -1,13 +1,23 @@
 use crate::services::thumbnailer::{thumbnail, ThumbResult, MAX_PX};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+/// Highest preview session token cancelled by the frontend.
+static PREVIEW_CANCEL: std::sync::atomic::AtomicU64 = AtomicU64::new(0);
 
 /// Generate (or fetch cached) thumbnails for a batch of files. The frontend grid
 /// calls this lazily for the tiles entering the viewport. Work runs on blocking
 /// threads, bounded to a small pool so a large card can't saturate the runtime.
 #[tauri::command]
-pub async fn preview_thumbnails(paths: Vec<String>) -> Result<Vec<ThumbResult>, String> {
+pub async fn preview_thumbnails(
+    paths: Vec<String>,
+    token: u64,
+) -> Result<Vec<ThumbResult>, String> {
     let mut results = Vec::with_capacity(paths.len());
 
     for chunk in paths.chunks(8) {
+        if token != 0 && token <= PREVIEW_CANCEL.load(Relaxed) {
+            break;
+        }
         let handles: Vec<_> = chunk
             .iter()
             .cloned()
@@ -47,6 +57,13 @@ pub async fn preview_thumbnails(paths: Vec<String>) -> Result<Vec<ThumbResult>, 
     Ok(results)
 }
 
+/// Cancel active preview work for this and all earlier preview session tokens.
+#[tauri::command]
+pub async fn preview_cancel(token: u64) -> Result<(), String> {
+    PREVIEW_CANCEL.fetch_max(token, Relaxed);
+    Ok(())
+}
+
 use serde::Serialize;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
@@ -62,10 +79,13 @@ pub struct CaptureDate {
 /// Resolve a sortable capture timestamp for each file. EXIF is authoritative;
 /// file mtime is the fallback (on a camera card it closely tracks capture time).
 #[tauri::command]
-pub async fn preview_dates(paths: Vec<String>) -> Result<Vec<CaptureDate>, String> {
+pub async fn preview_dates(paths: Vec<String>, token: u64) -> Result<Vec<CaptureDate>, String> {
     let mut results = Vec::with_capacity(paths.len());
 
     for chunk in paths.chunks(16) {
+        if token != 0 && token <= PREVIEW_CANCEL.load(Relaxed) {
+            break;
+        }
         let handles: Vec<_> = chunk
             .iter()
             .cloned()
@@ -183,6 +203,21 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_preview_token_stops_before_starting_a_chunk() {
+        PREVIEW_CANCEL.store(0, Relaxed);
+
+        tauri::async_runtime::block_on(preview_cancel(42)).unwrap();
+        let results = tauri::async_runtime::block_on(preview_dates(
+            vec!["/path/that-must-not-be-read".to_owned()],
+            42,
+        ))
+        .unwrap();
+
+        assert!(results.is_empty());
+        PREVIEW_CANCEL.store(0, Relaxed);
+    }
 
     #[test]
     fn parses_exif_datetime_to_epoch() {

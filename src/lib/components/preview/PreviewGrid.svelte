@@ -1,3 +1,11 @@
+<script module lang="ts">
+  let previewTokenSeq = 0;
+
+  function nextPreviewToken(): number {
+    return ++previewTokenSeq;
+  }
+</script>
+
 <script lang="ts">
   import type { Action } from "svelte/action";
   import {
@@ -22,7 +30,7 @@
     type DatePreset,
     type MediaTypeFilter,
   } from "$lib/state/previewFilter";
-  import { previewDates, previewThumbnails } from "$lib/api";
+  import { previewCancel, previewDates, previewThumbnails } from "$lib/api";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
   import { cn } from "$lib/utils.js";
@@ -53,9 +61,11 @@
       dates = new Map();
       return;
     }
-    loader = makeLoader();
+    const token = nextPreviewToken();
+    const datasetLoader = makeLoader(token);
+    loader = datasetLoader;
     let disposed = false;
-    void previewDates(paths)
+    void previewDates(paths, token)
       .then((rows: CaptureDate[]) => {
         // A newer file set may have superseded this fetch; only apply the dates if
         // the key we requested for is still the active dataset.
@@ -73,6 +83,11 @@
     return () => {
       disposed = true;
       loader.dispose();
+      // Cancellation also stops backend work that is already rendering a
+      // thumbnail or extracting capture dates for this preview session.
+      void previewCancel(token).catch(() => {
+        // The preview may be closing while Tauri is already unavailable.
+      });
     };
   });
 
@@ -188,9 +203,9 @@
   // Loads requested tiles in small ordered chunks, merging each chunk the moment
   // it resolves so tiles paint incrementally top-down and one slow RAW/video
   // can't gate the whole viewport.
-  function makeLoader() {
+  function makeLoader(token: number) {
     return createThumbnailLoader({
-      fetch: previewThumbnails,
+      fetch: (paths) => previewThumbnails(paths, token),
       onResults: (results) => {
         const next = new Map(thumbs);
         for (const r of results) next.set(r.path, r);
@@ -198,7 +213,7 @@
       },
     });
   }
-  let loader = makeLoader();
+  let loader = makeLoader(0);
 
   // Loaded thumbnails keyed by file path. Reassigned (new Map) on every merge so
   // Svelte reactivity fires for the affected tiles.
