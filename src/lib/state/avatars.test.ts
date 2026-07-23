@@ -26,16 +26,35 @@ function deferredFetches(): Map<string, (value: string | null) => void> {
   return resolvers;
 }
 
-async function freshStore() {
+/**
+ * Fresh module graph per test (avatars keeps module-level queue state), with
+ * photo badges enabled unless a test opts out — fetching is gated on it.
+ */
+async function freshStore(display: "initials" | "photos" = "photos") {
   vi.resetModules();
-  return import("./avatars");
+  const theme = await import("./theme");
+  theme.avatarDisplayState.setDisplay(display);
+  const avatars = await import("./avatars");
+  return { ...avatars, avatarDisplayState: theme.avatarDisplayState };
 }
 
 beforeEach(() => {
   mockedFetch.mockReset();
+  localStorage.clear();
 });
 
 describe("avatarsState.prefetch", () => {
+  it("fetches nothing in initials mode, replays on switch to photos", async () => {
+    const { avatarsState, avatarDisplayState } = await freshStore("initials");
+    deferredFetches();
+
+    avatarsState.prefetch("p1", [user("u1"), user("u2")]);
+    expect(mockedFetch).not.toHaveBeenCalled();
+
+    avatarDisplayState.setDisplay("photos");
+    expect(mockedFetch).toHaveBeenCalledTimes(2);
+  });
+
   it("caps concurrent fetches and drains the queue as fetches settle", async () => {
     const { avatarsState } = await freshStore();
     const resolvers = deferredFetches();

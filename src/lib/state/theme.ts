@@ -118,3 +118,40 @@ export const paletteState = {
     this.setPalette(PALETTE_ORDER[(idx + 1) % PALETTE_ORDER.length]);
   },
 };
+
+/**
+ * How shared-album member badges render: colored initials (default — readable
+ * at badge size) or the user's profile photo with a colored ring.
+ */
+export type AvatarDisplay = "initials" | "photos";
+
+const AVATAR_DISPLAY_KEY = "immich-shuttle-avatar-display";
+
+function getStoredAvatarDisplay(): AvatarDisplay {
+  try {
+    const stored = localStorage.getItem(AVATAR_DISPLAY_KEY);
+    if (stored === "initials" || stored === "photos") {
+      return stored;
+    }
+  } catch {
+  }
+  return "initials";
+}
+
+const avatarDisplayStore = writable<AvatarDisplay>(getStoredAvatarDisplay());
+
+export const avatarDisplayState = {
+  subscribe: avatarDisplayStore.subscribe,
+
+  get display(): AvatarDisplay {
+    return get(avatarDisplayStore);
+  },
+
+  setDisplay(display: AvatarDisplay): void {
+    avatarDisplayStore.set(display);
+    try {
+      localStorage.setItem(AVATAR_DISPLAY_KEY, display);
+    } catch {
+    }
+  },
+};

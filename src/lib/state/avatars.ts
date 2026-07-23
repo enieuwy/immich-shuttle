@@ -1,6 +1,7 @@
 import { get, writable } from "svelte/store";
 
 import { userProfileImage } from "$lib/api";
+import { avatarDisplayState } from "$lib/state/theme";
 import type { AlbumUser } from "$lib/types";
 
 type AvatarsState = {
@@ -53,41 +54,62 @@ function pump(): void {
   }
 }
 
+// Last prefetch request, replayed if the user enables photo badges later so
+// the switch takes effect without waiting for the next album reload.
+let lastPrefetch: { profileId: string; users: AlbumUser[] } | null = null;
+
+function enqueue(profileId: string, users: AlbumUser[]): void {
+  if (retainedProfileId !== profileId) {
+    retainedProfileId = profileId;
+    // Drop queued work for other profiles (their inflight marks too) and
+    // evict cached entries that don't belong to the new profile.
+    for (const job of pendingQueue) {
+      inflight.delete(job.key);
+    }
+    pendingQueue.length = 0;
+    const prefix = `${profileId}:`;
+    state.update((s) => {
+      const images = new Map<string, string | null>();
+      for (const [key, value] of s.images) {
+        if (key.startsWith(prefix)) {
+          images.set(key, value);
+        }
+      }
+      return { images };
+    });
+  }
+  for (const user of users) {
+    if (!user.has_profile_image) continue;
+    const key = avatarKey(profileId, user.id);
+    if (inflight.has(key) || get(state).images.has(key)) continue;
+    inflight.add(key);
+    pendingQueue.push({ key, profileId, userId: user.id });
+  }
+  pump();
+}
+
+// Fetch only while photo badges are enabled; on switch-on, replay the last
+// request so already-loaded albums get their images immediately.
+avatarDisplayState.subscribe((display) => {
+  if (display === "photos" && lastPrefetch) {
+    enqueue(lastPrefetch.profileId, lastPrefetch.users);
+  }
+});
+
 export const avatarsState = {
   subscribe: state.subscribe,
 
   /**
    * Queue profile-image fetches for any user that has one and is not yet
    * cached. Failures are cached as "no image" so a flaky server cannot cause
-   * a retry storm from render-driven prefetches.
+   * a retry storm from render-driven prefetches. A no-op while badges render
+   * as initials — nothing is fetched that is not shown.
    */
   prefetch(profileId: string, users: AlbumUser[]): void {
-    if (retainedProfileId !== profileId) {
-      retainedProfileId = profileId;
-      // Drop queued work for other profiles (their inflight marks too) and
-      // evict cached entries that don't belong to the new profile.
-      for (const job of pendingQueue) {
-        inflight.delete(job.key);
-      }
-      pendingQueue.length = 0;
-      const prefix = `${profileId}:`;
-      state.update((s) => {
-        const images = new Map<string, string | null>();
-        for (const [key, value] of s.images) {
-          if (key.startsWith(prefix)) {
-            images.set(key, value);
-          }
-        }
-        return { images };
-      });
+    lastPrefetch = { profileId, users };
+    if (avatarDisplayState.display !== "photos") {
+      return;
     }
-    for (const user of users) {
-      if (!user.has_profile_image) continue;
-      const key = avatarKey(profileId, user.id);
-      if (inflight.has(key) || get(state).images.has(key)) continue;
-      inflight.add(key);
-      pendingQueue.push({ key, profileId, userId: user.id });
-    }
-    pump();
+    enqueue(profileId, users);
   },
 };

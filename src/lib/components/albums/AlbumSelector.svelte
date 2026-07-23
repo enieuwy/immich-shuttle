@@ -191,11 +191,11 @@
               {#if album.shared_with.length > 0}
                 <span class="flex shrink-0 -space-x-1" aria-hidden="true">
                   {#each album.shared_with.slice(0, 3) as user (user.id)}
-                    <UserAvatar {user} profileId={$activeProfile?.id} class="size-4 text-[8px]" />
+                    <UserAvatar {user} profileId={$activeProfile?.id} class="size-4.5 text-[9px]" />
                   {/each}
                   {#if album.shared_with.length > 3}
                     <span
-                      class="grid size-4 place-items-center rounded-full bg-muted text-[8px] font-semibold text-muted-foreground ring-1 ring-card"
+                      class="grid size-4.5 place-items-center rounded-full bg-muted text-[9px] font-semibold text-muted-foreground ring-1 ring-card"
                     >
                       +{album.shared_with.length - 3}
                     </span>

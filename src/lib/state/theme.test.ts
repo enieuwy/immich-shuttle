@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { get } from "svelte/store";
 
-import { paletteState } from "./theme";
+import { avatarDisplayState, paletteState } from "./theme";
 
 beforeEach(() => {
   localStorage.clear();
@@ -32,5 +32,16 @@ describe("paletteState", () => {
     paletteState.cycle();
     expect(get(paletteState)).toBe("darkroom");
     expect(document.documentElement.classList.contains("palette-darkroom")).toBe(true);
+  });
+});
+
+describe("avatarDisplayState", () => {
+  it("defaults to initials and persists an explicit choice", () => {
+    expect(["initials", "photos"]).toContain(avatarDisplayState.display);
+    avatarDisplayState.setDisplay("photos");
+    expect(avatarDisplayState.display).toBe("photos");
+    expect(localStorage.getItem("immich-shuttle-avatar-display")).toBe("photos");
+    avatarDisplayState.setDisplay("initials");
+    expect(localStorage.getItem("immich-shuttle-avatar-display")).toBe("initials");
   });
 });

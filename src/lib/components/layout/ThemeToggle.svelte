@@ -7,6 +7,7 @@
     DropdownMenuLabel,
     DropdownMenuRadioGroup,
     DropdownMenuRadioItem,
+    DropdownMenuSeparator,
     DropdownMenuTrigger,
   } from "$lib/components/ui/dropdown-menu";
   import {
@@ -15,7 +16,13 @@
     TooltipProvider,
     TooltipTrigger,
   } from "$lib/components/ui/tooltip";
-  import { paletteState, themeState, type ThemePalette } from "$lib/state/theme";
+  import {
+    avatarDisplayState,
+    paletteState,
+    themeState,
+    type AvatarDisplay,
+    type ThemePalette,
+  } from "$lib/state/theme";
 
   const nextLabel = $derived(
     $themeState === "light"
@@ -40,14 +47,14 @@
           {#snippet child({ props: tooltipProps })}
             <DropdownMenuTrigger {...tooltipProps}>
               {#snippet child({ props })}
-                <Button variant="ghost" size="icon-sm" {...props} aria-label="Dark palette">
+                <Button variant="ghost" size="icon-sm" {...props} aria-label="Appearance">
                   <Palette class="size-4" />
                 </Button>
               {/snippet}
             </DropdownMenuTrigger>
           {/snippet}
         </TooltipTrigger>
-        <TooltipContent>Dark palette</TooltipContent>
+        <TooltipContent>Appearance</TooltipContent>
       </Tooltip>
       <DropdownMenuContent align="end" class="w-56">
         <DropdownMenuLabel>Dark palette</DropdownMenuLabel>
@@ -63,6 +70,25 @@
               </span>
             </DropdownMenuRadioItem>
           {/each}
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>Shared-album badges</DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          value={$avatarDisplayState}
+          onValueChange={(value) => avatarDisplayState.setDisplay(value as AvatarDisplay)}
+        >
+          <DropdownMenuRadioItem value="initials" class="items-start py-2">
+            <span class="flex min-w-0 flex-col">
+              <span class="font-medium">Colored initials</span>
+              <span class="text-xs text-muted-foreground">Readable at badge size</span>
+            </span>
+          </DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="photos" class="items-start py-2">
+            <span class="flex min-w-0 flex-col">
+              <span class="font-medium">Profile photos</span>
+              <span class="text-xs text-muted-foreground">Picture with a colored ring</span>
+            </span>
+          </DropdownMenuRadioItem>
         </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
