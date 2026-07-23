@@ -42,6 +42,49 @@ struct PendingWipe {
     api_key: String,
 }
 
+fn collapse_overlapping_roots(paths: Vec<String>) -> Vec<String> {
+    let roots: Vec<(String, Option<PathBuf>)> = paths
+        .into_iter()
+        .map(|path| {
+            let canonical = std::fs::canonicalize(&path).ok();
+            (path, canonical)
+        })
+        .collect();
+    let mut seen_raw_paths = HashSet::new();
+
+    roots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (path, canonical_path))| {
+            if !seen_raw_paths.insert(path.clone()) {
+                return None;
+            }
+            let Some(canonical_path) = canonical_path.as_ref() else {
+                return Some(path.clone());
+            };
+            if roots[..index]
+                .iter()
+                .any(|(_, other)| other.as_ref() == Some(canonical_path))
+            {
+                return None;
+            }
+            if roots
+                .iter()
+                .enumerate()
+                .any(|(other_index, (_, ancestor))| {
+                    other_index != index
+                        && ancestor.as_ref().is_some_and(|ancestor| {
+                            ancestor != canonical_path && canonical_path.starts_with(ancestor)
+                        })
+                })
+            {
+                return None;
+            }
+            Some(canonical_path.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -237,7 +280,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     let api_key = keychain::get_api_key(&input.profile_id)?
         .ok_or_else(|| format!("No API key found for profile: {}", input.profile_id))?;
 
-    let source_paths = input.source_paths.clone();
+    let source_paths = collapse_overlapping_roots(input.source_paths.clone());
     let record_source_paths = source_paths.clone();
     // Selected (staged) imports honor the same keep/delete toggle as whole-folder
     // imports; the post-wipe SHA-1 verification guards deletion either way.
@@ -756,6 +799,7 @@ async fn scan_paths(paths: Vec<String>) -> Result<ScanResult, String> {
     let scan_cancellation = cancellation.clone();
     let mut scan_task =
         tauri::async_runtime::spawn_blocking(move || -> Result<ScanResult, String> {
+            let paths = collapse_overlapping_roots(paths);
             let mut merged = ScanResult {
                 files: Vec::new(),
                 total_size_bytes: 0,
@@ -763,6 +807,7 @@ async fn scan_paths(paths: Vec<String>) -> Result<ScanResult, String> {
                 video_count: 0,
                 skipped_unreadable: 0,
             };
+            let mut seen_file_paths = HashSet::new();
             for path in paths {
                 let result = media_scanner::scan_directory_with_controls(
                     PathBuf::from(path).as_path(),
@@ -770,10 +815,20 @@ async fn scan_paths(paths: Vec<String>) -> Result<ScanResult, String> {
                     Some(deadline),
                 )
                 .map_err(|error| error.to_string())?;
-                merged.files.extend(result.files);
-                merged.total_size_bytes += result.total_size_bytes;
-                merged.photo_count += result.photo_count;
-                merged.video_count += result.video_count;
+                for file in result.files {
+                    let file_path = std::fs::canonicalize(&file.path)
+                        .unwrap_or_else(|_| PathBuf::from(&file.path));
+                    if !seen_file_paths.insert(file_path) {
+                        continue;
+                    }
+                    merged.total_size_bytes += file.size_bytes;
+                    if file.is_video {
+                        merged.video_count += 1;
+                    } else {
+                        merged.photo_count += 1;
+                    }
+                    merged.files.push(file);
+                }
                 merged.skipped_unreadable += result.skipped_unreadable;
             }
             Ok(merged)
@@ -950,6 +1005,41 @@ mod tests {
 
     fn is_failed(o: &RunOutcome) -> bool {
         matches!(o.status, JobStatus::Failed)
+    }
+
+    #[test]
+    fn collapse_overlapping_roots_keeps_disjoint_ancestors_once() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("immich-shuttle-collapse-roots-{}", Uuid::new_v4()));
+        let parent = temp_dir.join("Photos");
+        let child = parent.join("2026");
+        let disjoint = temp_dir.join("Documents");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&disjoint).unwrap();
+
+        let collapsed = collapse_overlapping_roots(vec![
+            child.to_string_lossy().into_owned(),
+            parent.to_string_lossy().into_owned(),
+            disjoint.to_string_lossy().into_owned(),
+            parent.to_string_lossy().into_owned(),
+        ]);
+
+        assert_eq!(
+            collapsed,
+            vec![
+                parent
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                disjoint
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        );
+        std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
     #[test]
