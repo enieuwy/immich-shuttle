@@ -16,14 +16,53 @@ use std::{
 
 use uuid::Uuid;
 
-/// Build a staging directory linking to `selected`. Returns the directory path.
-pub fn create_staging_dir(selected: &[String]) -> Result<PathBuf, String> {
+/// Owns a temporary staging directory and removes it when dropped.
+///
+/// Normal callers should move this into [`cleanup_staging_dir`] on a blocking
+/// worker. Drop remains the backstop for cancellation, early returns, and
+/// panics, so staged links cannot outlive their import.
+pub struct StagingDir {
+    path: Option<PathBuf>,
+}
+
+impl StagingDir {
+    pub fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("staging directory path is available until cleanup")
+    }
+
+    fn cleanup(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        // Cancellation and panic paths may drop this guard on an async worker.
+        // Detached cleanup keeps that runtime worker from blocking on the filesystem.
+        if let Some(path) = self.path.take() {
+            let _ = std::thread::spawn(move || {
+                let _ = fs::remove_dir_all(path);
+            });
+        }
+    }
+}
+
+/// Build a staging directory linking to `selected`. The returned guard removes
+/// the directory if it is not explicitly cleaned up.
+pub fn create_staging_dir(selected: &[String]) -> Result<StagingDir, String> {
     if selected.is_empty() {
         return Err("No files selected to stage".to_string());
     }
 
     let root = std::env::temp_dir().join(format!("immich-shuttle-stage-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).map_err(|e| format!("Could not create staging dir: {e}"))?;
+    // Construct the guard immediately after creation so unwinding during any
+    // later staging operation removes partially-created links as well.
+    let guard = StagingDir { path: Some(root) };
 
     let base = common_ancestor(selected);
     let mut linked = 0_usize;
@@ -47,14 +86,14 @@ pub fn create_staging_dir(selected: &[String]) -> Result<PathBuf, String> {
         // drives with no common ancestor, which both collapse to the same
         // relative path — by nesting later hits under a numeric subfolder, so a
         // second file never silently overwrites the first in the staging dir.
-        let mut dest = root.join(&rel);
+        let mut dest = guard.path().join(&rel);
         let mut n = 1_usize;
         while used.contains(&dest) {
-            dest = root.join(n.to_string()).join(&rel);
+            dest = guard.path().join(n.to_string()).join(&rel);
             n += 1;
         }
         // Belt-and-suspenders: never write outside `root`.
-        if !dest.starts_with(&root) {
+        if !dest.starts_with(guard.path()) {
             continue;
         }
         if let Some(parent) = dest.parent() {
@@ -73,15 +112,14 @@ pub fn create_staging_dir(selected: &[String]) -> Result<PathBuf, String> {
     }
 
     if linked == 0 {
-        let _ = fs::remove_dir_all(&root);
         return Err("None of the selected files could be staged".to_string());
     }
-    Ok(root)
+    Ok(guard)
 }
 
 /// Remove a staging directory. Only the links are removed; targets are untouched.
-pub fn cleanup_staging_dir(dir: &Path) {
-    let _ = fs::remove_dir_all(dir);
+pub fn cleanup_staging_dir(mut dir: StagingDir) {
+    dir.cleanup();
 }
 
 fn link_file(src: &Path, dest: &Path) -> Result<(), String> {
@@ -172,11 +210,12 @@ mod tests {
         ])
         .unwrap();
 
-        assert!(staged.join("100/IMG_1.JPG").exists());
-        assert!(staged.join("101/IMG_2.JPG").exists());
+        assert!(staged.path().join("100/IMG_1.JPG").exists());
+        assert!(staged.path().join("101/IMG_2.JPG").exists());
 
-        cleanup_staging_dir(&staged);
-        assert!(!staged.exists());
+        let staged_path = staged.path().to_path_buf();
+        cleanup_staging_dir(staged);
+        assert!(!staged_path.exists());
         // Originals survive cleanup.
         assert!(a.exists() && b.exists());
         fs::remove_dir_all(&tmp).unwrap();
@@ -205,12 +244,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            walkdir_files(&staged).len(),
+            walkdir_files(staged.path()).len(),
             2,
             "both entries must be staged without collision"
         );
 
-        cleanup_staging_dir(&staged);
+        cleanup_staging_dir(staged);
         fs::remove_dir_all(&tmp).unwrap();
     }
 
@@ -243,9 +282,9 @@ mod tests {
         let crafted = format!("{}/album/../evilfile.jpg", tmp.to_string_lossy());
         let staged = create_staging_dir(&[crafted, normal.to_string_lossy().to_string()]).unwrap();
 
-        for entry in walkdir_files(&staged) {
+        for entry in walkdir_files(staged.path()) {
             assert!(
-                entry.starts_with(&staged),
+                entry.starts_with(staged.path()),
                 "staged path escaped root: {}",
                 entry.display()
             );
@@ -253,7 +292,33 @@ mod tests {
         // The escaping original is untouched (never overwritten in place).
         assert_eq!(fs::read(&escape).unwrap(), b"x");
 
-        cleanup_staging_dir(&staged);
+        cleanup_staging_dir(staged);
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn dropping_staging_dir_removes_links() {
+        let tmp = std::env::temp_dir().join(format!("stage-drop-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("photo.jpg");
+        fs::write(&source, b"x").unwrap();
+
+        let staged_path = {
+            let staged = create_staging_dir(&[source.to_string_lossy().to_string()]).unwrap();
+            let path = staged.path().to_path_buf();
+            assert!(path.exists());
+            path
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while staged_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !staged_path.exists(),
+            "detached cleanup did not finish within 1 second"
+        );
+        assert!(source.exists());
         fs::remove_dir_all(&tmp).unwrap();
     }
 

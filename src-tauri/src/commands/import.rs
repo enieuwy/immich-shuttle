@@ -1,10 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, LazyLock, Mutex,
     },
+    time::{Duration, Instant},
 };
 
 use uuid::Uuid;
@@ -29,6 +30,12 @@ static RUNNING_IMPORTS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
 static JOB_INPUTS: LazyLock<Mutex<HashMap<String, ImportInput>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+const MAX_RETAINED_TERMINAL_JOBS: usize = 500;
+const SCAN_DEADLINE: Duration = Duration::from_secs(60 * 60);
+
+static IMPORT_START_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static ACTIVE_SCAN: LazyLock<Mutex<Option<Arc<AtomicBool>>>> = LazyLock::new(|| Mutex::new(None));
+
 struct PendingWipe {
     paths: Vec<String>,
     server_url: String,
@@ -52,15 +59,108 @@ fn get_job(job_id: &str) -> Result<ImportJob, String> {
         .ok_or_else(|| format!("Job not found: {job_id}"))
 }
 
-fn set_job(job: ImportJob) -> Result<(), String> {
-    let mut jobs = JOBS
+fn is_active(status: &JobStatus) -> bool {
+    matches!(status, JobStatus::Running | JobStatus::Pending)
+}
+
+fn is_terminal(status: &JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled
+    )
+}
+
+fn has_active_import() -> Result<bool, String> {
+    let jobs = JOBS
         .lock()
         .map_err(|_| "Could not lock import job state".to_string())?;
-    if let Some(existing) = jobs.iter_mut().find(|j| j.id == job.id) {
-        *existing = job;
-    } else {
-        jobs.push(job);
+    let has_active_job = jobs.iter().any(|job| is_active(&job.status));
+    drop(jobs);
+    let running = RUNNING_IMPORTS
+        .lock()
+        .map_err(|_| "Could not lock running imports state".to_string())?;
+    Ok(has_active_job || !running.is_empty())
+}
+
+fn evict_old_terminal_jobs(jobs: &mut Vec<ImportJob>) -> Vec<String> {
+    let terminal_count = jobs.iter().filter(|job| is_terminal(&job.status)).count();
+    let excess = terminal_count.saturating_sub(MAX_RETAINED_TERMINAL_JOBS);
+    if excess == 0 {
+        return Vec::new();
     }
+
+    let evicted: HashSet<String> = jobs
+        .iter()
+        .filter(|job| is_terminal(&job.status))
+        .take(excess)
+        .map(|job| job.id.clone())
+        .collect();
+    jobs.retain(|job| !evicted.contains(&job.id));
+    evicted.into_iter().collect()
+}
+
+fn remove_job_state(job_ids: &[String]) {
+    if let Ok(mut inputs) = JOB_INPUTS.lock() {
+        for id in job_ids {
+            inputs.remove(id);
+        }
+    }
+    if let Ok(mut pending) = PENDING_WIPE.lock() {
+        for id in job_ids {
+            pending.remove(id);
+        }
+    }
+}
+
+fn insert_initial_job(
+    job: ImportJob,
+    input: ImportInput,
+    cancel_flag: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let evicted_ids = {
+        let mut running = RUNNING_IMPORTS
+            .lock()
+            .map_err(|_| "Could not lock running imports state".to_string())?;
+        let mut jobs = JOBS
+            .lock()
+            .map_err(|_| "Could not lock import job state".to_string())?;
+        if !running.is_empty() || jobs.iter().any(|existing| is_active(&existing.status)) {
+            return Err("An import is already running".to_string());
+        }
+        let mut inputs = JOB_INPUTS
+            .lock()
+            .map_err(|_| "Could not lock import inputs".to_string())?;
+
+        let job_id = job.id.clone();
+        inputs.insert(job_id.clone(), input);
+        jobs.push(job);
+        running.insert(job_id, cancel_flag);
+        evict_old_terminal_jobs(&mut jobs)
+    };
+    remove_job_state(&evicted_ids);
+    Ok(())
+}
+
+fn set_job(job: ImportJob) -> Result<(), String> {
+    let evicted_ids = {
+        let mut jobs = JOBS
+            .lock()
+            .map_err(|_| "Could not lock import job state".to_string())?;
+        let Some(index) = jobs.iter().position(|existing| existing.id == job.id) else {
+            return Ok(());
+        };
+
+        let terminal = is_terminal(&job.status);
+        jobs[index] = job;
+        // Terminal jobs are ordered by their last state transition so eviction
+        // keeps the most recently completed/cancelled/failed jobs.
+        if terminal {
+            let job = jobs.remove(index);
+            jobs.push(job);
+        }
+        evict_old_terminal_jobs(&mut jobs)
+    };
+    remove_job_state(&evicted_ids);
     Ok(())
 }
 
@@ -137,34 +237,6 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     let api_key = keychain::get_api_key(&input.profile_id)?
         .ok_or_else(|| format!("No API key found for profile: {}", input.profile_id))?;
 
-    let job_id = Uuid::new_v4().to_string();
-    if let Ok(mut inputs) = JOB_INPUTS.lock() {
-        inputs.insert(job_id.clone(), input.clone());
-    }
-    let initial = ImportJob {
-        id: job_id.clone(),
-        status: JobStatus::Running,
-        progress: JobProgress {
-            total: 0,
-            uploaded: 0,
-            duplicates: 0,
-            errors: 0,
-        },
-        error: None,
-        summary: None,
-        awaiting_wipe_confirmation: false,
-        pending_wipe_count: 0,
-        file_errors: Vec::new(),
-    };
-    set_job(initial)?;
-    logs::append_log(
-        "app.log",
-        &format!(
-            "import_start job_id={job_id} profile_id={}",
-            input.profile_id
-        ),
-    )?;
-
     let source_paths = input.source_paths.clone();
     let record_source_paths = source_paths.clone();
     // Selected (staged) imports honor the same keep/delete toggle as whole-folder
@@ -185,24 +257,62 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     if staging_requested {
         validate_selected_under_sources(&select_files, &source_paths)?;
     }
+
+    let job_id = Uuid::new_v4().to_string();
+    let log_path = logs::logs_dir()?.join(format!("run-{job_id}.log"));
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let initial = ImportJob {
+        id: job_id.clone(),
+        status: JobStatus::Running,
+        progress: JobProgress {
+            total: 0,
+            uploaded: 0,
+            duplicates: 0,
+            errors: 0,
+        },
+        error: None,
+        summary: None,
+        awaiting_wipe_confirmation: false,
+        pending_wipe_count: 0,
+        file_errors: Vec::new(),
+    };
+
+    // Publish a job only after all fallible setup has succeeded. The admission
+    // lock serializes the check and insertion so two IPC calls cannot both begin.
+    {
+        let _start_lock = IMPORT_START_LOCK
+            .lock()
+            .map_err(|_| "Could not lock import start state".to_string())?;
+        if has_active_import()? {
+            return Err("An import is already running".to_string());
+        }
+        logs::append_log(
+            "app.log",
+            &format!(
+                "import_start job_id={job_id} profile_id={}",
+                input.profile_id
+            ),
+        )?;
+        insert_initial_job(initial, input.clone(), cancel_flag.clone())?;
+    }
+
     let started_at = now_ms();
     let job_id_clone = job_id.clone();
     let api_key_clone = api_key;
     let app_clone = app.clone();
-    let log_path = logs::logs_dir()?.join(format!("run-{job_id}.log"));
     let device_uuid = format!("immich-shuttle-{}", Uuid::new_v4());
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    RUNNING_IMPORTS
-        .lock()
-        .map_err(|_| "Could not lock running imports state".to_string())?
-        .insert(job_id.clone(), cancel_flag.clone());
 
     tauri::async_runtime::spawn(async move {
         let api_key_for_album_assignment = api_key_clone.clone();
         let staging_dir = if staging_requested {
-            match staging::create_staging_dir(&select_files) {
-                Ok(dir) => Some(dir),
-                Err(e) => {
+            let selected_files = select_files.clone();
+            match tauri::async_runtime::spawn_blocking(move || {
+                staging::create_staging_dir(&selected_files)
+            })
+            .await
+            {
+                Ok(Ok(dir)) => Some(dir),
+                Ok(Err(e)) => {
                     if let Ok(mut running) = RUNNING_IMPORTS.lock() {
                         running.remove(&job_id_clone);
                     }
@@ -223,12 +333,34 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                     });
                     return;
                 }
+                Err(e) => {
+                    if let Ok(mut running) = RUNNING_IMPORTS.lock() {
+                        running.remove(&job_id_clone);
+                    }
+                    let _ = set_job(ImportJob {
+                        id: job_id_clone.clone(),
+                        status: JobStatus::Failed,
+                        progress: JobProgress {
+                            total: 0,
+                            uploaded: 0,
+                            duplicates: 0,
+                            errors: 1,
+                        },
+                        error: Some(format!("Staging task failed: {e}")),
+                        summary: None,
+                        awaiting_wipe_confirmation: false,
+                        pending_wipe_count: 0,
+                        file_errors: Vec::new(),
+                    });
+                    return;
+                }
             }
         } else {
             None
         };
+        let staged_import = staging_dir.is_some();
         let upload_paths: Vec<String> = match &staging_dir {
-            Some(dir) => vec![dir.to_string_lossy().to_string()],
+            Some(dir) => vec![dir.path().to_string_lossy().to_string()],
             None => source_paths.clone(),
         };
         // Resolve the reachable endpoint inside the task: the LAN/WAN probe can
@@ -274,8 +406,11 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             }
         }
 
-        if let Some(dir) = &staging_dir {
-            staging::cleanup_staging_dir(dir);
+        if let Some(dir) = staging_dir {
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                staging::cleanup_staging_dir(dir);
+            })
+            .await;
         }
 
         if let Ok(mut running) = RUNNING_IMPORTS.lock() {
@@ -297,7 +432,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // symlink dir, which is cleaned up below — so wipe must target the user's
         // selected originals instead. SHA-1 verify_uploaded still gates deletion
         // to files the server actually holds, so unuploaded picks are kept safe.
-        let completed_asset_paths = if staging_dir.is_some() {
+        let completed_asset_paths = if staged_import {
             select_files.clone()
         } else {
             run.completed_paths
@@ -453,7 +588,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             JobStatus::Cancelled => "cancelled",
             _ => "failed",
         };
-        crate::services::store::append_history(
+        if let Err(err) = crate::services::store::append_history(
             &app_clone,
             crate::models::history::ImportRecord {
                 id: update.id.clone(),
@@ -468,7 +603,22 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 duplicates: update.progress.duplicates,
                 errors: update.progress.errors,
             },
-        );
+        ) {
+            let _ = logs::append_log(
+                "app.log",
+                &format!(
+                    "import_history_persist_failed job_id={} error={err}",
+                    update.id
+                ),
+            );
+            let mut job_with_warning = update.clone();
+            let warning = "Warning: import history could not be saved.";
+            job_with_warning.summary = Some(match job_with_warning.summary.take() {
+                Some(summary) => format!("{summary} {warning}"),
+                None => warning.to_string(),
+            });
+            let _ = set_job(job_with_warning);
+        }
     });
 
     Ok(job_id)
@@ -497,39 +647,56 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
     if confirm {
         match wipe::verify_uploaded(&pending.server_url, &pending.api_key, &pending.paths).await {
             Ok(verified) => {
-                let wipe_result = wipe::wipe_files(&verified.confirmed);
-                let kept = wipe_result.failed + wipe_result.skipped + verified.unverified.len();
-                job.summary = Some(format!(
-                    "Verified {} of {} files on the server and deleted {}. Kept {} ({} not found on server).",
-                    verified.confirmed.len(),
-                    pending_count,
-                    wipe_result.deleted,
-                    kept,
-                    verified.unverified.len(),
-                ));
-                job.error = if wipe_result.failed > 0 {
-                    Some(format!(
-                        "Wipe completed with errors: deleted={}, failed={}, skipped={}",
-                        wipe_result.deleted, wipe_result.failed, wipe_result.skipped
-                    ))
-                } else if !verified.unverified.is_empty() {
-                    Some(format!(
-                        "{} file(s) were not found on the server and were kept for safety.",
-                        verified.unverified.len()
-                    ))
-                } else {
-                    None
-                };
-                let _ = logs::append_log(
-                    "app.log",
-                    &format!(
-                        "import_wipe_verified job_id={} confirmed={} unverified={} deleted={}",
-                        job_id,
-                        verified.confirmed.len(),
-                        verified.unverified.len(),
-                        wipe_result.deleted
-                    ),
-                );
+                let confirmed_count = verified.confirmed.len();
+                let unverified_count = verified.unverified.len();
+                match tauri::async_runtime::spawn_blocking(move || {
+                    wipe::wipe_files(&verified.confirmed)
+                })
+                .await
+                {
+                    Ok(wipe_result) => {
+                        let kept = wipe_result.failed + wipe_result.skipped + unverified_count;
+                        job.summary = Some(format!(
+                            "Verified {} of {} files on the server and deleted {}. Kept {} ({} not found on server).",
+                            confirmed_count,
+                            pending_count,
+                            wipe_result.deleted,
+                            kept,
+                            unverified_count,
+                        ));
+                        job.error = if wipe_result.failed > 0 {
+                            Some(format!(
+                                "Wipe completed with errors: deleted={}, failed={}, skipped={}",
+                                wipe_result.deleted, wipe_result.failed, wipe_result.skipped
+                            ))
+                        } else if unverified_count > 0 {
+                            Some(format!(
+                                "{unverified_count} file(s) were not found on the server and were kept for safety."
+                            ))
+                        } else {
+                            None
+                        };
+                        let _ = logs::append_log(
+                            "app.log",
+                            &format!(
+                                "import_wipe_verified job_id={} confirmed={} unverified={} deleted={}",
+                                job_id, confirmed_count, unverified_count, wipe_result.deleted
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        job.summary = Some(
+                            "Wipe worker stopped before completion. Source files were kept where possible — you can retry the wipe."
+                                .to_string(),
+                        );
+                        job.error = Some(format!("Wipe task failed: {err}"));
+                        let _ = logs::append_log(
+                            "app.log",
+                            &format!("import_wipe_task_failed job_id={job_id} error={err}"),
+                        );
+                        retry_pending = Some(pending);
+                    }
+                }
             }
             Err(err) => {
                 job.summary = Some(format!(
@@ -573,16 +740,85 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
     Ok(job)
 }
 
+async fn scan_paths(paths: Vec<String>) -> Result<ScanResult, String> {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let previous = {
+        let mut active = ACTIVE_SCAN
+            .lock()
+            .map_err(|_| "Could not lock active scan state".to_string())?;
+        active.replace(cancellation.clone())
+    };
+    if let Some(previous) = previous {
+        previous.store(true, Ordering::Relaxed);
+    }
+
+    let deadline = Instant::now() + SCAN_DEADLINE;
+    let scan_cancellation = cancellation.clone();
+    let mut scan_task =
+        tauri::async_runtime::spawn_blocking(move || -> Result<ScanResult, String> {
+            let mut merged = ScanResult {
+                files: Vec::new(),
+                total_size_bytes: 0,
+                photo_count: 0,
+                video_count: 0,
+                skipped_unreadable: 0,
+            };
+            for path in paths {
+                let result = media_scanner::scan_directory_with_controls(
+                    PathBuf::from(path).as_path(),
+                    Some(scan_cancellation.as_ref()),
+                    Some(deadline),
+                )
+                .map_err(|error| error.to_string())?;
+                merged.files.extend(result.files);
+                merged.total_size_bytes += result.total_size_bytes;
+                merged.photo_count += result.photo_count;
+                merged.video_count += result.video_count;
+                merged.skipped_unreadable += result.skipped_unreadable;
+            }
+            Ok(merged)
+        });
+
+    let result = tokio::select! {
+        joined = tokio::time::timeout(SCAN_DEADLINE, &mut scan_task) => match joined {
+            Ok(result) => result.map_err(|error| format!("Scan task failed: {error}"))?,
+            Err(_) => {
+                cancellation.store(true, Ordering::Relaxed);
+                // Dropping the join handle detaches a worker stuck inside a filesystem
+                // syscall; it remains until the OS returns, but the IPC/UI is unblocked.
+                Err(format!("Scan timed out after {} seconds", SCAN_DEADLINE.as_secs()))
+            }
+        },
+        _ = async {
+            while !cancellation.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        } => {
+            cancellation.store(true, Ordering::Relaxed);
+            Err("Scan superseded by a newer request".to_string())
+        },
+    };
+
+    if let Ok(mut active) = ACTIVE_SCAN.lock() {
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &cancellation))
+        {
+            active.take();
+        }
+    }
+
+    result
+}
+
 #[tauri::command]
 pub async fn scan_source(path: String) -> Result<ScanResult, String> {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("Source path is required".to_string());
+    }
     crate::services::source_guard::record_roots(std::slice::from_ref(&path));
-    // Recursive directory walks can take seconds/minutes on large libraries or
-    // network shares; run off the async executor so IPC stays responsive.
-    tauri::async_runtime::spawn_blocking(move || {
-        media_scanner::scan_directory(PathBuf::from(path).as_path())
-    })
-    .await
-    .map_err(|e| format!("Scan task failed: {e}"))?
+    scan_paths(vec![path]).await
 }
 
 #[tauri::command]
@@ -590,52 +826,42 @@ pub async fn scan_sources(paths: Vec<String>) -> Result<ScanResult, String> {
     if paths.is_empty() {
         return Err("At least one path is required".to_string());
     }
+    // The plural scan always receives the user's full current selection, so
+    // reset the approved-root scope before recording it. This de-authorizes
+    // roots that were removed from the selection (bounds the allowlist too).
+    crate::services::source_guard::reset_roots();
     crate::services::source_guard::record_roots(&paths);
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut merged = ScanResult {
-            files: Vec::new(),
-            total_size_bytes: 0,
-            photo_count: 0,
-            video_count: 0,
-            skipped_unreadable: 0,
-        };
-        for p in paths {
-            let result = media_scanner::scan_directory(PathBuf::from(p).as_path())?;
-            merged.files.extend(result.files);
-            merged.total_size_bytes += result.total_size_bytes;
-            merged.photo_count += result.photo_count;
-            merged.video_count += result.video_count;
-            merged.skipped_unreadable += result.skipped_unreadable;
-        }
-        Ok(merged)
-    })
-    .await
-    .map_err(|e| format!("Scan task failed: {e}"))?
+    scan_paths(paths).await
 }
 
 #[tauri::command]
 pub async fn import_cancel(job_id: String) -> Result<(), String> {
-    if let Ok(running) = RUNNING_IMPORTS.lock() {
-        if let Some(flag) = running.get(&job_id) {
+    let mut job = get_job(&job_id)?;
+    match &job.status {
+        JobStatus::Running => {
+            let running = RUNNING_IMPORTS
+                .lock()
+                .map_err(|_| "Could not lock running imports state".to_string())?;
+            let flag = running
+                .get(&job_id)
+                .ok_or_else(|| format!("Import is no longer running: {job_id}"))?;
             flag.store(true, Ordering::Relaxed);
+        }
+        JobStatus::Pending => {}
+        JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => {
+            return Err(format!("Cannot cancel a terminal import: {job_id}"));
         }
     }
 
-    let mut jobs = JOBS
-        .lock()
-        .map_err(|_| "Could not lock import job state".to_string())?;
-    if let Some(existing) = jobs.iter_mut().find(|j| j.id == job_id) {
-        existing.status = JobStatus::Cancelled;
-        existing.awaiting_wipe_confirmation = false;
-        existing.pending_wipe_count = 0;
-        existing.error = None;
-        existing.summary = Some("Import cancelled by user.".to_string());
-        if let Ok(mut pending) = PENDING_WIPE.lock() {
-            pending.remove(&job_id);
-        }
-        return Ok(());
+    job.status = JobStatus::Cancelled;
+    job.awaiting_wipe_confirmation = false;
+    job.pending_wipe_count = 0;
+    job.error = None;
+    job.summary = Some("Import cancelled by user.".to_string());
+    if let Ok(mut pending) = PENDING_WIPE.lock() {
+        pending.remove(&job_id);
     }
-    Err(format!("Job not found: {job_id}"))
+    set_job(job)
 }
 
 #[tauri::command]
@@ -648,6 +874,12 @@ pub async fn import_list_jobs() -> Result<Vec<ImportJob>, String> {
 
 #[tauri::command]
 pub async fn import_retry(app: tauri::AppHandle, job_id: String) -> Result<String, String> {
+    let job = get_job(&job_id)?;
+    if !matches!(&job.status, JobStatus::Failed | JobStatus::Cancelled) {
+        return Err(format!(
+            "Only failed or cancelled imports can be retried: {job_id}"
+        ));
+    }
     let input = {
         let inputs = JOB_INPUTS
             .lock()

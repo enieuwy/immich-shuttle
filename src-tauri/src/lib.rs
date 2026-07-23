@@ -1,3 +1,105 @@
+use std::{fs, path::Path, time::Duration};
+
+use uuid::Uuid;
+
+// A cross-process ownership lease is the thorough long-term fix. Until then,
+// preserve a full day of staging/config artifacts so another app instance's
+// plausibly-live upload cannot be pruned during startup.
+const STALE_TEMP_ARTIFACT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+// Run logs are not removed until well beyond any plausible live upload window.
+const STALE_RUN_LOG_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+fn is_older_than(path: &Path, age: Duration) -> bool {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .is_some_and(|modified| modified.elapsed().is_ok_and(|elapsed| elapsed >= age))
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|uuid| uuid.hyphenated().to_string() == value)
+}
+
+fn is_temp_artifact_name(name: &str) -> bool {
+    ["immich-shuttle-stage-", "immich-shuttle-"]
+        .iter()
+        .any(|prefix| name.strip_prefix(prefix).is_some_and(is_canonical_uuid))
+}
+
+fn is_run_log_name(name: &str) -> bool {
+    name.strip_prefix("run-")
+        .and_then(|name| name.strip_suffix(".log"))
+        .is_some_and(is_canonical_uuid)
+}
+
+fn prune_stale_temp_artifacts() {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if is_temp_artifact_name(name)
+            && path.is_dir()
+            && is_older_than(&path, STALE_TEMP_ARTIFACT_AGE)
+        {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn prune_stale_run_logs() {
+    let Ok(dir) = crate::services::logs::logs_dir() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if is_run_log_name(name) && path.is_file() && is_older_than(&path, STALE_RUN_LOG_AGE) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn prune_startup_artifacts() {
+    prune_stale_temp_artifacts();
+    prune_stale_run_logs();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+    #[test]
+    fn startup_prune_only_recognizes_exact_artifact_names() {
+        assert!(is_temp_artifact_name(&format!("immich-shuttle-{UUID}")));
+        assert!(is_temp_artifact_name(&format!(
+            "immich-shuttle-stage-{UUID}"
+        )));
+        assert!(is_run_log_name(&format!("run-{UUID}.log")));
+
+        assert!(!is_temp_artifact_name("immich-shuttle-photos"));
+        assert!(!is_temp_artifact_name(&format!(
+            "immich-shuttle-{UUID}-backup"
+        )));
+        assert!(!is_run_log_name(&format!("run-{UUID}.log.old")));
+        assert!(!is_run_log_name("run-upload.log"));
+    }
+}
+
 mod commands;
 mod models;
 mod services;
@@ -13,6 +115,9 @@ pub fn run() {
             // Evict stale thumbnails so the on-disk cache can't grow without
             // bound across sessions. Off-thread: it stats/deletes cache files.
             tauri::async_runtime::spawn_blocking(crate::services::thumbnailer::prune_cache);
+            // Recover temp staging/config directories and run logs left behind
+            // if the prior process stopped before their normal cleanup.
+            tauri::async_runtime::spawn_blocking(prune_startup_artifacts);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
