@@ -7,6 +7,7 @@ import {
   filterFiles,
   presetRange,
   toYmd,
+  type PreviewFilter,
 } from "./previewFilter";
 
 function file(name: string, is_video = false): MediaFile {
@@ -64,31 +65,52 @@ describe("date helpers", () => {
 });
 
 describe("filterFiles", () => {
+  const base: PreviewFilter = {
+    type: "all",
+    fromEpoch: null,
+    toEpoch: null,
+    nameQuery: "",
+    minBytes: null,
+    maxBytes: null,
+  };
+  const run = (overrides: Partial<PreviewFilter>, input = files) =>
+    filterFiles(input, dates, { ...base, ...overrides });
+
   it("passes everything with no filter", () => {
-    const out = filterFiles(files, dates, { type: "all", fromEpoch: null, toEpoch: null });
-    expect(out).toHaveLength(3);
+    expect(run({})).toHaveLength(3);
   });
 
   it("filters by media type", () => {
-    expect(
-      filterFiles(files, dates, { type: "photo", fromEpoch: null, toEpoch: null }),
-    ).toEqual([photoA, photoB]);
-    expect(
-      filterFiles(files, dates, { type: "video", fromEpoch: null, toEpoch: null }),
-    ).toEqual([video]);
+    expect(run({ type: "photo" })).toEqual([photoA, photoB]);
+    expect(run({ type: "video" })).toEqual([video]);
   });
 
   it("filters by inclusive date window and drops unknown-date files", () => {
     const from = dayStartEpoch("2026-06-01");
     const to = dayEndEpoch("2026-06-30");
-    const out = filterFiles(files, dates, { type: "all", fromEpoch: from, toEpoch: to });
     // photoB (Jun 15) in range; photoA (Jan) out; video (unknown) excluded.
-    expect(out).toEqual([photoB]);
+    expect(run({ fromEpoch: from, toEpoch: to })).toEqual([photoB]);
   });
 
   it("combines type and date filters", () => {
     const from = dayStartEpoch("2026-01-01");
-    const out = filterFiles(files, dates, { type: "photo", fromEpoch: from, toEpoch: null });
-    expect(out).toEqual([photoA, photoB]);
+    expect(run({ type: "photo", fromEpoch: from })).toEqual([photoA, photoB]);
+  });
+
+  it("filters by case-insensitive filename substring", () => {
+    expect(run({ nameQuery: "A.JPG" })).toEqual([photoA]);
+    expect(run({ nameQuery: ".mp4" })).toEqual([video]);
+    // Blank/whitespace query is a no-op.
+    expect(run({ nameQuery: "   " })).toHaveLength(3);
+  });
+
+  it("filters by inclusive byte-size window", () => {
+    const small = { ...file("small.jpg"), size_bytes: 500 };
+    const mid = { ...file("mid.jpg"), size_bytes: 1500 };
+    const big = { ...file("big.jpg"), size_bytes: 3000 };
+    const sized = [small, mid, big];
+    expect(run({ minBytes: 1000 }, sized)).toEqual([mid, big]);
+    expect(run({ maxBytes: 2000 }, sized)).toEqual([small, mid]);
+    expect(run({ minBytes: 1000, maxBytes: 2000 }, sized)).toEqual([mid]);
   });
 });

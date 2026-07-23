@@ -9,6 +9,12 @@ export interface PreviewFilter {
   fromEpoch: number | null;
   /** Inclusive upper bound, epoch seconds, or null for no upper bound. */
   toEpoch: number | null;
+  /** Case-insensitive substring matched against the file name; "" = no filter. */
+  nameQuery: string;
+  /** Inclusive minimum size in bytes, or null for no lower bound. */
+  minBytes: number | null;
+  /** Inclusive maximum size in bytes, or null for no upper bound. */
+  maxBytes: number | null;
 }
 
 /** Local calendar date as "YYYY-MM-DD" (the value shape of <input type="date">). */
@@ -60,9 +66,11 @@ export function presetRange(
 }
 
 /**
- * Filter `files` by media type and capture-date window. Files whose capture date
- * is unknown are excluded whenever a date bound is active (we can't confirm they
- * fall in range), and included otherwise.
+ * Filter `files` by media type, capture-date window, filename substring, and
+ * byte-size bounds. Files whose capture date is unknown are excluded whenever a
+ * date bound is active (we can't confirm they fall in range), and included
+ * otherwise. The name query is case-insensitive; blank/whitespace means no
+ * filter.
  */
 export function filterFiles(
   files: MediaFile[],
@@ -70,9 +78,13 @@ export function filterFiles(
   filter: PreviewFilter,
 ): MediaFile[] {
   const hasDateBound = filter.fromEpoch !== null || filter.toEpoch !== null;
+  const query = filter.nameQuery.trim().toLowerCase();
   return files.filter((f) => {
     if (filter.type === "photo" && f.is_video) return false;
     if (filter.type === "video" && !f.is_video) return false;
+    if (query && !f.name.toLowerCase().includes(query)) return false;
+    if (filter.minBytes !== null && f.size_bytes < filter.minBytes) return false;
+    if (filter.maxBytes !== null && f.size_bytes > filter.maxBytes) return false;
     if (hasDateBound) {
       const captured = dates.get(f.path) ?? null;
       if (captured === null) return false;

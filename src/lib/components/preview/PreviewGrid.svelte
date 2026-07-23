@@ -105,6 +105,20 @@
     fromEpoch !== null && toEpoch !== null && fromEpoch > toEpoch,
   );
 
+  // Filename substring (case-insensitive) and size window (entered in MB).
+  let nameQuery = $state("");
+  let minMbInput = $state("");
+  let maxMbInput = $state("");
+
+  function mbToBytes(value: string): number | null {
+    const mb = Number.parseFloat(value);
+    if (!Number.isFinite(mb) || mb < 0) return null;
+    return Math.round(mb * 1024 * 1024);
+  }
+
+  const minBytes = $derived(mbToBytes(minMbInput));
+  const maxBytes = $derived(mbToBytes(maxMbInput));
+
   const activePreset = $derived.by<DatePreset>(() => {
     if (!fromInput && !toInput) return "all";
     for (const p of ["7d", "30d", "year"] as const) {
@@ -133,6 +147,9 @@
       // Ignore a backwards range rather than hiding everything.
       fromEpoch: invalidRange ? null : fromEpoch,
       toEpoch: invalidRange ? null : toEpoch,
+      nameQuery,
+      minBytes,
+      maxBytes,
     }),
   );
 
@@ -166,7 +183,14 @@
     return { count, size };
   });
 
-  const filterActive = $derived(typeFilter !== "all" || fromInput !== "" || toInput !== "");
+  const filterActive = $derived(
+    typeFilter !== "all" ||
+      fromInput !== "" ||
+      toInput !== "" ||
+      nameQuery.trim() !== "" ||
+      minMbInput !== "" ||
+      maxMbInput !== "",
+  );
 
   function fmtSize(bytes: number): string {
     const mb = bytes / 1024 / 1024;
@@ -339,6 +363,39 @@
             bind:value={toInput}
             aria-label="To date"
             aria-invalid={invalidRange}
+          />
+        </div>
+
+        <div class="flex items-center gap-1">
+          <Input
+            type="search"
+            placeholder="Filename…"
+            class="h-8 w-[10rem]"
+            bind:value={nameQuery}
+            aria-label="Filter by filename"
+          />
+        </div>
+
+        <div class="flex items-center gap-1">
+          <span class="text-xs text-muted-foreground">Size (MB)</span>
+          <Input
+            type="number"
+            min="0"
+            step="0.1"
+            placeholder="min"
+            class="h-8 w-[4.5rem]"
+            bind:value={minMbInput}
+            aria-label="Minimum size in MB"
+          />
+          <span class="text-xs text-muted-foreground">to</span>
+          <Input
+            type="number"
+            min="0"
+            step="0.1"
+            placeholder="max"
+            class="h-8 w-[4.5rem]"
+            bind:value={maxMbInput}
+            aria-label="Maximum size in MB"
           />
         </div>
       </div>
