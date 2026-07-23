@@ -69,6 +69,16 @@ pub async fn open_in_immich(profile_id: String, album_id: Option<String>) -> Res
     if base.is_empty() {
         return Err("No reachable Immich server URL for this profile.".to_string());
     }
+    // Only ever hand an http(s) URL to the OS opener: a stored profile URL with
+    // another scheme (mailto:, file:, a custom protocol handler) must never be
+    // launched host-side.
+    let scheme_ok = {
+        let lower = base.to_ascii_lowercase();
+        lower.starts_with("http://") || lower.starts_with("https://")
+    };
+    if !scheme_ok {
+        return Err("Immich server URL must start with http:// or https://.".to_string());
+    }
     let url = immich_web_url(&base, album_id.as_deref());
     tauri_plugin_opener::open_url(url, None::<String>)
         .map_err(|e| format!("Could not open Immich: {e}"))

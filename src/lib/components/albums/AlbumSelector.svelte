@@ -3,6 +3,7 @@
   import { userDisplayNames } from "$lib/users";
 
   import { albumsState } from "$lib/state/albums";
+  import { errorsState } from "$lib/state/errors";
   import { activeProfile } from "$lib/state/profiles";
   import { openInImmich } from "$lib/api";
   import { Button } from "$lib/components/ui/button";
@@ -55,7 +56,11 @@
   async function openAlbumInImmich(albumId: string) {
     const profile = $activeProfile;
     if (!profile) return;
-    await openInImmich(profile.id, albumId);
+    try {
+      await openInImmich(profile.id, albumId);
+    } catch {
+      errorsState.addError("Could not open Immich.");
+    }
   }
 </script>
 
@@ -94,14 +99,17 @@
             </Badge>
           {/if}
         {/each}
-        <Button
-          variant="ghost"
-          size="sm"
-          class="text-primary hover:bg-primary/10"
-          onclick={() => openAlbumInImmich($albumsState.selectedAlbumIds[0])}
-        >
-          <ExternalLink class="mr-1 h-3.5 w-3.5" /> Open in Immich
-        </Button>
+        {@const openableAlbum = $albumsState.availableAlbums.find((a) => a.id === $albumsState.selectedAlbumIds[0])}
+        {#if openableAlbum}
+          <Button
+            variant="ghost"
+            size="sm"
+            class="text-primary hover:bg-primary/10"
+            onclick={() => openAlbumInImmich(openableAlbum.id)}
+          >
+            <ExternalLink class="mr-1 h-3.5 w-3.5" /> Open in Immich
+          </Button>
+        {/if}
       {:else}
         <Badge variant="outline" class="text-muted-foreground">No album selected</Badge>
       {/if}
