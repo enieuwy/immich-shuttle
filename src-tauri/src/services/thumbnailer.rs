@@ -21,10 +21,18 @@
 //! Results are cached on disk keyed by path+mtime+size so re-scans are instant.
 
 use std::{
+    collections::HashMap,
     fs,
     io::{Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
     time::UNIX_EPOCH,
+};
+
+#[cfg(target_os = "macos")]
+use std::{
+    process::Command,
+    time::{Duration, Instant},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -61,16 +69,29 @@ const CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Best-effort maintenance: evict the oldest cached thumbnails until the cache
 /// is back under `CACHE_MAX_BYTES`. Called at startup so the cache can't grow
 /// without bound. All I/O errors are swallowed — a cache hiccup must never block
-/// the app or a scan.
+/// an app or a scan.
 pub fn prune_cache() {
     if let Ok(dir) = cache_dir() {
-        prune_dir_to_size(&dir, CACHE_MAX_BYTES);
+        let _pruning = CACHE_PRUNE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active = IN_FLIGHT_CACHE_FILES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(target_os = "macos")]
+        prune_stale_ql_scratch_dirs(&dir);
+        prune_dir_to_size_excluding(&dir, CACHE_MAX_BYTES, &active);
     }
 }
 
 /// Delete the oldest files (by mtime) in `dir` until its total size is at most
 /// `max_bytes`. No-op when already under budget.
+#[cfg(test)]
 fn prune_dir_to_size(dir: &Path, max_bytes: u64) {
+    prune_dir_to_size_excluding(dir, max_bytes, &HashMap::new());
+}
+
+fn prune_dir_to_size_excluding(dir: &Path, max_bytes: u64, protected: &HashMap<PathBuf, usize>) {
     let Ok(read) = fs::read_dir(dir) else {
         return;
     };
@@ -78,7 +99,7 @@ fn prune_dir_to_size(dir: &Path, max_bytes: u64) {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
-            if !meta.is_file() {
+            if !meta.is_file() || protected.contains_key(&e.path()) {
                 return None;
             }
             Some((meta.modified().ok()?, meta.len(), e.path()))
@@ -99,6 +120,97 @@ fn prune_dir_to_size(dir: &Path, max_bytes: u64) {
         }
         if fs::remove_file(&path).is_ok() {
             to_free = to_free.saturating_sub(len);
+        }
+    }
+}
+
+/// Cache entries currently being read or written. Pruning excludes these paths
+/// so it cannot unlink a thumbnail another worker is still using.
+static IN_FLIGHT_CACHE_FILES: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CACHE_PRUNE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+struct CacheFileGuard {
+    paths: [PathBuf; 2],
+}
+
+impl CacheFileGuard {
+    fn new(paths: [PathBuf; 2]) -> Self {
+        let mut active = IN_FLIGHT_CACHE_FILES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for path in &paths {
+            *active.entry(path.clone()).or_default() += 1;
+        }
+        Self { paths }
+    }
+}
+
+impl Drop for CacheFileGuard {
+    fn drop(&mut self) {
+        let mut active = IN_FLIGHT_CACHE_FILES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for path in &self.paths {
+            let remove = match active.get_mut(path) {
+                Some(count) => {
+                    *count = count.saturating_sub(1);
+                    *count == 0
+                }
+                None => false,
+            };
+            if remove {
+                active.remove(path);
+            }
+        }
+    }
+}
+
+/// Pruning is serialized with cache-file registration. Holding the active-path
+/// lock through deletion prevents a new writer from appearing between the
+/// protected-path snapshot and the directory scan.
+fn prune_cache_after_write(dir: &Path) {
+    let _pruning = CACHE_PRUNE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let active = IN_FLIGHT_CACHE_FILES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_dir_to_size_excluding(dir, CACHE_MAX_BYTES, &active);
+}
+
+/// Quick Look renders into hidden cache-local scratch directories. A normal
+/// return cleans them with `TempDirGuard`; recover leftovers from an aborted
+/// process once they are old enough that they cannot belong to a live command.
+#[cfg(target_os = "macos")]
+const QUICK_LOOK_SCRATCH_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+
+#[cfg(target_os = "macos")]
+fn prune_stale_ql_scratch_dirs(dir: &Path) {
+    prune_ql_scratch_dirs_older_than(dir, QUICK_LOOK_SCRATCH_MAX_AGE);
+}
+
+#[cfg(target_os = "macos")]
+fn prune_ql_scratch_dirs_older_than(dir: &Path, max_age: Duration) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let is_ql_scratch = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(".ql-"));
+        let is_stale_dir = entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= max_age);
+        if is_ql_scratch && is_stale_dir {
+            let _ = fs::remove_dir_all(path);
         }
     }
 }
@@ -181,18 +293,25 @@ pub fn thumbnail(path_str: &str, max: u32) -> ThumbResult {
     let jpg = cache.join(format!("{key}.jpg"));
     let png = cache.join(format!("{key}.png"));
 
-    let file = if jpg.is_file() {
-        Some(jpg.clone())
+    let cache_files = CacheFileGuard::new([jpg.clone(), png.clone()]);
+    let (file, wrote_cache) = if jpg.is_file() {
+        (Some(jpg.clone()), false)
     } else if png.is_file() {
-        Some(png.clone())
+        (Some(png.clone()), false)
     } else {
-        generate(path, max, &jpg, &png)
+        (generate(path, max, &jpg, &png), true)
     };
 
-    match file {
-        Some(f) => to_result(path_str, &f).unwrap_or_else(|_| placeholder()),
-        None => placeholder(),
+    // Fully read the cache file before allowing post-write pruning to remove it.
+    let result = file
+        .as_deref()
+        .and_then(|file| to_result(path_str, file).ok());
+    drop(cache_files);
+    if wrote_cache && file.is_some() {
+        prune_cache_after_write(&cache);
     }
+
+    result.unwrap_or_else(placeholder)
 }
 
 fn to_result(path_str: &str, file: &Path) -> Result<ThumbResult, String> {
@@ -356,42 +475,105 @@ fn generate_with_shell(src: &Path, max: u32, out: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+const EXTERNAL_THUMBNAILER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wait for an OS thumbnailing tool without allowing it to monopolize a worker
+/// forever. `wait` after `kill` reaps the child on every timeout/error path.
+#[cfg(target_os = "macos")]
+fn command_succeeds_within_timeout(command: &mut Command) -> bool {
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + EXTERNAL_THUMBNAILER_TIMEOUT;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Removes a Quick Look scratch directory even when its process times out or an
+/// early error returns from `generate_qlmanage`.
+#[cfg(target_os = "macos")]
+struct TempDirGuard(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl TempDirGuard {
+    fn create(path: PathBuf) -> std::io::Result<Self> {
+        fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn generate_sips(src: &Path, max: u32, out: &Path) -> bool {
-    std::process::Command::new("/usr/bin/sips")
-        .args(["-Z", &max.to_string(), "-s", "format", "jpeg"])
+    let mut command = Command::new("/usr/bin/sips");
+    command
+        .arg("-Z")
+        .arg(max.to_string())
+        .args(["-s", "format", "jpeg"])
         .arg(src)
         .arg("--out")
-        .arg(out)
-        .output()
-        .map(|o| o.status.success() && out.is_file())
-        .unwrap_or(false)
+        .arg(out);
+    let succeeded = command_succeeds_within_timeout(&mut command) && out.is_file();
+    if !succeeded {
+        let _ = fs::remove_file(out);
+    }
+    succeeded
 }
 
 #[cfg(target_os = "macos")]
 fn generate_qlmanage(src: &Path, max: u32, out: &Path) -> bool {
     // qlmanage writes "<input name>.png" into an output directory; render into a
     // private temp dir, then move the single produced file to the cache path.
-    let tmp = match out.parent().and_then(|p| {
-        out.file_stem()
-            .map(|s| p.join(format!(".ql-{}", s.to_string_lossy())))
+    let tmp_path = match out.parent().and_then(|p| {
+        out.file_stem().map(|s| {
+            p.join(format!(
+                ".ql-{}-{}",
+                s.to_string_lossy(),
+                uuid::Uuid::new_v4()
+            ))
+        })
     }) {
         Some(d) => d,
         None => return false,
     };
-    if fs::create_dir_all(&tmp).is_err() {
-        return false;
-    }
+    let tmp = match TempDirGuard::create(tmp_path) {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
 
-    let ran = std::process::Command::new("/usr/bin/qlmanage")
-        .args(["-t", "-s", &max.to_string(), "-o"])
-        .arg(&tmp)
-        .arg(src)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let mut command = Command::new("/usr/bin/qlmanage");
+    command
+        .args(["-t", "-s"])
+        .arg(max.to_string())
+        .arg("-o")
+        .arg(tmp.path())
+        .arg(src);
+    let ran = command_succeeds_within_timeout(&mut command);
 
     let produced = if ran {
-        fs::read_dir(&tmp).ok().and_then(|rd| {
+        fs::read_dir(tmp.path()).ok().and_then(|rd| {
             rd.filter_map(|e| e.ok())
                 .map(|e| e.path())
                 .find(|p| p.extension().map(|x| x == "png").unwrap_or(false))
@@ -407,12 +589,35 @@ fn generate_qlmanage(src: &Path, max: u32, out: &Path) -> bool {
         None => false,
     };
 
-    let _ = fs::remove_dir_all(&tmp);
-    moved && out.is_file()
+    let succeeded = moved && out.is_file();
+    if !succeeded {
+        let _ = fs::remove_file(out);
+    }
+    succeeded
+}
+
+/// The image crate must decode the source before it can resize. These limits
+/// bound each of the eight concurrent preview workers to a practical amount of
+/// memory while still admitting ordinary camera-sized images.
+const MAX_THUMBNAIL_DECODE_DIMENSION: u32 = 8_192;
+const MAX_THUMBNAIL_DECODE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn thumbnail_decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_THUMBNAIL_DECODE_DIMENSION);
+    limits.max_image_height = Some(MAX_THUMBNAIL_DECODE_DIMENSION);
+    limits.max_alloc = Some(MAX_THUMBNAIL_DECODE_BYTES);
+    limits
 }
 
 fn generate_with_image(src: &Path, max: u32, out: &Path) -> bool {
-    let decoded = match image::open(src) {
+    let mut reader = match image::ImageReader::open(src) {
+        Ok(reader) => reader,
+        Err(_) => return false,
+    };
+    // `decode` checks the dimensions/allocation limits before reading pixels.
+    reader.limits(thumbnail_decode_limits());
+    let decoded = match reader.decode() {
         Ok(img) => img,
         Err(_) => return false,
     };
@@ -423,20 +628,34 @@ fn generate_with_image(src: &Path, max: u32, out: &Path) -> bool {
     rgb.save_with_format(out, image::ImageFormat::Jpeg).is_ok()
 }
 
-/// Scan `src` for embedded JPEG SOI markers (`FF D8 FF`) using a small rolling
-/// buffer, so we never hold the whole (often 20-100MB) RAW file in memory.
-/// Returns the absolute byte offset of each embedded JPEG stream. Byte stuffing
-/// means a real `FF D8 FF` never appears inside JPEG entropy data, so these
-/// offsets reliably mark the start of each embedded stream (false positives from
-/// raw sensor data are rejected later when dimension parsing fails).
+/// Scan `src` for embedded JPEG headers using a small rolling buffer, so we
+/// never hold the whole (often 20-100MB) RAW file in memory. Only a bounded
+/// number of plausible headers are retained; a malformed RAW cannot grow this
+/// vector or force unlimited header probes.
+const MAX_RAW_JPEG_CANDIDATES: usize = 16;
+
+fn is_jpeg_header_marker(marker: u8) -> bool {
+    matches!(
+        marker,
+        0xC0..=0xC3
+            | 0xC5..=0xC7
+            | 0xC9..=0xCB
+            | 0xCD..=0xCF
+            | 0xDB
+            | 0xDD
+            | 0xE0..=0xEF
+            | 0xFE
+    )
+}
+
 fn find_embedded_jpeg_offsets(src: &Path) -> Vec<u64> {
     let mut file = match fs::File::open(src) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
     const CHUNK: usize = 1 << 16; // 64 KiB
-    let mut buf = vec![0u8; CHUNK + 2]; // +2 so a boundary-straddling marker survives
-    let mut offsets = Vec::new();
+    let mut buf = vec![0u8; CHUNK + 3]; // retained bytes cover a split JPEG header
+    let mut offsets = Vec::with_capacity(MAX_RAW_JPEG_CANDIDATES);
     let mut base: u64 = 0; // absolute offset of buf[0]
     let mut carry = 0usize; // bytes retained from the previous chunk at buf[0..carry]
     loop {
@@ -447,15 +666,22 @@ fn find_embedded_jpeg_offsets(src: &Path) -> Vec<u64> {
         };
         let filled = carry + n;
         let mut i = 0usize;
-        while i + 3 <= filled {
-            if buf[i] == 0xFF && buf[i + 1] == 0xD8 && buf[i + 2] == 0xFF {
+        while i + 4 <= filled {
+            if buf[i] == 0xFF
+                && buf[i + 1] == 0xD8
+                && buf[i + 2] == 0xFF
+                && is_jpeg_header_marker(buf[i + 3])
+            {
                 offsets.push(base + i as u64);
+                if offsets.len() == MAX_RAW_JPEG_CANDIDATES {
+                    return offsets;
+                }
             }
             i += 1;
         }
-        // Retain the last 2 bytes so a marker split across the chunk boundary is
-        // still matched on the next pass.
-        let keep = filled.min(2);
+        // Retain the last 3 bytes so an SOI plus following marker split across
+        // the chunk boundary is still validated on the next pass.
+        let keep = filled.min(3);
         let drop = filled - keep;
         buf.copy_within(drop..filled, 0);
         base += drop as u64;
@@ -466,9 +692,10 @@ fn find_embedded_jpeg_offsets(src: &Path) -> Vec<u64> {
 
 /// Read up to `len` bytes from `src` starting at `offset`, capping the request so
 /// a corrupt length can't blow up memory. Real camera previews are a few MB.
+const MAX_RAW_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
+
 fn read_file_range(src: &Path, offset: u64, len: usize) -> Option<Vec<u8>> {
-    const MAX_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
-    let len = len.min(MAX_PREVIEW_BYTES);
+    let len = len.min(MAX_RAW_PREVIEW_BYTES);
     let mut file = fs::File::open(src).ok()?;
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut buf = vec![0u8; len];
@@ -484,10 +711,22 @@ fn read_file_range(src: &Path, offset: u64, len: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// Decode the largest embedded JPEG preview from a camera RAW file and write a
-/// JPEG thumbnail. Pure Rust (no RAW decoder); works on every platform. Memory
-/// is bounded to a small header probe per candidate plus one preview read for
-/// the chosen stream — never the whole RAW file.
+fn jpeg_dimensions(header: &[u8]) -> Option<(u32, u32)> {
+    let mut reader = image::ImageReader::with_format(Cursor::new(header), image::ImageFormat::Jpeg);
+    reader.limits(thumbnail_decode_limits());
+    reader.into_dimensions().ok()
+}
+
+fn decode_jpeg_preview(bytes: &[u8]) -> Option<image::DynamicImage> {
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Jpeg);
+    reader.limits(thumbnail_decode_limits());
+    reader.decode().ok()
+}
+
+/// Decode the largest eligible embedded JPEG preview from a camera RAW file and
+/// write a JPEG thumbnail. Pure Rust (no RAW decoder); works on every platform.
+/// Memory is bounded to a small header probe per bounded candidate plus one
+/// preview read at a time — never the whole RAW file.
 fn generate_with_raw_preview(src: &Path, max: u32, out: &Path) -> bool {
     let offsets = find_embedded_jpeg_offsets(src);
     if offsets.is_empty() {
@@ -495,49 +734,51 @@ fn generate_with_raw_preview(src: &Path, max: u32, out: &Path) -> bool {
     }
     let file_len = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
 
-    // Selection: read only a small header per candidate to get its dimensions
-    // (the JPEG SOF marker sits near the start), never the full stream.
+    // The JPEG SOF marker sits near the start, so rank bounded candidates without
+    // reading any full stream. If the largest later fails to decode, fall back to
+    // the next preview instead of discarding a usable camera thumbnail.
     const PROBE_BYTES: usize = 256 * 1024;
-    let mut best: Option<(u64, u64)> = None; // (pixel area, offset)
+    let mut candidates = Vec::with_capacity(offsets.len());
     for &off in &offsets {
         let header = match read_file_range(src, off, PROBE_BYTES) {
-            Some(b) if !b.is_empty() => b,
+            Some(bytes) if !bytes.is_empty() => bytes,
             _ => continue,
         };
-        if let Ok((w, h)) =
-            image::ImageReader::with_format(Cursor::new(&header), image::ImageFormat::Jpeg)
-                .into_dimensions()
-        {
-            let area = u64::from(w) * u64::from(h);
-            if best.is_none_or(|(a, _)| area > a) {
-                best = Some((area, off));
-            }
+        if let Some((w, h)) = jpeg_dimensions(&header) {
+            candidates.push((u64::from(w) * u64::from(h), off));
         }
     }
+    candidates.sort_unstable_by(|(left, _), (right, _)| right.cmp(left));
 
-    let Some((_, off)) = best else {
-        return false;
-    };
-    // Read the chosen stream up to the next embedded marker (or EOF). Trailing
-    // raw sensor bytes are harmless: the JPEG decoder stops at the EOI marker.
-    let end = offsets
-        .iter()
-        .copied()
-        .find(|&o| o > off)
-        .unwrap_or(file_len);
-    let span = end.saturating_sub(off).max(1) as usize;
-    let bytes = match read_file_range(src, off, span) {
-        Some(b) => b,
-        None => return false,
-    };
-    let decoded = match image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg) {
-        Ok(img) => img,
-        Err(_) => return false,
-    };
-    let thumb = decoded.thumbnail(max, max);
-    // JPEG has no alpha channel; flatten to RGB before encoding.
-    let rgb = image::DynamicImage::ImageRgb8(thumb.to_rgb8());
-    rgb.save_with_format(out, image::ImageFormat::Jpeg).is_ok()
+    let _ = fs::remove_file(out);
+    for (_, off) in candidates {
+        // Read the chosen stream up to the next embedded marker (or EOF).
+        // Trailing raw sensor bytes are harmless: the JPEG decoder stops at EOI.
+        let end = offsets
+            .iter()
+            .copied()
+            .find(|&other| other > off)
+            .unwrap_or(file_len);
+        let span = end
+            .saturating_sub(off)
+            .max(1)
+            .min(MAX_RAW_PREVIEW_BYTES as u64) as usize;
+        let bytes = match read_file_range(src, off, span) {
+            Some(bytes) => bytes,
+            None => continue,
+        };
+        let Some(decoded) = decode_jpeg_preview(&bytes) else {
+            continue;
+        };
+        let thumb = decoded.thumbnail(max, max);
+        // JPEG has no alpha channel; flatten to RGB before encoding.
+        let rgb = image::DynamicImage::ImageRgb8(thumb.to_rgb8());
+        if rgb.save_with_format(out, image::ImageFormat::Jpeg).is_ok() {
+            return true;
+        }
+        let _ = fs::remove_file(out);
+    }
+    false
 }
 
 fn read_orientation(src: &Path) -> Option<u32> {
@@ -576,6 +817,22 @@ mod tests {
         let (w, h) = image::image_dimensions(&out).unwrap();
         assert!(w <= 64 && h <= 64 && w > 0 && h > 0);
         let _ = fs::remove_file(&out);
+    }
+
+    #[test]
+    fn image_backend_rejects_source_over_decode_dimension_limit() {
+        let src =
+            std::env::temp_dir().join(format!("immich_shuttle_oversize_{}.png", Uuid::new_v4()));
+        let out =
+            std::env::temp_dir().join(format!("immich_shuttle_oversize_{}.jpg", Uuid::new_v4()));
+        image::RgbImage::new(MAX_THUMBNAIL_DECODE_DIMENSION + 1, 1)
+            .save(&src)
+            .unwrap();
+
+        assert!(!generate_with_image(&src, 64, &out));
+        assert!(!out.exists());
+
+        let _ = fs::remove_file(&src);
     }
 
     #[test]
@@ -641,6 +898,25 @@ mod tests {
             "should find the thumbnail SOI"
         );
         assert!(offsets.contains(&big_off), "should find the preview SOI");
+    }
+
+    #[test]
+    fn raw_jpeg_candidate_scan_validates_and_caps_headers() {
+        let mut data = vec![0xFF, 0xD8, 0xFF, 0x00]; // not a valid JPEG header marker
+        for _ in 0..(MAX_RAW_JPEG_CANDIDATES + 4) {
+            data.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0]);
+        }
+        let src = std::env::temp_dir().join(format!(
+            "immich_shuttle_candidate_limit_{}.cr2",
+            Uuid::new_v4()
+        ));
+        fs::write(&src, data).unwrap();
+
+        let offsets = find_embedded_jpeg_offsets(&src);
+
+        let _ = fs::remove_file(&src);
+        assert_eq!(offsets.len(), MAX_RAW_JPEG_CANDIDATES);
+        assert!(!offsets.contains(&0));
     }
 
     #[test]
@@ -742,6 +1018,22 @@ mod tests {
             .sum();
         assert!(total <= 2560);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_quick_look_scratch_dirs_are_removed_without_touching_other_entries() {
+        let dir = std::env::temp_dir().join(format!("immich_shuttle_ql_prune_{}", Uuid::new_v4()));
+        let scratch = dir.join(".ql-abandoned");
+        let unrelated = dir.join(".cache-kept");
+        fs::create_dir_all(&scratch).unwrap();
+        fs::create_dir(&unrelated).unwrap();
+
+        prune_ql_scratch_dirs_older_than(&dir, std::time::Duration::ZERO);
+
+        assert!(!scratch.exists());
+        assert!(unrelated.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

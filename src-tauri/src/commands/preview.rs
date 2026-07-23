@@ -12,7 +12,8 @@ pub async fn preview_thumbnails(paths: Vec<String>) -> Result<Vec<ThumbResult>, 
             .iter()
             .cloned()
             .map(|path| {
-                tauri::async_runtime::spawn_blocking(move || {
+                let fallback_path = path.clone();
+                let handle = tauri::async_runtime::spawn_blocking(move || {
                     // Only read files under a folder the user selected as a
                     // source; reject arbitrary paths from the IPC boundary.
                     if crate::services::source_guard::is_within_approved(&path) {
@@ -25,13 +26,20 @@ pub async fn preview_thumbnails(paths: Vec<String>) -> Result<Vec<ThumbResult>, 
                             height: 0,
                         }
                     }
-                })
+                });
+                (fallback_path, handle)
             })
             .collect();
 
-        for handle in handles {
-            if let Ok(result) = handle.await {
-                results.push(result);
+        for (path, handle) in handles {
+            match handle.await {
+                Ok(result) => results.push(result),
+                Err(_) => results.push(ThumbResult {
+                    path,
+                    data_url: None,
+                    width: 0,
+                    height: 0,
+                }),
             }
         }
     }
@@ -62,20 +70,26 @@ pub async fn preview_dates(paths: Vec<String>) -> Result<Vec<CaptureDate>, Strin
             .iter()
             .cloned()
             .map(|path| {
-                tauri::async_runtime::spawn_blocking(move || CaptureDate {
+                let fallback_path = path.clone();
+                let handle = tauri::async_runtime::spawn_blocking(move || CaptureDate {
                     captured_at: if crate::services::source_guard::is_within_approved(&path) {
                         capture_date(&path)
                     } else {
                         None
                     },
                     path,
-                })
+                });
+                (fallback_path, handle)
             })
             .collect();
 
-        for handle in handles {
-            if let Ok(result) = handle.await {
-                results.push(result);
+        for (path, handle) in handles {
+            match handle.await {
+                Ok(result) => results.push(result),
+                Err(_) => results.push(CaptureDate {
+                    path,
+                    captured_at: None,
+                }),
             }
         }
     }
