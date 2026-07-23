@@ -2,18 +2,49 @@
 
 ## Unreleased
 
-### Fixes
-- **Duplicate files are now wiped from the source drive.** Files the server already had ("server has duplicate") were counted but never added to the post-import wipe candidate list, so they were left behind on the SD card even when the user chose to delete originals. They now join the candidate list (still gated by the per-file SHA-1 existence check before any deletion); the `uploaded` counter stays a separate tally.
-- **Import history can always be reset.** A corrupt/unparseable history store no longer blocks "Clear history" (it falls back to an empty store and overwrites the bad file), and a panic while the store lock is held no longer permanently disables all history/metadata operations for the session (the lock recovers from poisoning).
-- **A single unstageable file no longer aborts a selected-subset import** — staging skips the failed file and continues, failing the run only if nothing could be staged. Same-named files chosen from drives with no common ancestor no longer overwrite each other in the staging dir (collisions are nested under a numeric subfolder).
-- **Album creation survives a failed share.** If sharing or public-link creation fails after the album is created on the server, the album is still registered and selected in the UI (no orphaned/duplicate albums) with a specific warning, instead of throwing a generic error and desyncing state.
-- **Date-range preview filtering is timezone-correct.** Day boundaries are parsed as UTC to match the backend's UTC EXIF capture epochs, so photos captured near midnight are no longer filtered into the wrong day in browsers outside UTC.
-- **Album/user/server-info commands honor LAN/WAN failover**, resolving the reachable endpoint like imports do, instead of always hitting the primary URL and failing when only a failover server is up.
-- **Concurrent profile edits no longer lose data**: profile upsert/delete now serialize their read-modify-write of `config.json`.
-- **Auto-import no longer suppresses sibling cards.** Inserting two cards at once, or a card while another prompt is open, previously marked the extra cards "seen" forever; now only the surfaced card is marked seen and the others prompt in turn.
-- **Live import progress no longer flickers.** The 2-second queue poll took the field-wise maximum of polled vs. event-driven progress for running jobs, so it can't reset the bar/ETA to the stale start-of-run value.
-- Immich API calls try the `/api` path first, eliminating a wasted request (a 404 or HTML 200) that previously preceded every metadata/validation call.
-- The persistent `app.log` is excluded from run-log rotation, so it can't be deleted as the oldest file.
+## v0.4.0 - 2026-07-23
+
+### Import safety & data integrity
+- **A local original is never deleted when the server's only copy is in the trash.** Verify-before-wipe now excludes `bulk-upload-check` results flagged `isTrashed`; previously a checksum whose sole server copy was soft-deleted counted as "safely uploaded", so the last live original was wiped and lost once the server trash was emptied.
+- **Files the server already holds now join the post-import wipe candidate list** (still gated by the per-file SHA-1 existence check before any deletion); the `uploaded` counter stays a separate tally.
+- **A single unstageable file no longer aborts a selected-subset import** — staging skips the failed file and continues, failing the run only if nothing could be staged. Same-named files chosen from drives with no common ancestor no longer overwrite each other (collisions nest under a numeric subfolder).
+- **Staging is now cancellable.** Clicking Cancel during a large selected-subset import stops the copy-fallback staging loop instead of running it to completion before the uploader notices.
+
+### Scanning & preview
+- **Source scans stream in with a live "N found" count and a Cancel button** instead of freezing behind one all-at-once result, so large libraries stay responsive and a scan of a slow/huge tree can be stopped.
+- **Overlapping source folders are de-duplicated.** Selecting a parent and its child no longer scans or uploads the shared files twice (roots are collapsed and files de-duplicated by canonical path).
+- **Closing or replacing the preview cancels its in-flight backend work**, so rapidly opening/closing previews on a big folder no longer keeps generating thumbnails and dates nobody will see.
+- **Date-range preview filtering is timezone-correct.** Day boundaries are parsed as UTC to match the backend's UTC EXIF epochs, so photos captured near midnight aren't filtered into the wrong day outside UTC.
+
+### Reliability
+- **Crash-safe cleanup of per-run temp artifacts**, with a cross-process ownership lease: interrupted imports no longer leave staging dirs, API-key config dirs, or run logs behind, and startup cleanup uses an advisory lock so a second running copy of the app can never delete a live import's files.
+- **A stalled network/USB mount no longer hides other cards.** Each removable-device DCIM probe is bounded (500 ms), so one sleeping SMB/NFS/external drive can't block detection of a freshly-inserted SD card.
+- **The upload sidecar is always reaped and teardown can't hang**: cancelling, an unexpected event-channel close, or a sidecar error now kill and wait for the immich-go child within a bounded window instead of leaking a zombie or blocking the quit path.
+- **Import lifecycle hardening**: only one import starts at a time; a job is published only after its fallible setup succeeds (no ghost "running" jobs); cancel/retry are guarded by job status; and in-memory job history and retry inputs are bounded.
+- **Thumbnail work is memory- and time-bounded**: explicit decode dimension/allocation limits, a capped RAW embedded-JPEG scan, timed-out `sips`/`qlmanage` subprocesses (with partial-output cleanup), and cache pruning that runs during a session without evicting in-flight files.
+- **Live import progress no longer flickers** — the queue poll can't reset a running job's bar/ETA to a stale start-of-run value, and a late progress event can't revive a finished job.
+- **Auto-import no longer suppresses sibling cards.** Inserting two cards at once (or one while a prompt is open) now prompts each in turn instead of marking the extras "seen" forever.
+- **Import history can always be reset.** A corrupt/unparseable store no longer blocks "Clear history" (it overwrites the bad file), and a panic while the store lock is held no longer disables history for the session (the lock recovers from poisoning). "Clear history" now also clears the per-source "last imported" metadata so the badge doesn't contradict a cleared history.
+
+### Correctness
+- **LAN/WAN URLs are normalized before they reach immich-go.** A LAN/WAN address with a trailing slash or `/api` suffix used to pass the connection probe (which normalizes internally) but break the sidecar; both are now normalized at save time.
+- **immich-go per-file paths resolve against your source folders**, so a source directory containing a colon on macOS/Linux is parsed correctly and its files are verified/wiped instead of being silently skipped.
+- **Windows verbatim UNC paths no longer break "last imported"** — a canonicalized `\\?\C:\…` path and its non-canonical fallback now produce the same store key.
+- **Config and history temp files are cleaned up on failed writes** instead of leaking `config.json.*`/`store.json.tmp` in the app data directory.
+- **Concurrent profile edits no longer lose data**: profile upsert/delete serialize their keychain change together with the `config.json` read-modify-write, so two simultaneous saves of the same profile can't clobber each other's key.
+- **Album/user/server-info commands honor LAN/WAN failover**, resolving the reachable endpoint like imports do, instead of always hitting the primary URL.
+- **Immich API calls try the `/api` path first**, abort the candidate loop on any non-404 (so an authentic 401/403 surfaces), and never replay a non-idempotent write (album/share creation) on a transport error, preventing duplicate albums/links.
+- **An unreadable config surfaces an error instead of looking empty**, so a permissions/IO failure isn't mistaken for first-run and overwritten.
+- **`app.log` is excluded from run-log rotation and size-capped** (trimmed to the newest lines) so it can neither be deleted as the oldest file nor grow without bound; log parsing is char-boundary-safe and error counts are per-file.
+
+### Security & hardening
+- **Path authorization tightened** on the preview/scan/staging boundary (with regression tests confirming a sibling-prefix path like `/src-evil` is not treated as inside `/src`), and the approved-source-root allowlist is bounded and reset on a fresh selection.
+- **Per-run API-key config carries restrictive permissions and an ownership lease**, and stale credential-bearing temp dirs from interrupted runs are pruned at startup.
+
+### Maintenance
+- **keyring 3 → 4**: the macOS credential path now links a single `security-framework` (3.7.0), removing the dual-major (2.x + 3.x) split that shipped in the lockfile. API is unchanged; not-found handling uses the typed `Error::NoEntry` variant.
+- **Frontend bundle split** into separate vendor/tauri/svelte chunks for a smaller initial parse and independent caching.
+- **Aligned the `@tauri-apps/*` npm packages (api 2.11.1, CLI 2.11.4) with the Rust `tauri` 2.11 crate**, fixing the tauri-cli version-mismatch that blocked `tauri build`/`dev`.
 
 ## v0.3.0 - 2026-07-12
 
