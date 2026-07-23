@@ -1,4 +1,13 @@
-use std::{fs, io::Write, path::PathBuf};
+use std::{
+    fs,
+    io::Write,
+    path::PathBuf,
+    sync::{LazyLock, Mutex},
+};
+
+/// Serializes append+trim so a concurrent append can't be clobbered by another
+/// thread's in-place trim rewrite (read-old, write-truncated) race.
+static LOG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 pub fn logs_dir() -> Result<PathBuf, String> {
     let base = dirs::data_local_dir()
@@ -31,6 +40,9 @@ pub fn read_recent(file_name: &str, max_lines: usize) -> Result<String, String> 
 }
 
 pub fn append_log(file_name: &str, line: &str) -> Result<(), String> {
+    let _guard = LOG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = logs_dir()?.join(file_name);
     let mut file = fs::OpenOptions::new()
         .create(true)

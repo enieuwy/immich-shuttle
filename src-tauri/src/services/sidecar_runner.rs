@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -9,8 +10,11 @@ use std::{
     time::Duration,
 };
 
-use tauri::{AppHandle, Emitter};
-use tauri_plugin_shell::{process::CommandEvent, ShellExt};
+use tauri::{async_runtime::Receiver, AppHandle, Emitter};
+use tauri_plugin_shell::{
+    process::{CommandChild, CommandEvent},
+    ShellExt,
+};
 use uuid::Uuid;
 
 use crate::models::job::Organization;
@@ -23,6 +27,10 @@ pub struct SidecarResult {
     /// Whether immich-go exited with a non-zero status.
     pub exit_nonzero: bool,
 }
+
+/// Keep enough stderr context to diagnose a failed run without retaining an
+/// unbounded stream from a noisy sidecar.
+const MAX_STDERR_LINES: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct UploadRequest {
@@ -137,9 +145,9 @@ impl ProgressReader {
         }
     }
 
-    /// Fold newly-appended bytes (through the last complete line) and return the
-    /// current snapshot.
-    fn poll(&mut self) -> RunProgress {
+    /// Fold newly-appended bytes (through the last complete line) and return a
+    /// lightweight view for the current UI update.
+    fn poll(&mut self) -> (crate::models::job::JobProgress, Option<&str>) {
         if let Ok(mut file) = fs::File::open(&self.log_path) {
             if file.seek(SeekFrom::Start(self.offset)).is_ok() {
                 let mut buf = Vec::new();
@@ -153,7 +161,7 @@ impl ProgressReader {
                 }
             }
         }
-        self.acc.snapshot()
+        self.acc.progress_view()
     }
 
     /// Authoritative final snapshot: drain any remaining bytes and flush a
@@ -170,9 +178,14 @@ impl ProgressReader {
 }
 
 /// Emit a progress snapshot to the frontend.
-fn emit_progress(app: &AppHandle, job_id: &str, run: &RunProgress) {
-    let current_file = run.completed_paths.last().and_then(|p| {
-        Path::new(p)
+fn emit_progress(
+    app: &AppHandle,
+    job_id: &str,
+    progress: &crate::models::job::JobProgress,
+    current_path: Option<&str>,
+) {
+    let current_file = current_path.and_then(|path| {
+        Path::new(path)
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
     });
@@ -180,11 +193,44 @@ fn emit_progress(app: &AppHandle, job_id: &str, run: &RunProgress) {
         "import-progress",
         serde_json::json!({
             "job_id": job_id,
-            "progress": run.progress,
-            "parsed_progress": run.progress,
+            "progress": progress,
+            "parsed_progress": progress,
             "current_file": current_file,
         }),
     );
+}
+
+/// Stop a sidecar and wait for the plugin's background waiter to confirm that
+/// it reaped the process. `CommandChild` exposes no `wait`; its `Terminated`
+/// event is the lifecycle acknowledgement.
+async fn kill_and_reap(
+    child: &mut Option<CommandChild>,
+    rx: &mut Receiver<CommandEvent>,
+) -> Result<(), String> {
+    let Some(running_child) = child.take() else {
+        return Ok(());
+    };
+    running_child
+        .kill()
+        .map_err(|error| format!("could not kill sidecar: {error}"))?;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut event_error = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                CommandEvent::Terminated(_) => return Ok(()),
+                CommandEvent::Error(error) => event_error = Some(error),
+                _ => {}
+            }
+        }
+
+        Err(match event_error {
+            Some(error) => format!("sidecar failed while waiting to terminate: {error}"),
+            None => "sidecar event channel closed before termination was reported".to_string(),
+        })
+    })
+    .await
+    .map_err(|_| "timed out waiting for sidecar termination after kill".to_string())?
 }
 
 /// Build the immich-go `upload from-folder` argument vector for a run. Pure (no
@@ -284,10 +330,9 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
     let (mut rx, child) = sidecar
         .spawn()
         .map_err(|e| format!("Could not spawn immich-go sidecar: {e}"))?;
-    let child = Arc::new(tokio::sync::Mutex::new(Some(child)));
+    let mut child = Some(child);
 
-    let mut error_lines: Vec<String> = Vec::new();
-    let mut exit_nonzero = false;
+    let mut error_lines = VecDeque::with_capacity(MAX_STDERR_LINES);
 
     // immich-go's --no-ui stdout is a `\r`-refreshed aggregate that never
     // line-flushes through the pipe, so progress is polled from the run log
@@ -297,45 +342,64 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    loop {
+    let exit_nonzero = loop {
         if request.cancel_flag.load(Ordering::Relaxed) {
-            if let Some(running_child) = child.lock().await.take() {
-                let _ = running_child.kill();
-            }
+            kill_and_reap(&mut child, &mut rx)
+                .await
+                .map_err(|error| format!("Could not cancel immich-go sidecar: {error}"))?;
             return Err("Cancelled by user".to_string());
         }
 
         tokio::select! {
             _ = ticker.tick() => {
-                let snapshot = progress.poll();
-                emit_progress(&app, &request.job_id, &snapshot);
+                let (snapshot, current_path) = progress.poll();
+                emit_progress(&app, &request.job_id, &snapshot, current_path);
             }
             maybe_event = rx.recv() => {
                 match maybe_event {
-                    None => break,
+                    None => {
+                        let reap_error = kill_and_reap(&mut child, &mut rx).await.err();
+                        let detail = reap_error
+                            .unwrap_or_else(|| "sidecar stopped without a termination event".to_string());
+                        return Err(format!("immich-go event channel closed unexpectedly: {detail}"));
+                    }
                     Some(CommandEvent::Stderr(line_bytes)) => {
                         let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
                         if !line.is_empty() {
-                            error_lines.push(line);
+                            if error_lines.len() == MAX_STDERR_LINES {
+                                error_lines.pop_front();
+                            }
+                            error_lines.push_back(line);
                         }
                     }
                     Some(CommandEvent::Terminated(payload)) => {
-                        let _ = child.lock().await.take();
-                        exit_nonzero = payload.code.unwrap_or(1) != 0;
-                        break;
+                        let _ = child.take();
+                        break payload.code.unwrap_or(1) != 0;
+                    }
+                    Some(CommandEvent::Error(error)) => {
+                        let reap_error = kill_and_reap(&mut child, &mut rx).await.err();
+                        let detail = reap_error
+                            .map(|reap_error| format!("; {reap_error}"))
+                            .unwrap_or_default();
+                        return Err(format!("immich-go sidecar event failed: {error}{detail}"));
                     }
                     Some(_) => {}
                 }
             }
         }
-    }
+    };
 
     // Final authoritative snapshot so the UI lands on the run log's last counts.
     let snapshot = progress.finish();
-    emit_progress(&app, &request.job_id, &snapshot);
+    emit_progress(
+        &app,
+        &request.job_id,
+        &snapshot.progress,
+        snapshot.completed_paths.last().map(String::as_str),
+    );
 
     Ok(SidecarResult {
-        error_lines,
+        error_lines: error_lines.into_iter().collect(),
         exit_nonzero,
     })
 }

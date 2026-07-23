@@ -5,6 +5,10 @@ use crate::models::job::{FileError, JobProgress};
 /// Maximum number of per-file errors retained from a single run, to keep the job
 /// payload and the UI bounded on imports that fail en masse.
 const MAX_FILE_ERRORS: usize = 100;
+/// Maximum number of distinct failed paths tracked for progress. Progress error
+/// counts saturate at this limit so a pathological run cannot retain unbounded
+/// path strings.
+const MAX_TRACKED_ERROR_PATHS: usize = 10_000;
 
 /// Progress recovered from an immich-go run log.
 ///
@@ -91,18 +95,24 @@ fn is_windows_drive_prefix(s: &str) -> bool {
 /// whitespace so callers' `starts_with` checks skip them.
 fn info_line_message(line: &str) -> Option<&str> {
     const MARKER: &str = " INF ";
-    if line.len() < 19 + MARKER.len() || !line.is_char_boundary(19) {
+    let marker_end = 19 + MARKER.len();
+    if line.len() < marker_end || !line.is_char_boundary(19) || !line.is_char_boundary(marker_end) {
         return None;
     }
-    if &line[19..19 + MARKER.len()] != MARKER {
+    if &line[19..marker_end] != MARKER {
         return None;
     }
-    Some(&line[19 + MARKER.len()..])
+    Some(&line[marker_end..])
 }
 
 /// console-slog (NoColor) error line prefix: `YYYY-MM-DD HH:MM:SS ERR `.
 fn is_error_line(line: &str) -> bool {
-    line.len() >= 24 && line.is_char_boundary(19) && &line[19..24] == " ERR "
+    const MARKER: &str = " ERR ";
+    let marker_end = 19 + MARKER.len();
+    line.len() >= marker_end
+        && line.is_char_boundary(19)
+        && line.is_char_boundary(marker_end)
+        && &line[19..marker_end] == MARKER
 }
 
 /// Incremental accumulator for run-log progress.
@@ -122,7 +132,12 @@ pub struct ProgressAccumulator {
     // counter. Deletion is still gated by a SHA-1 existence check downstream.
     completed_paths: Vec<String>,
     seen_paths: HashSet<String>,
-    error_files: HashSet<String>,
+    /// Distinct per-file failures, bounded to prevent a pathological run from
+    /// retaining an unbounded number of path strings.
+    failed_paths: HashSet<String>,
+    /// Number of distinct failed paths tracked, capped at
+    /// `MAX_TRACKED_ERROR_PATHS`.
+    errors: u32,
     /// A trailing line not yet terminated by '\n'; reparsed once its rest arrives.
     pending: String,
 }
@@ -151,14 +166,25 @@ impl ProgressAccumulator {
         }
     }
 
-    pub fn snapshot(&self) -> RunProgress {
-        RunProgress {
-            progress: JobProgress {
+    /// Lightweight view for a live progress tick. It avoids cloning the full
+    /// completed path list, which is only needed after the run for wipe
+    /// accounting.
+    pub fn progress_view(&self) -> (JobProgress, Option<&str>) {
+        (
+            JobProgress {
                 total: self.total,
                 uploaded: self.uploaded,
                 duplicates: self.duplicates,
-                errors: self.error_files.len() as u32,
+                errors: self.errors,
             },
+            self.completed_paths.last().map(String::as_str),
+        )
+    }
+
+    pub fn snapshot(&self) -> RunProgress {
+        let (progress, _) = self.progress_view();
+        RunProgress {
+            progress,
             completed_paths: self.completed_paths.clone(),
         }
     }
@@ -168,7 +194,11 @@ impl ProgressAccumulator {
             if let Some(file) = attr_value(line, "file", &["error", "reason", "discovered_at"])
                 .filter(|f| !f.is_empty())
             {
-                self.error_files.insert(file);
+                if self.failed_paths.len() < MAX_TRACKED_ERROR_PATHS
+                    && self.failed_paths.insert(file)
+                {
+                    self.errors = self.errors.saturating_add(1);
+                }
             }
             return;
         }
@@ -205,7 +235,7 @@ impl ProgressAccumulator {
 /// - `discovered image` / `discovered video` -> total assets found
 /// - `uploaded successfully` -> uploaded (de-duplicated, with real fs path)
 /// - `server has duplicate` -> duplicates already on the server
-/// - ERROR lines carrying a `file=` -> per-file upload errors (de-duplicated)
+/// - ERROR lines carrying a `file=` -> per-file upload error events
 pub fn parse_run_progress(contents: &str) -> RunProgress {
     let mut acc = ProgressAccumulator::new();
     acc.push_chunk(contents);
@@ -248,7 +278,9 @@ pub fn parse_error_log(contents: &str) -> Vec<FileError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_error_log, parse_run_progress, ProgressAccumulator};
+    use super::{
+        info_line_message, is_error_line, parse_error_log, parse_run_progress, ProgressAccumulator,
+    };
 
     // A realistic console-slog run-log slice captured from immich-go v0.32.0
     // `--no-ui --log-level DEBUG` output: per-asset events plus the directory
@@ -374,6 +406,13 @@ mod tests {
     }
 
     #[test]
+    fn progress_deduplicates_repeated_error_paths() {
+        let log = "2026-06-22 14:30:01 ERR server error file=/x/IMG_0003.JPG error=first\n\
+2026-06-22 14:30:09 ERR incomplete processing file=/x/IMG_0003.JPG error=second";
+        assert_eq!(parse_run_progress(log).progress.errors, 1);
+    }
+
+    #[test]
     fn caps_at_one_hundred_errors() {
         let mut log = String::new();
         for i in 0..150 {
@@ -414,5 +453,15 @@ mod tests {
         assert_eq!(acc.snapshot().progress.uploaded, 0);
         acc.finish();
         assert_eq!(acc.snapshot().progress.uploaded, 1);
+    }
+
+    #[test]
+    fn malformed_non_ascii_level_boundary_is_not_an_event() {
+        // The byte offset after a console-slog level token lands inside `é`.
+        // Parsing this must reject the line rather than slicing at a non-boundary.
+        let line = "1234567890123456789abcdé ERR file=Card:IMG_0001.JPG";
+        assert!(!is_error_line(line));
+        assert_eq!(info_line_message(line), None);
+        assert_eq!(parse_run_progress(line).progress.errors, 0);
     }
 }
