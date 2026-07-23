@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { Link, Search, Plus, X, Images, KeyRound } from "@lucide/svelte";
+  import { Link, Search, Plus, X, Images, KeyRound, ExternalLink } from "@lucide/svelte";
   import { userDisplayNames } from "$lib/users";
 
   import { albumsState } from "$lib/state/albums";
   import { activeProfile } from "$lib/state/profiles";
+  import { openInImmich } from "$lib/api";
   import { Button } from "$lib/components/ui/button";
   import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "$lib/components/ui/dialog";
   import { Input } from "$lib/components/ui/input";
@@ -50,6 +51,12 @@
       selectedShareUserIds = [...selectedShareUserIds, userId];
     }
   }
+
+  async function openAlbumInImmich(albumId: string) {
+    const profile = $activeProfile;
+    if (!profile) return;
+    await openInImmich(profile.id, albumId);
+  }
 </script>
 
 <Card class="flex flex-col gap-4 py-4">
@@ -87,6 +94,14 @@
             </Badge>
           {/if}
         {/each}
+        <Button
+          variant="ghost"
+          size="sm"
+          class="text-primary hover:bg-primary/10"
+          onclick={() => openAlbumInImmich($albumsState.selectedAlbumIds[0])}
+        >
+          <ExternalLink class="mr-1 h-3.5 w-3.5" /> Open in Immich
+        </Button>
       {:else}
         <Badge variant="outline" class="text-muted-foreground">No album selected</Badge>
       {/if}

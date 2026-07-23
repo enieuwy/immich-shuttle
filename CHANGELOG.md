@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### UI
+- **The footer action bar is always visible.** The app now pins to the viewport height with the content area scrolling internally, so the footer (import stats, Logs, Start Import) no longer slides off the bottom of a long page. Absolutely-positioned controls inside the scroll area are correctly clipped instead of overflowing the layout and scrolling the whole window.
+- **"Open in Immich" deep-links.** A finished import's queue card and any selected album now offer an "Open in Immich" action that opens the album (`/albums/{id}`) — or the timeline (`/photos`) when there's no single album target — in your browser, using the reachable server URL (LAN/WAN failover, same as imports). Closes the import loop so you can jump straight to verifying uploads.
+
+### Maintenance
+- **Dependency bumps**: svelte 5.56.7, @lucide/svelte ^0.577.0, @internationalized/date 3.12.2, serde 1.0.229, serde_json 1.0.151, plus CI action-digest updates (actions/checkout, dtolnay/rust-toolchain, tauri-apps/tauri-action).
+
 ## v0.4.0 - 2026-07-23
 
 ### Import safety & data integrity

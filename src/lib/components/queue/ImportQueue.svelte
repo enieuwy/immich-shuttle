@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { Inbox, X, AlertTriangle, FileWarning, RotateCcw, Trash2 } from "@lucide/svelte";
+  import { Inbox, X, AlertTriangle, FileWarning, RotateCcw, Trash2, ExternalLink } from "@lucide/svelte";
 
   import { queueState } from "$lib/state/queue";
+  import { openInImmich } from "$lib/api";
   import { Card, CardHeader, CardContent } from "$lib/components/ui/card";
   import { Badge } from "$lib/components/ui/badge";
   import { Button } from "$lib/components/ui/button";
@@ -21,6 +22,15 @@
     actionError = "";
     try {
       await queueState.cancelImport(jobId);
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function openImmich(profileId: string, albumId?: string | null) {
+    actionError = "";
+    try {
+      await openInImmich(profileId, albumId);
     } catch (error) {
       actionError = error instanceof Error ? error.message : String(error);
     }
@@ -135,6 +145,19 @@
                   }}
                 >
                   <RotateCcw class="h-4 w-4" /> Retry
+                </Button>
+              {/if}
+              {#if job.status === "completed"}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  class="ml-auto"
+                  aria-label="Open in Immich"
+                  onclick={() => {
+                    void openImmich(job.profile_id, job.album_id);
+                  }}
+                >
+                  <ExternalLink class="h-4 w-4" /> Open in Immich
                 </Button>
               {/if}
               {#if isFinished(job.status)}

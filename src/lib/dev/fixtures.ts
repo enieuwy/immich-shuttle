@@ -171,6 +171,8 @@ const completedJob: ImportJob = {
   awaiting_wipe_confirmation: false,
   pending_wipe_count: 0,
   file_errors: [],
+  profile_id: "p-home",
+  album_id: "a-vacation",
 };
 
 export function jobsForScenario(scenario: Scenario): ImportJob[] {
@@ -186,6 +188,7 @@ export function jobsForScenario(scenario: Scenario): ImportJob[] {
           awaiting_wipe_confirmation: false,
           pending_wipe_count: 0,
           file_errors: [],
+          profile_id: "p-home",
         },
         completedJob,
       ];
@@ -200,6 +203,7 @@ export function jobsForScenario(scenario: Scenario): ImportJob[] {
           awaiting_wipe_confirmation: true,
           pending_wipe_count: 1813,
           file_errors: [],
+          profile_id: "p-home",
         },
       ];
     case "empty":
@@ -222,6 +226,7 @@ export function jobsForScenario(scenario: Scenario): ImportJob[] {
             { file: "/Volumes/CANON_EOS/DCIM:101CANON/MVI_0007.MOV", reason: "Connection reset by peer" },
             { file: "/Volumes/CANON_EOS/DCIM:101CANON/IMG_0533.HEIC", reason: "checksum mismatch" },
           ],
+          profile_id: "p-home",
         },
       ];
   }

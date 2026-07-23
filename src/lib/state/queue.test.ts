@@ -122,6 +122,7 @@ describe("queueState", () => {
         awaiting_wipe_confirmation: false,
         pending_wipe_count: 0,
         file_errors: [],
+        profile_id: "p1",
       },
     ];
     vi.mocked(api.importDismiss).mockResolvedValueOnce(remaining);
@@ -278,6 +279,7 @@ describe("queueState", () => {
       awaiting_wipe_confirmation: false,
       pending_wipe_count: 0,
       file_errors: [],
+      profile_id: "p1",
     };
     vi.mocked(api.importListJobs).mockResolvedValueOnce([completed]);
     await queueState.loadJobs();

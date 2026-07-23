@@ -77,6 +77,10 @@ export interface ImportJob {
   awaiting_wipe_confirmation: boolean;
   pending_wipe_count: number;
   file_errors: FileError[];
+  /** Owning profile, used to resolve the server URL for an "Open in Immich" link. */
+  profile_id: string;
+  /** Target album for the deep-link, or null to open the timeline. */
+  album_id?: string | null;
 }
 
 export interface RemovableDevice {

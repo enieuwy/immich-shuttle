@@ -190,7 +190,8 @@ pub fn run() {
             commands::settings::get_server_info,
             commands::settings::get_logs_dir,
             commands::settings::get_recent_logs,
-            commands::settings::open_logs_dir
+            commands::settings::open_logs_dir,
+            commands::settings::open_in_immich
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

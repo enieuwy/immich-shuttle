@@ -18,6 +18,7 @@ function job(
     awaiting_wipe_confirmation: false,
     pending_wipe_count: 0,
     file_errors: [],
+    profile_id: "p1",
     ...over,
     progress,
   };

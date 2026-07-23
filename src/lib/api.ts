@@ -116,6 +116,10 @@ export function openLogsDir(): Promise<void> {
   return invokeCommand<void>("open_logs_dir");
 }
 
+export function openInImmich(profileId: string, albumId?: string | null): Promise<void> {
+  return invokeCommand<void>("open_in_immich", { profileId, albumId: albumId ?? null });
+}
+
 export function getRecentLogs(): Promise<string> {
   return invokeCommand<string>("get_recent_logs");
 }

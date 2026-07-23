@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     models::{
-        job::{ImportInput, ImportJob, JobProgress, JobStatus},
+        job::{ImportInput, ImportJob, JobProgress, JobStatus, Organization},
         media::{ScanProgress, ScanSummary},
     },
     services::{
@@ -296,6 +296,14 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     let album_ids = input.album_ids.clone();
     let into_album = input.into_album.clone();
     let organization = input.organization;
+    // The "Open in Immich" deep-link points at a specific album only when the run
+    // targets exactly one selected album (SingleAlbum mode); folder/tag modes fan
+    // out across many albums, so the link falls back to the timeline.
+    let target_album_id = if organization == Organization::SingleAlbum {
+        album_ids.first().cloned()
+    } else {
+        None
+    };
     let select_files = input.select_files.clone().unwrap_or_default();
     let staging_requested = !select_files.is_empty();
     if staging_requested {
@@ -319,6 +327,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         awaiting_wipe_confirmation: false,
         pending_wipe_count: 0,
         file_errors: Vec::new(),
+        profile_id: input.profile_id.clone(),
+        album_id: target_album_id.clone(),
     };
 
     // Publish a job only after all fallible setup has succeeded. The admission
@@ -378,6 +388,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                         awaiting_wipe_confirmation: false,
                         pending_wipe_count: 0,
                         file_errors: Vec::new(),
+                        profile_id: profile.id.clone(),
+                        album_id: None,
                     });
                     return;
                 }
@@ -399,6 +411,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                         awaiting_wipe_confirmation: false,
                         pending_wipe_count: 0,
                         file_errors: Vec::new(),
+                        profile_id: profile.id.clone(),
+                        album_id: None,
                     });
                     return;
                 }
@@ -502,6 +516,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 awaiting_wipe_confirmation: false,
                 pending_wipe_count: 0,
                 file_errors: Vec::new(),
+                profile_id: profile.id.clone(),
+                album_id: None,
             }
         } else if let Some(err) = spawn_error {
             ImportJob {
@@ -513,6 +529,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 awaiting_wipe_confirmation: false,
                 pending_wipe_count: 0,
                 file_errors: file_errors.clone(),
+                profile_id: profile.id.clone(),
+                album_id: None,
             }
         } else {
             // The process ran to completion. classify_completed_run owns the
@@ -606,6 +624,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                     0
                 },
                 file_errors: file_errors.clone(),
+                profile_id: profile.id.clone(),
+                album_id: target_album_id.clone(),
             }
         };
 

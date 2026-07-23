@@ -81,4 +81,13 @@ pub struct ImportJob {
     pub pending_wipe_count: u32,
     /// Per-file failures parsed from immich-go's run log, for actionable reporting.
     pub file_errors: Vec<FileError>,
+    /// Owning profile, so the finished-job card can resolve the server URL for an
+    /// "Open in Immich" deep-link. Empty for jobs created before this field.
+    #[serde(default)]
+    pub profile_id: String,
+    /// The single Immich album this run targeted, if any (SingleAlbum mode with a
+    /// selected album). `None` for folder/tag organization or no album — the
+    /// deep-link then points at the timeline instead of a specific album.
+    #[serde(default)]
+    pub album_id: Option<String>,
 }
