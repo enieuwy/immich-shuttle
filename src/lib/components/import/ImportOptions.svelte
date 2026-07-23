@@ -5,7 +5,7 @@
   import { Label } from "$lib/components/ui/label";
   import { Separator } from "$lib/components/ui/separator";
   import { Switch } from "$lib/components/ui/switch";
-  import { importOptionsState } from "$lib/state/import-options";
+  import { importOptionsState, isDateRangeInvalid } from "$lib/state/import-options";
   import { autoImportState } from "$lib/state/auto-import";
   import DeviceRuleControl from "$lib/components/source/DeviceRuleControl.svelte";
   import type { ImportOrganization } from "$lib/types";
@@ -27,7 +27,7 @@
 
   const dateFrom = $derived($importOptionsState.dateFrom ?? "");
   const dateTo = $derived($importOptionsState.dateTo ?? "");
-  const dateRangeInvalid = $derived(dateFrom !== "" && dateTo !== "" && dateFrom > dateTo);
+  const dateRangeInvalid = $derived(isDateRangeInvalid(dateFrom, dateTo));
 </script>
 
 <Card>

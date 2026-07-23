@@ -58,12 +58,18 @@ export const importOptionsState = {
 
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
 
+/** True when two complete date bounds are ordered backwards. */
+export function isDateRangeInvalid(from: string | null, to: string | null): boolean {
+  return Boolean(from && to && YMD.test(from) && YMD.test(to) && from > to);
+}
+
+
 /**
  * Build immich-go's `--date-range=YYYY-MM-DD,YYYY-MM-DD` value from the From/To
  * pickers. Returns null unless both bounds are present, well-formed, and
  * ordered From <= To (zero-padded ISO dates compare correctly as strings).
  */
 export function toImmichDateRange(from: string | null, to: string | null): string | null {
-  if (!from || !to || !YMD.test(from) || !YMD.test(to) || from > to) return null;
+  if (!from || !to || !YMD.test(from) || !YMD.test(to) || isDateRangeInvalid(from, to)) return null;
   return `${from},${to}`;
 }

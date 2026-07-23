@@ -81,7 +81,7 @@ describe("queueState", () => {
     });
   });
 
-  it("forwards a valid date range and omits an invalid one", async () => {
+  it("forwards a valid date range and rejects an invalid one", async () => {
     await profilesState.saveProfile({
       id: "p1",
       display_name: "Ellis",
@@ -98,11 +98,12 @@ describe("queueState", () => {
     await queueState.startImport();
     expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.date_range).toBe("2026-01-01,2026-01-31");
 
-    // Inverted range is rejected rather than forwarded.
+    // An inverted range must block the import instead of being treated as no filter.
     importOptionsState.setDateFrom("2026-02-01");
     importOptionsState.setDateTo("2026-01-01");
-    await queueState.startImport();
-    expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.date_range).toBeNull();
+    await expect(queueState.startImport()).rejects.toThrow(
+      "The start date must be on or before the end date.",
+    );
 
     importOptionsState.clearDateRange();
   });
@@ -265,6 +266,47 @@ describe("queueState", () => {
       stack_burst: true,
       organization: "folder_name",
     });
+  });
+
+  it("does not revive a terminal job when a late progress event arrives", async () => {
+    const completed: ImportJob = {
+      id: "job-completed",
+      status: "completed",
+      progress: { total: 4, uploaded: 4, duplicates: 0, errors: 0 },
+      error: null,
+      summary: "Imported 4 items.",
+      awaiting_wipe_confirmation: false,
+      pending_wipe_count: 0,
+      file_errors: [],
+    };
+    vi.mocked(api.importListJobs).mockResolvedValueOnce([completed]);
+    await queueState.loadJobs();
+
+    let onProgress:
+      | ((event: { payload: { job_id: string; progress: ImportJob["progress"] } }) => void)
+      | undefined;
+    const unlisten = vi.fn();
+    listenMock.mockImplementationOnce(
+      async (
+        _event: string,
+        handler: (event: { payload: { job_id: string; progress: ImportJob["progress"] } }) => void,
+      ) => {
+        onProgress = handler;
+        return unlisten;
+      },
+    );
+    queueState.startPolling();
+
+    onProgress?.({
+      payload: {
+        job_id: completed.id,
+        progress: { total: 4, uploaded: 3, duplicates: 0, errors: 0 },
+      },
+    });
+    expect(get(queueState).jobs).toEqual([completed]);
+
+    queueState.stopPolling();
+    await Promise.resolve();
   });
 
   it("tears down the progress listener when stopped mid-registration", async () => {

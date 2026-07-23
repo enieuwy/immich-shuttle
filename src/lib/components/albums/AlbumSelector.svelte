@@ -25,7 +25,10 @@
     const timer = setTimeout(() => {
       void albumsState.loadAlbums(_search || undefined);
     }, 150);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      albumsState.cancelLoad();
+    };
   });
 
   async function createAlbum() {

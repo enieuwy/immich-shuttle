@@ -69,6 +69,12 @@ export function createThumbnailLoader(options: ThumbnailLoaderOptions): Thumbnai
           for (const path of chunk) requested.delete(path);
           continue;
         }
+        const returnedPaths = new Set(results.map((result) => result.path));
+        // The backend can omit failed/unsupported paths without rejecting the
+        // batch. Release those claims so their next intersection can retry.
+        for (const path of chunk) {
+          if (!returnedPaths.has(path)) requested.delete(path);
+        }
         if (disposed) return;
         options.onResults(results);
       }

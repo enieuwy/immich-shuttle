@@ -172,6 +172,27 @@ describe("createThumbnailLoader", () => {
     expect(g.calls).toEqual([["a"], ["b"], ["a"]]);
   });
 
+  it("releases paths omitted from a successful batch for retry", async () => {
+    const calls: string[][] = [];
+    const loader = createThumbnailLoader({
+      fetch: async (paths) => {
+        calls.push(paths);
+        return paths.filter((path) => path === "a").map(thumb);
+      },
+      onResults: () => {},
+      chunkSize: 2,
+      debounceMs: 5,
+    });
+
+    loader.request("a");
+    loader.request("b");
+    await vi.advanceTimersByTimeAsync(5);
+
+    loader.request("b");
+    await vi.advanceTimersByTimeAsync(5);
+    expect(calls).toEqual([["a", "b"], ["b"]]);
+  });
+
   it("dispose halts draining and ignores later requests", async () => {
     const g = gatedFetch();
     const painted: string[] = [];

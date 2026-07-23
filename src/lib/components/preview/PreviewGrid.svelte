@@ -34,31 +34,46 @@
   // Capture dates (epoch seconds) keyed by path; fetched lazily once per file set.
   let dates = $state(new Map<string, number | null>());
   let datesFetchedFor = "";
+  let datesGeneration = 0;
+
 
   $effect(() => {
     const paths = files.map((f) => f.path);
     const key = paths.join("\n");
-    if (files.length === 0 || key === datesFetchedFor) {
+    if (key === datesFetchedFor) {
       return;
     }
     datesFetchedFor = key;
-    // New dataset: drop the previous set's cached thumbnails and loader queue so
-    // memory stays bounded across preview sessions instead of retaining every
-    // directory ever viewed. The old loader's in-flight work is neutralized by
-    // its own dispose guard.
+    const generation = ++datesGeneration;
+    // Tauri's invoke promises cannot be cancelled. Dispose the loader to halt
+    // queued chunks and use the generation below to drop the pending IPC result.
     loader.dispose();
-    loader = makeLoader();
     thumbs = new Map();
-    void previewDates(paths).then((rows: CaptureDate[]) => {
-      // A newer file set may have superseded this fetch; only apply the dates if
-      // the key we requested for is still the active dataset.
-      if (key !== datesFetchedFor) return;
-      const next = new Map<string, number | null>();
-      for (const row of rows) {
-        next.set(row.path, row.captured_at);
-      }
-      dates = next;
-    });
+    if (files.length === 0) {
+      dates = new Map();
+      return;
+    }
+    loader = makeLoader();
+    let disposed = false;
+    void previewDates(paths)
+      .then((rows: CaptureDate[]) => {
+        // A newer file set may have superseded this fetch; only apply the dates if
+        // the key we requested for is still the active dataset.
+        if (disposed || generation !== datesGeneration || key !== datesFetchedFor) return;
+        const next = new Map<string, number | null>();
+        for (const row of rows) {
+          next.set(row.path, row.captured_at);
+        }
+        dates = next;
+      })
+      .catch(() => {
+        // Preview metadata is optional; a failed or discarded IPC result leaves
+        // date sorting/filtering on its existing fallback behavior.
+      });
+    return () => {
+      disposed = true;
+      loader.dispose();
+    };
   });
 
   // --- Filters ---------------------------------------------------------------

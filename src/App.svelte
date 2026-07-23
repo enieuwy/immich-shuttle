@@ -26,6 +26,8 @@
   import { selectionState } from "$lib/state/selection";
   import { sourceState } from "$lib/state/source";
   import { openProfileEditor, panelTab } from "$lib/state/ui";
+  import { isDateRangeInvalid, importOptionsState } from "$lib/state/import-options";
+
 
   let showManager = $state(false);
   let showLogs = $state(false);
@@ -55,9 +57,18 @@
     return out;
   });
   const selectedCount = $derived(selectedPaths.length);
+  const dateRangeInvalid = $derived(
+    isDateRangeInvalid($importOptionsState.dateFrom, $importOptionsState.dateTo),
+  );
+
 
   async function startImport() {
     importError = "";
+    if (dateRangeInvalid) {
+      importError = "The start date must be on or before the end date.";
+      return;
+    }
+
     const selection = selectedPaths;
     try {
       await queueState.startImport(
@@ -72,6 +83,10 @@
   onMount(() => {
     let disposed = false;
     let unlistenClose: (() => void) | undefined;
+    let allowCloseAfterCancel = false;
+    let cancellingForClose = false;
+
+
     void profilesState.loadProfiles().then(() => {
       if (getProfilesSnapshot().profiles.length === 0) {
         showOnboarding = true;
@@ -82,16 +97,49 @@
 
     void getCurrentWindow()
       .onCloseRequested((event) => {
-        const running = $queueState.jobs.some((job) => job.status === "running");
-        if (!running) {
+        if (allowCloseAfterCancel) {
           return;
         }
-        const shouldQuit = window.confirm(
-          "An import is in progress. Quit now and cancel the running import?",
-        );
-        if (!shouldQuit) {
+        if (cancellingForClose) {
           event.preventDefault();
+          return;
         }
+
+        const runningJobs = $queueState.jobs.filter((job) => job.status === "running");
+        if (runningJobs.length === 0) {
+          return;
+        }
+        event.preventDefault();
+        if (
+          !window.confirm(
+            "An import is in progress. Quit now and cancel the running import?",
+          )
+        ) {
+          return;
+        }
+        cancellingForClose = true;
+
+        void (async () => {
+          let cancellationTimeout: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              Promise.allSettled(runningJobs.map((job) => queueState.cancelImport(job.id))),
+              new Promise<void>((resolve) => {
+                cancellationTimeout = setTimeout(resolve, 5_000);
+              }),
+            ]);
+            allowCloseAfterCancel = true;
+            await getCurrentWindow().close();
+          } catch (error) {
+            importError = error instanceof Error ? error.message : String(error);
+          } finally {
+            if (cancellationTimeout !== undefined) {
+              clearTimeout(cancellationTimeout);
+            }
+            cancellingForClose = false;
+          }
+        })();
+
       })
       .then((fn) => {
         // Drop the handler if the component unmounted before registration
@@ -174,7 +222,7 @@
         <Button variant="ghost" size="sm" onclick={() => (showLogs = true)}>
           <FileText class="size-4" /> Logs
         </Button>
-        <Button size="sm" class="btn-brand" onclick={startImport}>
+        <Button size="sm" class="btn-brand" onclick={startImport} disabled={dateRangeInvalid}>
           <Play class="size-4" />
           {selectedCount > 0 ? `Import ${selectedCount} selected` : "Start Import"}
         </Button>

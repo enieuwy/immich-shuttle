@@ -13,7 +13,7 @@ import {
 import { errorsState } from "$lib/state/errors";
 import type { ImportJob, ImportOrganization } from "$lib/types";
 
-import { importOptionsState, toImmichDateRange } from "$lib/state/import-options";
+import { importOptionsState, isDateRangeInvalid, toImmichDateRange } from "$lib/state/import-options";
 import { albumsState } from "$lib/state/albums";
 import { activeProfile, profilesState } from "$lib/state/profiles";
 import { sourceState } from "$lib/state/source";
@@ -46,6 +46,13 @@ type ImportProgressEvent = {
   progress?: ImportJob["progress"];
   parsed_progress?: ImportJob["progress"];
   current_file?: string | null;
+};
+
+
+const terminalStatuses: Partial<Record<ImportJob["status"], true>> = {
+  completed: true,
+  failed: true,
+  cancelled: true,
 };
 
 const firstSamples = new Map<string, { time: number; uploaded: number }>();
@@ -157,8 +164,12 @@ export const queueState = {
           return;
         }
         state.update((s) => {
-          const jobs: ImportJob[] = s.jobs.map((job) =>
-            job.id === payload.job_id ? { ...job, status: "running", progress } : job,
+          const job = s.jobs.find((entry) => entry.id === payload.job_id);
+          if (!job || terminalStatuses[job.status]) {
+            return s;
+          }
+          const jobs: ImportJob[] = s.jobs.map((entry) =>
+            entry.id === payload.job_id ? { ...entry, status: "running", progress } : entry,
           );
           const rates = recomputeRates(jobs);
           const currentFiles = payload.current_file
@@ -220,6 +231,10 @@ export const queueState = {
     if (sourcePaths.length === 0) {
       throw new Error("Select a source before starting import.");
     }
+    if (isDateRangeInvalid(options.dateFrom, options.dateTo)) {
+      throw new Error("The start date must be on or before the end date.");
+    }
+
 
     // immich-go assigns albums by name (--into-album), single album per run. A
     // device rule can supply the name directly; otherwise resolve it from the

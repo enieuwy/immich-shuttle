@@ -17,9 +17,26 @@ type AlbumsState = {
   shareLinkUrl: string | null;
 };
 
-// Bumped on each loadAlbums call so a newer load supersedes any in-flight retries.
+// A new search supersedes any in-flight retry loop. Tauri invoke calls do not
+// accept an AbortSignal, but the signal still prevents follow-up requests,
+// retries, and state updates once the result is no longer relevant.
 let loadGeneration = 0;
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+let loadAbort: AbortController | null = null;
+
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const cancel = () => {
+    clearTimeout(timer);
+    resolve();
+  };
+  const timer = setTimeout(() => {
+    signal.removeEventListener("abort", cancel);
+    resolve();
+  }, ms);
+  signal.addEventListener("abort", cancel, { once: true });
+  return promise;
+}
 
 const state = writable<AlbumsState>({
   availableAlbums: [],
@@ -33,14 +50,27 @@ const state = writable<AlbumsState>({
 
 export const albumsState = {
   subscribe: state.subscribe,
+  cancelLoad() {
+    loadAbort?.abort();
+    loadAbort = null;
+    loadGeneration += 1;
+    state.update((s) => ({ ...s, loading: false }));
+  },
   async loadAlbums(query?: string) {
+    loadAbort?.abort();
+    const controller = new AbortController();
+    loadAbort = controller;
+    const { signal } = controller;
+    const generation = ++loadGeneration;
+    const isCurrent = () => !signal.aborted && generation === loadGeneration;
     const profile = get(activeProfile);
     if (!profile) {
-      state.update((s) => ({ ...s, availableAlbums: [], availableUsers: [] }));
+      if (isCurrent()) {
+        state.update((s) => ({ ...s, availableAlbums: [], availableUsers: [], loading: false }));
+      }
       return;
     }
 
-    const generation = ++loadGeneration;
     state.update((s) => ({ ...s, loading: true, error: null, missingApiKey: false }));
 
     // Reaching a LAN server triggers the macOS Local Network prompt, and macOS
@@ -48,26 +78,28 @@ export const albumsState = {
     // moment the user grants access (or the server comes back) — no manual retry.
     const maxAttempts = 6;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      if (generation !== loadGeneration) return; // superseded by a newer load
+      if (!isCurrent()) return;
       try {
         const availableAlbums = await albumsList(profile.id, query);
-        if (generation !== loadGeneration) return;
+        if (!isCurrent()) return;
         // Non-admin Immich users get 403 from usersList; that must not block the
         // album list. Degrade the share-with-users picker to empty instead.
         let availableUsers: AlbumUser[] = [];
+        if (!isCurrent()) return;
         try {
           availableUsers = await usersList(profile.id);
         } catch (usersError) {
+          if (!isCurrent()) return;
           console.warn(
             "usersList failed (non-admin?):",
             usersError instanceof Error ? usersError.message : String(usersError),
           );
         }
-        if (generation !== loadGeneration) return;
+        if (!isCurrent()) return;
         state.update((s) => ({ ...s, availableAlbums, availableUsers, loading: false, error: null }));
         return;
       } catch (error) {
-        if (generation !== loadGeneration) return;
+        if (!isCurrent()) return;
         const message = error instanceof Error ? error.message : String(error);
         // A missing key isn't an error to shout about — surface a CTA to add it.
         if (/No API key/i.test(message)) {
@@ -86,7 +118,9 @@ export const albumsState = {
             message,
           );
         if (isConnectionError && attempt < maxAttempts) {
-          await delay(2500);
+          if (!isCurrent()) return;
+          await delay(2500, signal);
+          if (!isCurrent()) return;
           continue;
         }
         console.warn("loadAlbums failed:", message);
