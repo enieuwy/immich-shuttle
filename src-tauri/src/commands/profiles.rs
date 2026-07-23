@@ -19,16 +19,11 @@ pub async fn profile_upsert(input: ProfileInput) -> Result<Profile, String> {
         return Err("Server URL is required".to_string());
     }
 
-    let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let profile = Profile {
-        id: id.clone(),
-        display_name: input
-            .display_name
-            .unwrap_or_else(|| "Immich User".to_string()),
-        server_url: normalize_server_url(&input.server_url),
-        lan_server_url: input.lan_server_url,
-        wan_server_url: input.wan_server_url,
-    };
+    let id = input
+        .id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let profile = profile_from_input(&input, id.clone());
 
     let api_key = input
         .api_key
@@ -63,6 +58,29 @@ pub async fn profile_upsert(input: ProfileInput) -> Result<Profile, String> {
             }
         }
         Err(err) => Err(err),
+    }
+}
+
+fn profile_from_input(input: &ProfileInput, id: String) -> Profile {
+    Profile {
+        id,
+        display_name: input
+            .display_name
+            .clone()
+            .unwrap_or_else(|| "Immich User".to_string()),
+        server_url: normalize_server_url(&input.server_url),
+        lan_server_url: input
+            .lan_server_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(normalize_server_url),
+        wan_server_url: input
+            .wan_server_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(normalize_server_url),
     }
 }
 
@@ -119,4 +137,34 @@ pub async fn profile_validate(url: String, api_key: String) -> Result<ServerInfo
             )
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::profile_from_input;
+    use crate::models::profile::ProfileInput;
+
+    #[test]
+    fn profile_builder_normalizes_optional_lan_and_wan_urls() {
+        let profile = profile_from_input(
+            &ProfileInput {
+                id: None,
+                display_name: None,
+                server_url: "https://immich.example.com".to_string(),
+                lan_server_url: Some(" https://lan.example.com/ ".to_string()),
+                wan_server_url: Some("https://wan.example.com/api".to_string()),
+                api_key: None,
+            },
+            "profile-id".to_string(),
+        );
+
+        assert_eq!(
+            profile.lan_server_url.as_deref(),
+            Some("https://lan.example.com")
+        );
+        assert_eq!(
+            profile.wan_server_url.as_deref(),
+            Some("https://wan.example.com")
+        );
+    }
 }

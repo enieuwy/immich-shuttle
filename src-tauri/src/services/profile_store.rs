@@ -83,7 +83,12 @@ pub fn save_config(config: &AppConfig) -> Result<(), String> {
     let content = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Could not serialize config: {e}"))?;
     fs::write(&tmp, content).map_err(|e| format!("Could not write temp config: {e}"))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("Could not persist config: {e}"))
+    if let Err(err) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("Could not persist config: {err}"));
+    }
+
+    Ok(())
 }
 
 pub fn list_profiles() -> Result<Vec<Profile>, String> {
@@ -137,8 +142,8 @@ mod tests {
     use crate::models::profile::Profile;
 
     use super::{
-        delete_profile, get_profile, load_config, lock_config, upsert_profile,
-        upsert_profile_locked,
+        delete_profile, get_profile, load_config, lock_config, save_config, upsert_profile,
+        upsert_profile_locked, AppConfig,
     };
 
     static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -228,6 +233,30 @@ mod tests {
         upsert_profile(profile).expect("upsert profile");
         delete_profile("p1").expect("delete profile");
         assert!(get_profile("p1").is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_config_rename_removes_temp_file() {
+        let _guard = TEST_LOCK.lock().expect("lock test mutex");
+        let dir = use_temp_config_home("rename-cleanup");
+        fs::create_dir_all(dir.join("immich-shuttle/config.json"))
+            .expect("create directory at config path");
+
+        assert!(save_config(&AppConfig::default()).is_err());
+
+        let config_dir = dir.join("immich-shuttle");
+        let temp_files = fs::read_dir(&config_dir)
+            .expect("read config directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.json.")
+            })
+            .count();
+        assert_eq!(temp_files, 0);
         let _ = fs::remove_dir_all(dir);
     }
 }
