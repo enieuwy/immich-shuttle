@@ -11,6 +11,7 @@
   import { autoImportState } from "$lib/state/auto-import";
   import { previewState } from "$lib/state/preview";
   import { selectionState } from "$lib/state/selection";
+  import { historyState } from "$lib/state/history";
   import { historySourceLastImport } from "$lib/api";
   import type { RemovableDevice } from "$lib/types";
   import { Button } from "$lib/components/ui/button";
@@ -41,14 +42,16 @@
   });
 
   $effect(() => {
+    const lastImportVersion = $historyState.lastImportVersion;
     const paths = $sourceState.selectedPaths;
     if (paths.length === 0) {
       lastImportedAt = null;
       return;
     }
+    lastImportedAt = null;
     let cancelled = false;
     void historySourceLastImport(paths).then((ms) => {
-      if (!cancelled) {
+      if (!cancelled && lastImportVersion === $historyState.lastImportVersion) {
         lastImportedAt = ms;
       }
     });

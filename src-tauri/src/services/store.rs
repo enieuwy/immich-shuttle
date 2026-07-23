@@ -101,8 +101,13 @@ pub fn clear_history(app: &tauri::AppHandle) -> Result<(), String> {
     // empty store so "Clear history" can overwrite and repair it instead of
     // propagating the parse error and leaving the user permanently stuck.
     let mut data = load(app).unwrap_or_default();
-    data.history.clear();
+    clear_store_data(&mut data);
     save(app, &data)
+}
+
+fn clear_store_data(data: &mut StoreData) {
+    data.history.clear();
+    data.sources.clear();
 }
 
 pub fn last_import_for(app: &AppHandle, source_paths: &[String]) -> Option<i64> {
@@ -148,7 +153,28 @@ fn normalize_source_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::source_key;
+    use std::collections::HashMap;
+
+    use super::{clear_store_data, source_key, SourceMeta, StoreData};
+
+    #[test]
+    fn clear_history_resets_source_metadata() {
+        let mut data = StoreData {
+            history: Vec::new(),
+            sources: HashMap::from([(
+                "source".to_string(),
+                SourceMeta {
+                    last_imported_at: 1,
+                    last_total: 1,
+                },
+            )]),
+        };
+
+        clear_store_data(&mut data);
+
+        assert!(data.history.is_empty());
+        assert!(data.sources.is_empty());
+    }
 
     #[test]
     fn source_key_normalizes_trailing_slashes_and_order() {

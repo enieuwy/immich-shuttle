@@ -8,12 +8,14 @@ type HistoryState = {
   records: ImportRecord[];
   loading: boolean;
   error: string | null;
+  lastImportVersion: number;
 };
 
 const state = writable<HistoryState>({
   records: [],
   loading: false,
   error: null,
+  lastImportVersion: 0,
 });
 
 
@@ -33,7 +35,12 @@ export const historyState = {
   async clearHistory() {
     try {
       await historyClear();
-      state.update((s) => ({ ...s, records: [], error: null }));
+      state.update((s) => ({
+        ...s,
+        records: [],
+        error: null,
+        lastImportVersion: s.lastImportVersion + 1,
+      }));
     } catch {
       errorsState.addError("Could not clear import history.");
     }
