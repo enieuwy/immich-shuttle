@@ -10,7 +10,7 @@ import type {
   Profile,
   ProfileInput,
   RemovableDevice,
-  ScanResult,
+  ScanSummary,
   ServerInfo,
   ThumbResult,
 } from "./types";
@@ -120,20 +120,24 @@ export function getRecentLogs(): Promise<string> {
   return invokeCommand<string>("get_recent_logs");
 }
 
-export function scanSource(path: string): Promise<ScanResult> {
-  return invokeCommand<ScanResult>("scan_source", { path });
+export function scanSourcesStream(paths: string[]): Promise<ScanSummary> {
+  return invokeCommand<ScanSummary>("scan_sources_stream", { paths });
 }
 
-export function scanSources(paths: string[]): Promise<ScanResult> {
-  return invokeCommand<ScanResult>("scan_sources", { paths });
+export function scanCancel(): Promise<void> {
+  return invokeCommand<void>("scan_cancel");
 }
 
-export function previewThumbnails(paths: string[]): Promise<ThumbResult[]> {
-  return invokeCommand<ThumbResult[]>("preview_thumbnails", { paths });
+export function previewThumbnails(paths: string[], token: number): Promise<ThumbResult[]> {
+  return invokeCommand<ThumbResult[]>("preview_thumbnails", { paths, token });
 }
 
-export function previewDates(paths: string[]): Promise<CaptureDate[]> {
-  return invokeCommand<CaptureDate[]>("preview_dates", { paths });
+export function previewDates(paths: string[], token: number): Promise<CaptureDate[]> {
+  return invokeCommand<CaptureDate[]>("preview_dates", { paths, token });
+}
+
+export function previewCancel(token: number): Promise<void> {
+  return invokeCommand<void>("preview_cancel", { token });
 }
 
 export function historyList(): Promise<ImportRecord[]> {

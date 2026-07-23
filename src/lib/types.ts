@@ -103,6 +103,24 @@ export interface ScanResult {
   skipped_unreadable: number;
 }
 
+/** Terminal outcome of a streamed scan (see scan_sources_stream). */
+export interface ScanSummary {
+  status: "complete" | "cancelled" | "timed_out";
+  photo_count: number;
+  video_count: number;
+  total_size_bytes: number;
+  skipped_unreadable: number;
+}
+
+/** Payload of each `scan-progress` event: an incremental batch plus cumulative totals. */
+export interface ScanProgress {
+  files: MediaFile[];
+  photo_count: number;
+  video_count: number;
+  total_size_bytes: number;
+  skipped_unreadable: number;
+}
+
 export interface ImportRecord {
   id: string;
   started_at: number;

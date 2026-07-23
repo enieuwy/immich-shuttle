@@ -15,6 +15,22 @@ export default defineConfig(async () => ({
     },
   },
 
+  build: {
+    // Split heavy third-party code out of the app entry so the initial parse is
+    // smaller and vendor code caches independently of app changes.
+    chunkSizeWarningLimit: 700,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("@tauri-apps")) return "tauri";
+          if (id.includes("svelte")) return "svelte";
+          return "vendor";
+        },
+      },
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

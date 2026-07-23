@@ -1,5 +1,6 @@
 use std::{fs, path::Path, time::Duration};
 
+use fs4::fs_std::FileExt;
 use uuid::Uuid;
 
 // A cross-process ownership lease is the thorough long-term fix. Until then,
@@ -32,6 +33,36 @@ fn is_run_log_name(name: &str) -> bool {
         .is_some_and(is_canonical_uuid)
 }
 
+/// Ownership state of a per-run temp artifact, determined via its `.lock` file.
+enum LeaseState {
+    /// Another process holds the advisory lock — the artifact is in use.
+    Live,
+    /// The lock exists but is free: the owning process is gone.
+    Released,
+    /// No lock file (a legacy artifact predating the lease).
+    NoLease,
+}
+
+/// Probe a temp artifact's ownership lease. The owning process holds an
+/// exclusive advisory lock on `<dir>/.lock` for the artifact's lifetime, so if
+/// we can acquire it the owner has already exited.
+fn temp_artifact_lease(dir: &Path) -> LeaseState {
+    let lock_path = dir.join(".lock");
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => match file.try_lock_exclusive() {
+            Ok(true) => LeaseState::Released,
+            _ => LeaseState::Live,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LeaseState::NoLease,
+        // Can't probe the lock (e.g. permissions) — assume live and keep it.
+        Err(_) => LeaseState::Live,
+    }
+}
+
 fn prune_stale_temp_artifacts() {
     let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
         return;
@@ -43,11 +74,21 @@ fn prune_stale_temp_artifacts() {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if is_temp_artifact_name(name)
-            && path.is_dir()
-            && is_older_than(&path, STALE_TEMP_ARTIFACT_AGE)
-        {
-            let _ = fs::remove_dir_all(path);
+        if is_temp_artifact_name(name) && path.is_dir() {
+            match temp_artifact_lease(&path) {
+                // A live owner (another running instance) still holds the lease.
+                LeaseState::Live => {}
+                // The lease was released — the owner is gone, so remove it now.
+                LeaseState::Released => {
+                    let _ = fs::remove_dir_all(&path);
+                }
+                // Legacy artifact with no lease file — fall back to the age grace.
+                LeaseState::NoLease => {
+                    if is_older_than(&path, STALE_TEMP_ARTIFACT_AGE) {
+                        let _ = fs::remove_dir_all(&path);
+                    }
+                }
+            }
         }
     }
 }
@@ -139,10 +180,11 @@ pub fn run() {
             commands::history::history_list,
             commands::history::history_clear,
             commands::history::history_source_last_import,
-            commands::import::scan_source,
-            commands::import::scan_sources,
+            commands::import::scan_sources_stream,
+            commands::import::scan_cancel,
             commands::preview::preview_thumbnails,
             commands::preview::preview_dates,
+            commands::preview::preview_cancel,
             commands::devices::devices_list_removable,
             commands::users::users_list,
             commands::settings::get_server_info,
