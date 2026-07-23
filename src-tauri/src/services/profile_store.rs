@@ -57,12 +57,15 @@ fn config_path() -> Result<PathBuf, String> {
 
 pub fn load_config() -> Result<AppConfig, String> {
     let path = config_path()?;
-    if !path.exists() {
-        return Ok(AppConfig::default());
+    match fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str::<AppConfig>(&raw)
+            .map_err(|e| format!("Could not parse config: {e}")),
+        // A missing file is the first-run case, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AppConfig::default()),
+        // File exists but is locked/unreadable — surface it rather than masking
+        // it as an empty first-run config (which a later save would overwrite).
+        Err(e) => Err(format!("Could not read config: {e}")),
     }
-
-    let raw = fs::read_to_string(&path).map_err(|e| format!("Could not read config: {e}"))?;
-    serde_json::from_str::<AppConfig>(&raw).map_err(|e| format!("Could not parse config: {e}"))
 }
 
 pub fn save_config(config: &AppConfig) -> Result<(), String> {
