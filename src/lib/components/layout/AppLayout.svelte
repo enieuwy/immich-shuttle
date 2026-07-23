@@ -19,7 +19,7 @@
   }>();
 </script>
 
-<div class="relative isolate grid min-h-screen grid-rows-[auto_1fr_auto] bg-background text-foreground">
+<div class="relative isolate grid h-screen grid-rows-[auto_1fr_auto] bg-background text-foreground">
   <div
     class="pointer-events-none absolute inset-0 -z-10 opacity-0 transition-opacity dark:opacity-100"
     aria-hidden="true"
@@ -51,7 +51,7 @@
     <div class="brand-gradient pointer-events-none absolute inset-x-0 bottom-0 h-px opacity-60" aria-hidden="true"></div>
   </header>
 
-  <main class="overflow-auto p-5">
+  <main class="relative min-h-0 overflow-auto p-5">
     <div class="mx-auto w-full max-w-6xl">
       {@render children?.()}
     </div>
