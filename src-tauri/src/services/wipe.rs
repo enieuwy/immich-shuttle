@@ -45,13 +45,16 @@ pub fn wipe_files(paths: &[String]) -> WipeResult {
             continue;
         }
 
-        match fs::remove_file(path) {
+        // Move to the OS Trash instead of a hard delete so a mistaken wipe is
+        // recoverable. The verify-before-wipe gate upstream is unchanged: only
+        // server-confirmed files reach this function.
+        match trash::delete(path) {
             Ok(_) => result.deleted += 1,
             Err(err) => {
                 result.failed += 1;
                 result
                     .errors
-                    .push(format!("Could not delete {}: {err}", path.display()));
+                    .push(format!("Could not move {} to Trash: {err}", path.display()));
             }
         }
     }
@@ -230,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn wipes_only_selected_media_files() {
+    fn moves_only_selected_media_files_to_trash() {
         let photo = temp_file("photo", "jpg");
         let other = temp_file("other", "txt");
         fs::write(&photo, b"a").expect("write photo");
@@ -240,6 +243,8 @@ mod tests {
             photo.to_string_lossy().to_string(),
             other.to_string_lossy().to_string(),
         ]);
+        // trash::delete moves the file to the OS Trash: it leaves the origin
+        // path (counted as deleted) but, unlike a hard delete, stays recoverable.
 
         assert_eq!(result.deleted, 1);
         assert!(!photo.exists());

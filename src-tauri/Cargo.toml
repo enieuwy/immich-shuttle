@@ -40,6 +40,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 kamadak-exif = "0.6"
 base64 = "0.22"
 fs4 = { version = "0.13.1", features = ["sync"] }
+trash = "5"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
