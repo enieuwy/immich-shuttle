@@ -2,6 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 
 const { listenMock } = vi.hoisted(() => ({ listenMock: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }));
+vi.mock("@tauri-apps/plugin-notification", () => ({
+  isPermissionGranted: vi.fn(async () => true),
+  requestPermission: vi.fn(async () => "granted"),
+  sendNotification: vi.fn(),
+}));
 
 vi.mock("$lib/api", () => ({
   importListJobs: vi.fn(async () => []),
@@ -38,7 +43,7 @@ vi.mock("$lib/api", () => ({
 }));
 
 import * as api from "$lib/api";
-import { queueState } from "./queue";
+import { queueState, selectNewlyTerminal } from "./queue";
 import { profilesState } from "./profiles";
 import { sourceState } from "./source";
 import { albumsState } from "./albums";
@@ -394,5 +399,39 @@ describe("queueState", () => {
     await Promise.resolve();
 
     expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("selectNewlyTerminal", () => {
+  const job = (id: string, status: ImportJob["status"]): ImportJob =>
+    ({
+      id,
+      status,
+      progress: { total: 1, uploaded: 1, duplicates: 0, errors: 0 },
+      awaiting_wipe_confirmation: false,
+      pending_wipe_count: 0,
+    }) as ImportJob;
+
+  it("detects running -> completed and running -> failed", () => {
+    const prev = [job("a", "running"), job("b", "running")];
+    const next = [job("a", "completed"), job("b", "failed")];
+    expect(selectNewlyTerminal(prev, next).map((j) => j.id)).toEqual(["a", "b"]);
+  });
+
+  it("ignores cancellations", () => {
+    const prev = [job("a", "running")];
+    const next = [job("a", "cancelled")];
+    expect(selectNewlyTerminal(prev, next)).toEqual([]);
+  });
+
+  it("ignores unseen jobs already terminal (initial hydration / restart)", () => {
+    const next = [job("a", "completed"), job("b", "failed")];
+    expect(selectNewlyTerminal([], next)).toEqual([]);
+  });
+
+  it("does not re-notify a job already terminal", () => {
+    const prev = [job("a", "completed")];
+    const next = [job("a", "completed")];
+    expect(selectNewlyTerminal(prev, next)).toEqual([]);
   });
 });

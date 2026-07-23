@@ -1,5 +1,10 @@
 import { get, writable } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
 
 import {
   historySourceLastImport,
@@ -102,30 +107,85 @@ export function recomputeRates(
   return rates;
 }
 
+// Notification permission is resolved once per session and cached; requesting it
+// on every terminal transition would spam the OS prompt.
+let notifyPermission: boolean | null = null;
+
+async function ensureNotifyPermission(): Promise<boolean> {
+  if (notifyPermission !== null) return notifyPermission;
+  let granted = await isPermissionGranted();
+  if (!granted) {
+    granted = (await requestPermission()) === "granted";
+  }
+  notifyPermission = granted;
+  return granted;
+}
+
+function notificationForJob(job: ImportJob): { title: string; body: string } | null {
+  if (job.status === "completed") {
+    return {
+      title: "Import complete",
+      body: `Uploaded ${job.progress.uploaded} of ${job.progress.total} file(s).`,
+    };
+  }
+  if (job.status === "failed") {
+    return {
+      title: "Import failed",
+      body: job.error ?? "The import did not finish. Check the logs for details.",
+    };
+  }
+  return null;
+}
+
+// Jobs observed transitioning from a non-terminal state into completed/failed.
+// Unseen jobs (initial hydration or app restart with old finished jobs) and
+// cancellations are excluded. Pure so the transition logic is unit-testable.
+export function selectNewlyTerminal(prev: ImportJob[], next: ImportJob[]): ImportJob[] {
+  const prevStatus = new Map(prev.map((j) => [j.id, j.status]));
+  return next.filter((job) => {
+    const before = prevStatus.get(job.id);
+    if (before === undefined || terminalStatuses[before]) return false;
+    return job.status === "completed" || job.status === "failed";
+  });
+}
+
+async function fireTerminalNotifications(prev: ImportJob[], next: ImportJob[]) {
+  const newlyTerminal = selectNewlyTerminal(prev, next);
+  if (newlyTerminal.length === 0) return;
+  if (!(await ensureNotifyPermission())) return;
+  for (const job of newlyTerminal) {
+    const notification = notificationForJob(job);
+    if (notification) sendNotification(notification);
+  }
+}
+
 async function refreshJobs() {
   try {
     const polled = await importListJobs();
     const runningIds = new Set(polled.filter((j) => j.status === "running").map((j) => j.id));
+    // Capture the pre-update jobs synchronously (no await before state.update, so
+    // no listener can interleave) to diff progress and detect terminal transitions.
+    const prev = get(state).jobs;
+    const prevById = new Map(prev.map((j) => [j.id, j]));
+    // The backend's stored job progress is only refreshed at import start and
+    // end; live per-file counts arrive via the "import-progress" event stream
+    // between polls. For a still-running job, take the field-wise max of the
+    // polled and current progress (the run log is append-only, so counts only
+    // grow) so the 2s poll can't reset the bar/ETA to the stale start value.
+    const jobs = polled.map((job) => {
+      const previous = prevById.get(job.id);
+      if (job.status !== "running" || !previous) return job;
+      return {
+        ...job,
+        progress: {
+          total: Math.max(previous.progress.total, job.progress.total),
+          uploaded: Math.max(previous.progress.uploaded, job.progress.uploaded),
+          duplicates: Math.max(previous.progress.duplicates, job.progress.duplicates),
+          errors: Math.max(previous.progress.errors, job.progress.errors),
+        },
+      };
+    });
     state.update((s) => {
-      const prevById = new Map(s.jobs.map((j) => [j.id, j]));
-      // The backend's stored job progress is only refreshed at import start and
-      // end; live per-file counts arrive via the "import-progress" event stream
-      // between polls. For a still-running job, take the field-wise max of the
-      // polled and current progress (the run log is append-only, so counts only
-      // grow) so the 2s poll can't reset the bar/ETA to the stale start value.
-      const jobs = polled.map((job) => {
-        const prev = prevById.get(job.id);
-        if (job.status !== "running" || !prev) return job;
-        return {
-          ...job,
-          progress: {
-            total: Math.max(prev.progress.total, job.progress.total),
-            uploaded: Math.max(prev.progress.uploaded, job.progress.uploaded),
-            duplicates: Math.max(prev.progress.duplicates, job.progress.duplicates),
-            errors: Math.max(prev.progress.errors, job.progress.errors),
-          },
-        };
-      });
       const rates = recomputeRates(jobs);
       return {
         ...s,
@@ -137,6 +197,7 @@ async function refreshJobs() {
         error: null,
       };
     });
+    void fireTerminalNotifications(prev, jobs);
   } catch (error) {
     errorsState.addError("Could not refresh import queue.");
     state.update((s) => ({ ...s, error: error instanceof Error ? error.message : String(error) }));

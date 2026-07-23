@@ -151,6 +151,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             crate::services::device_detector::start_polling(app.handle().clone());
             // Evict stale thumbnails so the on-disk cache can't grow without
