@@ -314,6 +314,27 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         .filter(|t| !t.is_empty())
         .collect();
     let session_tag = input.session_tag;
+    // Media-type filter is a fixed enum on immich-go's side; accept only those.
+    let include_type =
+        input
+            .include_type
+            .as_deref()
+            .and_then(|v| match v.trim().to_ascii_uppercase().as_str() {
+                "VIDEO" => Some("VIDEO".to_string()),
+                "IMAGE" => Some("IMAGE".to_string()),
+                _ => None,
+            });
+    // Normalize extensions to immich-go's leading-dot, lowercase form and drop
+    // blanks so the joined --include/--exclude-extensions arg is well-formed.
+    let normalize_exts = |exts: &[String]| -> Vec<String> {
+        exts.iter()
+            .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|e| !e.is_empty())
+            .map(|e| format!(".{e}"))
+            .collect()
+    };
+    let include_extensions = normalize_exts(&input.include_extensions);
+    let exclude_extensions = normalize_exts(&input.exclude_extensions);
     // The "Open in Immich" deep-link points at a specific album only when the run
     // actually targets one: SingleAlbum mode AND a non-empty --into-album name
     // (folder/tag modes fan out; an unresolved selection sends no into_album, so
@@ -470,6 +491,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             overwrite,
             tags,
             session_tag,
+            include_type,
+            include_extensions,
+            exclude_extensions,
         };
         let mut error_lines: Vec<String> = Vec::new();
         let mut exit_nonzero = false;
@@ -718,6 +742,65 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     });
 
     Ok(job_id)
+}
+
+/// Cap on how many files a forecast will hash in one pass; beyond this the
+/// result is marked truncated so the UI can show a lower bound instead of
+/// hashing an unbounded card on a "Check server" click.
+const FORECAST_MAX_FILES: usize = 5000;
+
+/// Read-only preflight: how many of the selected/scanned files the server
+/// already holds vs. would upload. Reuses the SHA-1 + bulk-upload-check path;
+/// safe to run repeatedly and never mutates anything.
+#[tauri::command]
+pub async fn import_forecast(
+    profile_id: String,
+    source_paths: Vec<String>,
+    select_files: Option<Vec<String>>,
+) -> Result<wipe::ForecastResult, String> {
+    let profile = profile_store::get_profile(&profile_id)?;
+    let api_key = keychain::get_api_key(&profile_id)?
+        .ok_or_else(|| format!("No API key found for profile: {profile_id}"))?;
+    let server_url = url_resolver::resolve_server_url(&profile).await;
+    if server_url.is_empty() {
+        return Err("No reachable Immich server URL for this profile.".to_string());
+    }
+
+    // Prefer an explicit selection; otherwise scan the sources (bounded) to find
+    // candidate media. Scanning reads the filesystem, so keep it off the runtime.
+    let (candidates, truncated) = match select_files {
+        Some(files) => (files, false),
+        None => {
+            let paths = collapse_overlapping_roots(source_paths);
+            tauri::async_runtime::spawn_blocking(move || {
+                let deadline = Instant::now() + SCAN_DEADLINE;
+                let mut files: Vec<String> = Vec::new();
+                for path in paths {
+                    let source_path = PathBuf::from(&path);
+                    let _ = media_scanner::scan_directory_streaming(
+                        &source_path,
+                        None,
+                        Some(deadline),
+                        &mut |batch| {
+                            for file in batch {
+                                if files.len() < FORECAST_MAX_FILES {
+                                    files.push(file.path);
+                                }
+                            }
+                        },
+                    );
+                }
+                let truncated = files.len() >= FORECAST_MAX_FILES;
+                (files, truncated)
+            })
+            .await
+            .map_err(|e| format!("Scan task failed: {e}"))?
+        }
+    };
+
+    let mut result = wipe::forecast_upload(&server_url, &api_key, &candidates).await?;
+    result.truncated = result.truncated || truncated;
+    Ok(result)
 }
 
 #[tauri::command]

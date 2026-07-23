@@ -23,6 +23,12 @@ type ImportOptionsState = {
   sessionTag: boolean;
   /** Import only media captured since this source's last import (date floor). */
   onlyNewSinceLastImport: boolean;
+  /** Restrict import to one media kind: "all" | "image" | "video". */
+  mediaType: "all" | "image" | "video";
+  /** Only import files with these extensions (immich-go --include-extensions). */
+  includeExtensions: string[];
+  /** Skip files with these extensions (immich-go --exclude-extensions). */
+  excludeExtensions: string[];
 };
 
 const initialState: ImportOptionsState = {
@@ -40,6 +46,9 @@ const initialState: ImportOptionsState = {
   tags: [],
   sessionTag: false,
   onlyNewSinceLastImport: false,
+  mediaType: "all",
+  includeExtensions: [],
+  excludeExtensions: [],
 };
 
 const state = writable<ImportOptionsState>(initialState);
@@ -82,6 +91,15 @@ export const importOptionsState = {
   },
   setOnlyNewSinceLastImport(onlyNewSinceLastImport: boolean) {
     state.update((s) => ({ ...s, onlyNewSinceLastImport }));
+  },
+  setMediaType(mediaType: "all" | "image" | "video") {
+    state.update((s) => ({ ...s, mediaType }));
+  },
+  setIncludeExtensions(includeExtensions: string[]) {
+    state.update((s) => ({ ...s, includeExtensions }));
+  },
+  setExcludeExtensions(excludeExtensions: string[]) {
+    state.update((s) => ({ ...s, excludeExtensions }));
   },
   clearDateRange() {
     state.update((s) => ({ ...s, dateFrom: null, dateTo: null }));

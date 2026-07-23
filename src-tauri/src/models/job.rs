@@ -75,6 +75,17 @@ pub struct ImportInput {
     /// immich-go `--session-tag`: tag this upload session with a timestamped tag.
     #[serde(default)]
     pub session_tag: bool,
+    /// immich-go `--include-type`: "VIDEO" or "IMAGE" to import only that media
+    /// kind. `None` imports both.
+    #[serde(default)]
+    pub include_type: Option<String>,
+    /// immich-go `--include-extensions`: only import files with these extensions
+    /// (each normalized to a leading-dot, lowercase form). Empty = no filter.
+    #[serde(default)]
+    pub include_extensions: Vec<String>,
+    /// immich-go `--exclude-extensions`: skip files with these extensions.
+    #[serde(default)]
+    pub exclude_extensions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

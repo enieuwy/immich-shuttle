@@ -75,14 +75,20 @@ pub fn append_history(app: &tauri::AppHandle, record: ImportRecord) -> Result<()
     let _guard = lock_store();
 
     let mut data = load(app)?;
-    let key = source_key(&record.source_paths);
-    data.sources.insert(
-        key,
-        SourceMeta {
-            last_imported_at: record.finished_at,
-            last_total: record.total,
-        },
-    );
+    // Only a clean, complete import advances the incremental checkpoint. Failed,
+    // cancelled, or error-bearing runs must NOT raise the date floor, or a later
+    // "only new" import would silently skip files that never actually landed
+    // (especially under the new default --on-errors=continue, where a partial
+    // run is still marked completed).
+    if record.status == "completed" && record.errors == 0 {
+        data.sources.insert(
+            checkpoint_key(&record.profile_id, &record.source_paths),
+            SourceMeta {
+                last_imported_at: record.finished_at,
+                last_total: record.total,
+            },
+        );
+    }
     data.history.insert(0, record);
     data.history.truncate(100);
 
@@ -112,14 +118,22 @@ fn clear_store_data(data: &mut StoreData) {
     data.sources.clear();
 }
 
-pub fn last_import_for(app: &AppHandle, source_paths: &[String]) -> Option<i64> {
+pub fn last_import_for(app: &AppHandle, profile_id: &str, source_paths: &[String]) -> Option<i64> {
     let _guard = lock_store();
 
     load(app)
         .ok()?
         .sources
-        .get(&source_key(source_paths))
+        .get(&checkpoint_key(profile_id, source_paths))
         .map(|source| source.last_imported_at)
+}
+
+// Checkpoints are per (profile, source set): the same card imported under a
+// different profile must not inherit another profile's date floor. Changing
+// this key format resets existing checkpoints (the next only-new import re-scans,
+// which server-side dedupe makes safe).
+fn checkpoint_key(profile_id: &str, paths: &[String]) -> String {
+    format!("{profile_id}\u{1f}{}", source_key(paths))
 }
 
 // Changing this normalization changes persisted keys and resets existing `last_import` associations.

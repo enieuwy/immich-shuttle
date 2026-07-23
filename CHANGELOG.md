@@ -11,6 +11,12 @@
 - **Replace existing on server.** Optional `--overwrite` re-uploads assets the server already holds instead of skipping them, for re-syncs.
 - **Tags & session tagging.** Apply comma-separated `--tag` values (with `/` hierarchy) to every uploaded asset, and optionally add a timestamped `--session-tag` to label the whole batch.
 - **Only import media newer than last import.** Opt-in toggle that derives a capture-date floor from this source's stored last-import time (via `--date-range`), turning a repeat import of a large card from a full re-scan into a fast incremental. Server-side dedupe still guards the boundary; filters by EXIF capture date, so wrong camera clocks may skip files.
+- **Type & extension filters.** Import only Photos or only Videos, and add comma-separated include/exclude extension lists — mapped to immich-go's `--include-type`/`--include-extensions`/`--exclude-extensions` instead of hand-selecting files.
+- **Check server (pre-import forecast).** A read-only preflight that hashes the selected/scanned files and asks the server how many it already holds, showing "X to upload, Y already on server" before you start — reuses the verify-before-wipe SHA-1 + bulk-upload-check path.
+- The **"only new since last import"** checkpoint is now scoped per profile and advanced only by clean, complete imports (failed/partial runs no longer raise the date floor), and the date floor is computed in the local calendar zone to avoid a timezone off-by-one.
+
+### Onboarding
+- **Scan network for your Immich server.** The profile editor can sweep the local `/24` (ports 2283/443/80) and list confirmed servers for one-click fill, so first-run setup no longer requires knowing the server's IP. Confirmation uses the unauthenticated ping endpoint only — the API key is never sent during discovery.
 
 ### Maintenance
 - **Dependency bumps**: svelte 5.56.7, @lucide/svelte ^0.577.0, @internationalized/date 3.12.2, serde 1.0.229, serde_json 1.0.151, plus CI action-digest updates (actions/checkout, dtolnay/rust-toolchain, tauri-apps/tauri-action).

@@ -1,4 +1,5 @@
 pub mod device_detector;
+pub mod discovery;
 pub mod immich_client;
 pub mod keychain;
 pub mod logs;

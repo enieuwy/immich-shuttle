@@ -136,6 +136,12 @@ function handle(cmd: string, args: InvokeArgs): unknown {
       return undefined;
     case "history_source_last_import":
       return scenario === "onboarding" || scenario === "empty" ? null : fixtures.lastImportMs;
+    case "import_forecast":
+      return scenario === "onboarding" || scenario === "empty"
+        ? { new: 0, already_present: 0, unreadable: 0, truncated: false }
+        : { new: 128, already_present: 342, unreadable: 1, truncated: false };
+    case "discover_immich_servers":
+      return scenario === "onboarding" ? ["http://192.168.1.10:2283"] : [];
     case "get_recent_logs":
       return scenario === "onboarding" || scenario === "empty" ? "" : fixtures.recentLogs;
     // Void commands: profile_delete, album_share_users, import_cancel, open_logs_dir, ...

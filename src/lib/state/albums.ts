@@ -15,6 +15,8 @@ type AlbumsState = {
   /** The active profile has no stored API key — prompt to add one instead of erroring. */
   missingApiKey: boolean;
   shareLinkUrl: string | null;
+  /** Profile id whose albums are currently in availableAlbums, or null. */
+  loadedProfileId: string | null;
 };
 
 // A new search supersedes any in-flight retry loop. Tauri invoke calls do not
@@ -46,6 +48,7 @@ const state = writable<AlbumsState>({
   error: null,
   missingApiKey: false,
   shareLinkUrl: null,
+  loadedProfileId: null,
 });
 
 export const albumsState = {
@@ -66,7 +69,13 @@ export const albumsState = {
     const profile = get(activeProfile);
     if (!profile) {
       if (isCurrent()) {
-        state.update((s) => ({ ...s, availableAlbums: [], availableUsers: [], loading: false }));
+        state.update((s) => ({
+          ...s,
+          availableAlbums: [],
+          availableUsers: [],
+          loading: false,
+          loadedProfileId: null,
+        }));
       }
       return;
     }
@@ -96,7 +105,14 @@ export const albumsState = {
           );
         }
         if (!isCurrent()) return;
-        state.update((s) => ({ ...s, availableAlbums, availableUsers, loading: false, error: null }));
+        state.update((s) => ({
+          ...s,
+          availableAlbums,
+          availableUsers,
+          loading: false,
+          error: null,
+          loadedProfileId: profile.id,
+        }));
         return;
       } catch (error) {
         if (!isCurrent()) return;

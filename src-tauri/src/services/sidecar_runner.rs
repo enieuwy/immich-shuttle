@@ -52,6 +52,9 @@ pub struct UploadRequest {
     pub overwrite: bool,
     pub tags: Vec<String>,
     pub session_tag: bool,
+    pub include_type: Option<String>,
+    pub include_extensions: Vec<String>,
+    pub exclude_extensions: Vec<String>,
 }
 
 /// Removes the private per-run config directory (with the api-key file inside)
@@ -344,6 +347,24 @@ fn build_upload_args(request: &UploadRequest, config_path: &Path) -> Vec<String>
     if request.session_tag {
         args.push("--session-tag".to_string());
     }
+    if let Some(include_type) = request.include_type.as_deref() {
+        let include_type = include_type.trim();
+        if !include_type.is_empty() {
+            args.push(format!("--include-type={include_type}"));
+        }
+    }
+    if !request.include_extensions.is_empty() {
+        args.push(format!(
+            "--include-extensions={}",
+            request.include_extensions.join(",")
+        ));
+    }
+    if !request.exclude_extensions.is_empty() {
+        args.push(format!(
+            "--exclude-extensions={}",
+            request.exclude_extensions.join(",")
+        ));
+    }
 
     args.push(request.source_path.clone());
     args
@@ -463,6 +484,9 @@ mod tests {
             overwrite: false,
             tags: Vec::new(),
             session_tag: false,
+            include_type: None,
+            include_extensions: Vec::new(),
+            exclude_extensions: Vec::new(),
         }
     }
 
@@ -554,5 +578,25 @@ mod tests {
         // Blank tags are dropped, not emitted as empty --tag= args.
         assert_eq!(args.iter().filter(|a| a.starts_with("--tag=")).count(), 2);
         assert!(args.contains(&"--session-tag".to_string()));
+    }
+
+    #[test]
+    fn filter_flags_absent_by_default() {
+        let args = args_for(Organization::SingleAlbum, None);
+        assert!(!args.iter().any(|a| a.starts_with("--include-type")));
+        assert!(!args.iter().any(|a| a.starts_with("--include-extensions")));
+        assert!(!args.iter().any(|a| a.starts_with("--exclude-extensions")));
+    }
+
+    #[test]
+    fn emits_type_and_extension_filters_when_set() {
+        let mut req = request(Organization::SingleAlbum, None);
+        req.include_type = Some("VIDEO".to_string());
+        req.include_extensions = vec![".mp4".to_string(), ".mov".to_string()];
+        req.exclude_extensions = vec![".gif".to_string()];
+        let args = build_upload_args(&req, Path::new("/cfg.yaml"));
+        assert!(args.contains(&"--include-type=VIDEO".to_string()));
+        assert!(args.contains(&"--include-extensions=.mp4,.mov".to_string()));
+        assert!(args.contains(&"--exclude-extensions=.gif".to_string()));
     }
 }

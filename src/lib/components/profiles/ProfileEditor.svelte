@@ -5,7 +5,8 @@
   import { Label } from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
   import { Alert, AlertDescription } from "$lib/components/ui/alert";
-  import { CheckCircle2, XCircle, Loader2, TriangleAlert } from "@lucide/svelte";
+  import { CheckCircle2, XCircle, Loader2, TriangleAlert, Radar } from "@lucide/svelte";
+  import { discoverImmichServers } from "$lib/api";
 
   let {
     profile = null,
@@ -77,6 +78,26 @@
       saving = false;
     }
   }
+
+  let discovering = $state(false);
+  let discovered = $state<string[]>([]);
+  let discoverMessage = $state("");
+
+  async function scanNetwork() {
+    discovering = true;
+    discoverMessage = "";
+    discovered = [];
+    try {
+      discovered = await discoverImmichServers();
+      if (discovered.length === 0) {
+        discoverMessage = "No Immich servers found on your local network.";
+      }
+    } catch (error) {
+      discoverMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      discovering = false;
+    }
+  }
 </script>
 
 <div class="grid gap-3">
@@ -85,8 +106,36 @@
   {/if}
 
   <div class="grid gap-1.5">
-    <Label for="serverUrl">Primary Immich URL</Label>
+    <div class="flex items-center justify-between gap-2">
+      <Label for="serverUrl">Primary Immich URL</Label>
+      <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" onclick={scanNetwork} disabled={discovering}>
+        {#if discovering}
+          <Loader2 class="mr-1 size-3.5 animate-spin" /> Scanning…
+        {:else}
+          <Radar class="mr-1 size-3.5" /> Scan network
+        {/if}
+      </Button>
+    </div>
     <Input id="serverUrl" bind:value={serverUrl} placeholder="https://immich.example.com" autocapitalize="off" autocorrect="off" spellcheck={false} />
+    {#if discovered.length > 0}
+      <div class="flex flex-wrap gap-1.5">
+        {#each discovered as url (url)}
+          <Button
+            variant="outline"
+            size="sm"
+            class="h-7 px-2 text-xs font-normal"
+            onclick={() => {
+              serverUrl = url;
+              discovered = [];
+            }}
+          >
+            {url}
+          </Button>
+        {/each}
+      </div>
+    {:else if discoverMessage}
+      <p class="text-xs text-muted-foreground">{discoverMessage}</p>
+    {/if}
   </div>
 
   <div class="grid gap-1.5">

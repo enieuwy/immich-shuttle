@@ -158,11 +158,17 @@ describe("queueState", () => {
     importOptionsState.clearDateRange();
     importOptionsState.setOnlyNewSinceLastImport(true);
 
-    // 2026-03-15T12:00:00Z -> floor 2026-03-15, paired with a far-future bound
-    // because immich-go's --date-range rejects an open-ended "floor,".
-    vi.mocked(api.historySourceLastImport).mockResolvedValueOnce(Date.UTC(2026, 2, 15, 12, 0, 0));
+    // Local midday so the local-calendar-zone floor is 2026-03-15 in any TZ,
+    // paired with a far-future bound (immich-go rejects an open-ended "floor,").
+    vi.mocked(api.historySourceLastImport).mockResolvedValueOnce(
+      new Date(2026, 2, 15, 12, 0, 0).getTime(),
+    );
     await queueState.startImport();
     expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.date_range).toBe("2026-03-15,9999-12-31");
+    // Checkpoint lookup is scoped to the active profile.
+    expect(vi.mocked(api.historySourceLastImport)).toHaveBeenLastCalledWith("p1", [
+      "/Volumes/SD/DCIM",
+    ]);
 
     // No stored last-import -> no floor (import everything).
     vi.mocked(api.historySourceLastImport).mockResolvedValueOnce(null);

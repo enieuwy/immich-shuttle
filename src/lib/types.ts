@@ -69,6 +69,12 @@ export interface ImportInput {
   tags?: string[];
   /** immich-go --session-tag. */
   session_tag?: boolean;
+  /** immich-go --include-type: "VIDEO" | "IMAGE". */
+  include_type?: string | null;
+  /** immich-go --include-extensions (leading-dot, lowercase). */
+  include_extensions?: string[];
+  /** immich-go --exclude-extensions. */
+  exclude_extensions?: string[];
 }
 
 export interface FileError {

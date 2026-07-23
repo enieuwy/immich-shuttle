@@ -254,9 +254,14 @@ export const queueState = {
     // far-future upper bound (open-ended "floor," is rejected).
     let dateRange = toImmichDateRange(options.dateFrom, options.dateTo);
     if (!dateRange && options.onlyNewSinceLastImport) {
-      const lastMs = await historySourceLastImport(sourcePaths);
+      const lastMs = await historySourceLastImport(profile.id, sourcePaths);
       if (lastMs != null) {
-        const floor = new Date(lastMs).toISOString().slice(0, 10);
+        // Format in the local calendar zone: immich-go parses --date-range in
+        // local time, so a UTC date could land a day off and skip newer files.
+        const d = new Date(lastMs);
+        const floor = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+          d.getDate(),
+        ).padStart(2, "0")}`;
         dateRange = `${floor},9999-12-31`;
       }
     }
@@ -277,6 +282,10 @@ export const queueState = {
       overwrite: options.overwrite,
       tags: options.tags,
       session_tag: options.sessionTag,
+      include_type:
+        options.mediaType === "image" ? "IMAGE" : options.mediaType === "video" ? "VIDEO" : null,
+      include_extensions: options.includeExtensions,
+      exclude_extensions: options.excludeExtensions,
     });
     await refreshJobs();
   },

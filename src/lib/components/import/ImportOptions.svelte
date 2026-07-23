@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { SlidersHorizontal, Zap } from "@lucide/svelte";
+  import { SlidersHorizontal, Zap, ServerCog } from "@lucide/svelte";
+  import { Button } from "$lib/components/ui/button";
   import { Card, CardContent, CardHeader } from "$lib/components/ui/card";
   import { Input } from "$lib/components/ui/input";
   import { Label } from "$lib/components/ui/label";
@@ -7,6 +8,9 @@
   import { Switch } from "$lib/components/ui/switch";
   import { importOptionsState, isDateRangeInvalid } from "$lib/state/import-options";
   import { autoImportState } from "$lib/state/auto-import";
+  import { sourceState } from "$lib/state/source";
+  import { activeProfile } from "$lib/state/profiles";
+  import { importForecast, type ImportForecast } from "$lib/api";
   import DeviceRuleControl from "$lib/components/source/DeviceRuleControl.svelte";
   import type { ImportOrganization } from "$lib/types";
 
@@ -37,6 +41,42 @@
         .filter((t) => t.length > 0),
     );
   }
+  const includeExtText = $derived($importOptionsState.includeExtensions.join(", "));
+  const excludeExtText = $derived($importOptionsState.excludeExtensions.join(", "));
+  function parseExtensions(raw: string): string[] {
+    return raw
+      .split(",")
+      .map((e) => e.trim().replace(/^\.+/, "").toLowerCase())
+      .filter((e) => e.length > 0)
+      .map((e) => `.${e}`);
+  }
+  const mediaTypes: Array<{ value: "all" | "image" | "video"; label: string }> = [
+    { value: "all", label: "All" },
+    { value: "image", label: "Photos" },
+    { value: "video", label: "Videos" },
+  ];
+
+  let forecast = $state<ImportForecast | null>(null);
+  let forecasting = $state(false);
+  let forecastError = $state("");
+  const canForecast = $derived(
+    !!$activeProfile && $sourceState.selectedPaths.length > 0 && !forecasting,
+  );
+
+  async function checkServer() {
+    const profile = $activeProfile;
+    if (!profile || $sourceState.selectedPaths.length === 0) return;
+    forecasting = true;
+    forecastError = "";
+    forecast = null;
+    try {
+      forecast = await importForecast(profile.id, $sourceState.selectedPaths);
+    } catch (error) {
+      forecastError = error instanceof Error ? error.message : String(error);
+    } finally {
+      forecasting = false;
+    }
+  }
 </script>
 
 <Card>
@@ -48,6 +88,34 @@
   </CardHeader>
 
   <CardContent class="flex flex-col gap-1">
+    <div class="rounded-lg border border-border/60 bg-muted/30 p-3">
+      <div class="flex items-center justify-between gap-3">
+        <div class="flex min-w-0 flex-col items-start gap-0.5">
+          <span class="text-sm font-medium text-foreground">Check server</span>
+          <span class="text-xs text-muted-foreground">Preview how much would upload vs. is already on the server.</span>
+        </div>
+        <Button variant="outline" size="sm" disabled={!canForecast} onclick={checkServer}>
+          <ServerCog class="mr-1 h-4 w-4" />
+          {forecasting ? "Checking…" : "Check"}
+        </Button>
+      </div>
+      {#if forecastError}
+        <p class="mt-2 text-xs text-destructive">{forecastError}</p>
+      {:else if forecast}
+        <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs">
+          <span class="text-foreground"><span class="font-semibold text-primary">{forecast.new}</span> to upload</span>
+          <span class="text-muted-foreground"><span class="font-semibold text-foreground">{forecast.already_present}</span> already on server</span>
+          {#if forecast.unreadable > 0}
+            <span class="text-muted-foreground"><span class="font-semibold text-foreground">{forecast.unreadable}</span> unreadable</span>
+          {/if}
+          {#if forecast.truncated}
+            <span class="text-muted-foreground">(sampled first {5000} files)</span>
+          {/if}
+        </div>
+      {/if}
+    </div>
+
+    <Separator class="my-2" />
     <div class="flex items-center justify-between gap-3 rounded-lg p-3 transition-colors hover:bg-muted/50">
       <Label
         for="import-option-stack-raw-jpeg"
@@ -303,6 +371,63 @@
           onCheckedChange={(v) => importOptionsState.setSessionTag(v)}
         />
       </div>
+    </div>
+
+    <Separator class="my-2" />
+
+    <div class="rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <div class="flex min-w-0 flex-col items-start gap-1">
+        <span class="text-sm font-medium text-foreground">Media type</span>
+        <span class="text-xs text-muted-foreground">Import only one kind of media, or both.</span>
+      </div>
+      <div class="mt-2 flex gap-2" role="group" aria-label="Media type filter">
+        {#each mediaTypes as { value, label } (value)}
+          <Button
+            variant={$importOptionsState.mediaType === value ? "default" : "outline"}
+            size="sm"
+            aria-pressed={$importOptionsState.mediaType === value}
+            onclick={() => importOptionsState.setMediaType(value)}
+          >
+            {label}
+          </Button>
+        {/each}
+      </div>
+    </div>
+
+    <div class="rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <Label
+        for="import-option-include-ext"
+        class="flex min-w-0 flex-col items-start gap-1 font-normal"
+      >
+        <span class="text-sm font-medium text-foreground">Only these extensions</span>
+        <span class="text-xs text-muted-foreground">Comma-separated (e.g. jpg, heic). Leave empty for all.</span>
+      </Label>
+      <Input
+        id="import-option-include-ext"
+        class="mt-2"
+        placeholder="jpg, heic, mp4"
+        aria-label="Only these extensions"
+        value={includeExtText}
+        onchange={(e) => importOptionsState.setIncludeExtensions(parseExtensions(e.currentTarget.value))}
+      />
+    </div>
+
+    <div class="rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <Label
+        for="import-option-exclude-ext"
+        class="flex min-w-0 flex-col items-start gap-1 font-normal"
+      >
+        <span class="text-sm font-medium text-foreground">Exclude extensions</span>
+        <span class="text-xs text-muted-foreground">Comma-separated (e.g. gif, aae) to skip.</span>
+      </Label>
+      <Input
+        id="import-option-exclude-ext"
+        class="mt-2"
+        placeholder="gif, aae"
+        aria-label="Exclude extensions"
+        value={excludeExtText}
+        onchange={(e) => importOptionsState.setExcludeExtensions(parseExtensions(e.currentTarget.value))}
+      />
     </div>
 
     <Separator class="my-2" />

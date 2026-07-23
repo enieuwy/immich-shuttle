@@ -143,11 +143,81 @@ pub async fn verify_uploaded(
     })
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ForecastResult {
+    /// Files not on the server — these would upload.
+    pub new: usize,
+    /// Files the server already holds — these would be skipped.
+    pub already_present: usize,
+    /// Files that could not be read/hashed.
+    pub unreadable: usize,
+    /// The candidate set was capped; counts are a lower bound.
+    pub truncated: bool,
+}
+
+/// Read-only preflight: partitions `paths` into files the server already holds
+/// vs. new uploads, using the same SHA-1 + bulk-upload-check path as
+/// verify-before-wipe. Safe to run repeatedly; never mutates anything.
+pub async fn forecast_upload(
+    server_url: &str,
+    api_key: &str,
+    paths: &[String],
+) -> Result<ForecastResult, String> {
+    if paths.is_empty() {
+        return Ok(ForecastResult::default());
+    }
+
+    // Hashing reads files from (possibly slow) media; keep it off the async runtime.
+    let owned: Vec<String> = paths.to_vec();
+    let hashed: Vec<(String, Option<String>)> = tokio::task::spawn_blocking(move || {
+        owned
+            .into_iter()
+            .map(|path| {
+                let checksum = file_sha1_hex(&path).ok();
+                (path, checksum)
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| format!("Checksum task failed: {e}"))?;
+
+    let mut unreadable = 0usize;
+    let mut to_check: Vec<(String, String)> = Vec::new();
+    for (path, checksum) in hashed {
+        match checksum {
+            Some(sum) => to_check.push((path, sum)),
+            None => unreadable += 1,
+        }
+    }
+
+    let client = ImmichClient::new(server_url, api_key);
+    let present = client.bulk_upload_check(&to_check).await?;
+
+    let (new, already_present) = partition_present(&to_check, &present);
+
+    Ok(ForecastResult {
+        new,
+        already_present,
+        unreadable,
+        truncated: false,
+    })
+}
+
+/// Partitions checked (path, checksum) items into (new, already_present) by the
+/// set of ids the server reports it already holds. Pure so the count logic is
+/// unit-tested without a live server.
+fn partition_present(
+    to_check: &[(String, String)],
+    present: &std::collections::HashSet<String>,
+) -> (usize, usize) {
+    let already_present = to_check.iter().filter(|(p, _)| present.contains(p)).count();
+    (to_check.len() - already_present, already_present)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{file_sha1_hex, partition_present, wipe_files};
     use std::{fs, path::PathBuf};
-
-    use super::{file_sha1_hex, wipe_files};
 
     fn temp_file(stem: &str, ext: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -205,5 +275,21 @@ mod tests {
         let _ = fs::remove_file(&file);
         // Immich matches assets by SHA-1; this is sha1("hello").
         assert_eq!(hex, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
+    }
+
+    #[test]
+    fn partition_present_splits_new_and_already_present() {
+        let to_check = vec![
+            ("/a.jpg".to_string(), "sum-a".to_string()),
+            ("/b.jpg".to_string(), "sum-b".to_string()),
+            ("/c.jpg".to_string(), "sum-c".to_string()),
+        ];
+        let present: std::collections::HashSet<String> =
+            ["/b.jpg".to_string(), "/c.jpg".to_string()]
+                .into_iter()
+                .collect();
+        let (new, already_present) = partition_present(&to_check, &present);
+        assert_eq!(new, 1);
+        assert_eq!(already_present, 2);
     }
 }

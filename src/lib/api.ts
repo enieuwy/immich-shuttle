@@ -28,6 +28,10 @@ export function profilesList(): Promise<Profile[]> {
   return invokeCommand<Profile[]>("profiles_list");
 }
 
+export function discoverImmichServers(): Promise<string[]> {
+  return invokeCommand<string[]>("discover_immich_servers");
+}
+
 export function profileUpsert(input: ProfileInput): Promise<Profile> {
   return invokeCommand<Profile>("profile_upsert", { input });
 }
@@ -152,6 +156,28 @@ export function historyClear(): Promise<void> {
   return invokeCommand<void>("history_clear");
 }
 
-export function historySourceLastImport(sourcePaths: string[]): Promise<number | null> {
-  return invokeCommand<number | null>("history_source_last_import", { sourcePaths });
+export function historySourceLastImport(
+  profileId: string,
+  sourcePaths: string[],
+): Promise<number | null> {
+  return invokeCommand<number | null>("history_source_last_import", { profileId, sourcePaths });
+}
+
+export interface ImportForecast {
+  new: number;
+  already_present: number;
+  unreadable: number;
+  truncated: boolean;
+}
+
+export function importForecast(
+  profileId: string,
+  sourcePaths: string[],
+  selectFiles?: string[] | null,
+): Promise<ImportForecast> {
+  return invokeCommand<ImportForecast>("import_forecast", {
+    profileId,
+    sourcePaths,
+    selectFiles: selectFiles ?? null,
+  });
 }

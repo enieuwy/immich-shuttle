@@ -100,7 +100,7 @@
           {/if}
         {/each}
         {@const openableAlbum = $albumsState.availableAlbums.find((a) => a.id === $albumsState.selectedAlbumIds[0])}
-        {#if openableAlbum}
+        {#if openableAlbum && $albumsState.loadedProfileId === $activeProfile?.id}
           <Button
             variant="ghost"
             size="sm"

@@ -13,6 +13,14 @@ pub async fn profiles_list() -> Result<Vec<Profile>, String> {
     profile_store::list_profiles()
 }
 
+/// Scan the local network for reachable Immich servers, returning confirmed
+/// base URLs the user can one-click into a profile. Read-only; probes only the
+/// unauthenticated ping endpoint.
+#[tauri::command]
+pub async fn discover_immich_servers() -> Result<Vec<String>, String> {
+    Ok(crate::services::discovery::discover_immich_servers().await)
+}
+
 #[tauri::command]
 pub async fn profile_upsert(input: ProfileInput) -> Result<Profile, String> {
     if input.server_url.trim().is_empty() {

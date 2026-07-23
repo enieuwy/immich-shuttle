@@ -13,6 +13,7 @@
   import { selectionState } from "$lib/state/selection";
   import { historyState } from "$lib/state/history";
   import { historySourceLastImport } from "$lib/api";
+  import { activeProfile } from "$lib/state/profiles";
   import type { RemovableDevice } from "$lib/types";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
@@ -44,13 +45,14 @@
   $effect(() => {
     const lastImportVersion = $historyState.lastImportVersion;
     const paths = $sourceState.selectedPaths;
-    if (paths.length === 0) {
+    const profile = $activeProfile;
+    if (paths.length === 0 || !profile) {
       lastImportedAt = null;
       return;
     }
     lastImportedAt = null;
     let cancelled = false;
-    void historySourceLastImport(paths).then((ms) => {
+    void historySourceLastImport(profile.id, paths).then((ms) => {
       if (!cancelled && lastImportVersion === $historyState.lastImportVersion) {
         lastImportedAt = ms;
       }

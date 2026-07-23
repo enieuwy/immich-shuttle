@@ -163,6 +163,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::profiles::profiles_list,
+            commands::profiles::discover_immich_servers,
             commands::profiles::profile_upsert,
             commands::profiles::profile_delete,
             commands::profiles::profile_validate,
@@ -171,6 +172,7 @@ pub fn run() {
             commands::albums::album_share_users,
             commands::albums::album_share_link,
             commands::import::import_start,
+            commands::import::import_forecast,
             commands::import::import_confirm_wipe,
             commands::import::import_cancel,
             commands::import::import_list_jobs,
