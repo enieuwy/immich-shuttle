@@ -8,12 +8,12 @@
 //! at that directory. Links are symlinks where possible, falling back to hard
 //! links then a copy. Cleanup removes only the links, never the originals.
 
+use fs4::fs_std::FileExt;
 use std::{
     collections::HashSet,
     fs,
     path::{Component, Path, PathBuf},
 };
-
 use uuid::Uuid;
 
 /// Owns a temporary staging directory and removes it when dropped.
@@ -23,6 +23,7 @@ use uuid::Uuid;
 /// panics, so staged links cannot outlive their import.
 pub struct StagingDir {
     path: Option<PathBuf>,
+    lock: Option<fs::File>,
 }
 
 impl StagingDir {
@@ -33,7 +34,9 @@ impl StagingDir {
     }
 
     fn cleanup(&mut self) {
-        if let Some(path) = self.path.take() {
+        let path = self.path.take();
+        drop(self.lock.take());
+        if let Some(path) = path {
             let _ = fs::remove_dir_all(path);
         }
     }
@@ -43,7 +46,9 @@ impl Drop for StagingDir {
     fn drop(&mut self) {
         // Cancellation and panic paths may drop this guard on an async worker.
         // Detached cleanup keeps that runtime worker from blocking on the filesystem.
-        if let Some(path) = self.path.take() {
+        let path = self.path.take();
+        drop(self.lock.take());
+        if let Some(path) = path {
             // `thread::spawn` panics if the OS refuses a new thread; a panic in
             // Drop during unwinding would abort the process. Use the fallible
             // Builder and fall back to synchronous removal so cleanup still runs.
@@ -71,9 +76,19 @@ pub fn create_staging_dir(selected: &[String]) -> Result<StagingDir, String> {
 
     let root = std::env::temp_dir().join(format!("immich-shuttle-stage-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).map_err(|e| format!("Could not create staging dir: {e}"))?;
+    let lock = match acquire_dir_lock(&root) {
+        Ok(lock) => lock,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&root);
+            return Err(format!("Could not lock staging dir: {e}"));
+        }
+    };
     // Construct the guard immediately after creation so unwinding during any
     // later staging operation removes partially-created links as well.
-    let guard = StagingDir { path: Some(root) };
+    let guard = StagingDir {
+        path: Some(root),
+        lock: Some(lock),
+    };
 
     let base = common_ancestor(selected);
     let mut linked = 0_usize;
@@ -131,6 +146,25 @@ pub fn create_staging_dir(selected: &[String]) -> Result<StagingDir, String> {
 /// Remove a staging directory. Only the links are removed; targets are untouched.
 pub fn cleanup_staging_dir(mut dir: StagingDir) {
     dir.cleanup();
+}
+
+/// Create and exclusively lock a per-run artifact's `.lock` file.
+///
+/// The returned handle must remain alive for the artifact's lifetime.
+pub(crate) fn acquire_dir_lock(dir: &Path) -> std::io::Result<fs::File> {
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(dir.join(".lock"))?;
+    if lock.try_lock_exclusive()? {
+        Ok(lock)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "temporary artifact lock is already held",
+        ))
+    }
 }
 
 fn link_file(src: &Path, dest: &Path) -> Result<(), String> {
@@ -333,6 +367,26 @@ mod tests {
         fs::remove_dir_all(&tmp).unwrap();
     }
 
+    #[test]
+    fn directory_lock_blocks_another_owner_until_released() {
+        let dir = std::env::temp_dir().join(format!("stage-lock-{}", Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+
+        let first = acquire_dir_lock(&dir).unwrap();
+        let second = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(".lock"))
+            .unwrap();
+        assert!(!second.try_lock_exclusive().unwrap());
+
+        drop(first);
+        assert!(second.try_lock_exclusive().unwrap());
+
+        drop(second);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn walkdir_files(root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];
@@ -344,7 +398,8 @@ mod tests {
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
-                } else {
+                } else if path.file_name().and_then(|n| n.to_str()) != Some(".lock") {
+                    // Skip the per-run lease marker; it is not part of the staged payload.
                     out.push(path);
                 }
             }

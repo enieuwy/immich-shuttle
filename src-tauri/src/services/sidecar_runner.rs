@@ -9,7 +9,6 @@ use std::{
     },
     time::Duration,
 };
-
 use tauri::{async_runtime::Receiver, AppHandle, Emitter};
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
@@ -18,6 +17,8 @@ use tauri_plugin_shell::{
 use uuid::Uuid;
 
 use crate::models::job::Organization;
+use crate::services::staging::acquire_dir_lock;
+
 use crate::services::stdout_parser::{ProgressAccumulator, RunProgress};
 
 #[derive(Debug, Clone, Default)]
@@ -54,10 +55,12 @@ pub struct UploadRequest {
 struct TempConfig {
     dir: PathBuf,
     path: PathBuf,
+    lock: Option<fs::File>,
 }
 
 impl Drop for TempConfig {
     fn drop(&mut self) {
+        drop(self.lock.take());
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -80,10 +83,18 @@ fn write_api_key_config(api_key: &str) -> Result<TempConfig, String> {
     dir_builder
         .create(&dir)
         .map_err(|e| format!("Could not create immich-go config directory: {e}"))?;
+    let lock = match acquire_dir_lock(&dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(format!("Could not lock immich-go config directory: {e}"));
+        }
+    };
     // Construct the guard before writing so a write failure still cleans up the dir.
     let guard = TempConfig {
         dir: dir.clone(),
         path: dir.join("config.yaml"),
+        lock: Some(lock),
     };
 
     let escaped = api_key.replace('\\', "\\\\").replace('"', "\\\"");
