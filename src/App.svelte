@@ -17,6 +17,7 @@
   import SourcePicker from "$lib/components/source/SourcePicker.svelte";
   import AutoImportBanner from "$lib/components/source/AutoImportBanner.svelte";
   import PreviewDialog from "$lib/components/preview/PreviewDialog.svelte";
+  import CommandPalette, { type PaletteCommand } from "$lib/components/layout/CommandPalette.svelte";
   import { Button } from "$lib/components/ui/button";
   import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "$lib/components/ui/dialog";
   import { activeProfile, getProfilesSnapshot, profilesState } from "$lib/state/profiles";
@@ -26,6 +27,7 @@
   import { selectionState } from "$lib/state/selection";
   import { sourceState } from "$lib/state/source";
   import { openProfileEditor, panelTab } from "$lib/state/ui";
+  import { themeState } from "$lib/state/theme";
   import { isDateRangeInvalid, importOptionsState } from "$lib/state/import-options";
 
 
@@ -34,6 +36,7 @@
   let showOnboarding = $state(false);
   let importError = $state("");
   let editTarget = $state<Profile | null>(null);
+  let showPalette = $state(false);
 
   // When a profile has no API key, the Albums CTA requests its editor — open the
   // profile manager straight on that profile so the user lands on the key field.
@@ -79,6 +82,36 @@
       importError = error instanceof Error ? error.message : String(error);
     }
   }
+
+  function handleGlobalKeydown(event: KeyboardEvent) {
+    if ((event.metaKey || event.ctrlKey) && (event.key === "k" || event.key === "K")) {
+      event.preventDefault();
+      showPalette = !showPalette;
+    }
+  }
+
+  const paletteCommands: PaletteCommand[] = [
+    { id: "goto-queue", label: "Go to Queue", keywords: ["jobs", "imports"], run: () => panelTab.set("queue") },
+    { id: "goto-history", label: "Go to History", keywords: ["past", "runs"], run: () => panelTab.set("history") },
+    { id: "start-import", label: "Start Import", keywords: ["run", "upload"], run: () => void startImport() },
+    { id: "open-logs", label: "Open Logs", keywords: ["debug", "output"], run: () => (showLogs = true) },
+    {
+      id: "manage-profiles",
+      label: "Manage Profiles",
+      keywords: ["servers", "accounts"],
+      run: () => {
+        editTarget = null;
+        showManager = true;
+      },
+    },
+    {
+      id: "edit-profile",
+      label: "Edit Active Profile",
+      keywords: ["api key", "settings"],
+      run: () => openProfileEditor.set(true),
+    },
+    { id: "cycle-theme", label: "Cycle Theme", keywords: ["dark", "light", "appearance"], run: () => themeState.cycle() },
+  ];
 
   onMount(() => {
     let disposed = false;
@@ -156,6 +189,8 @@
   });
 
 </script>
+
+<svelte:window onkeydown={handleGlobalKeydown} />
 
 <AppLayout>
   {#snippet profile()}
@@ -251,6 +286,8 @@
 <LogViewer bind:open={showLogs} />
 
 <PreviewDialog />
+
+<CommandPalette bind:open={showPalette} commands={paletteCommands} />
 
 {#if showOnboarding}
   <OnboardingOverlay onDone={() => (showOnboarding = false)} />
