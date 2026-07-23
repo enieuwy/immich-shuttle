@@ -4,7 +4,7 @@
 
 <h1 align="center">Immich Shuttle</h1>
 
-<p align="center">A cross-platform desktop importer for Immich, built with Tauri v2 + Svelte 5.</p>
+<p align="center">A cross-platform desktop importer for Immich, built with Tauri v2 + Svelte 5. Powered by <a href="https://github.com/simulot/immich-go">immich-go</a>.</p>
 
 <p align="center">
   <img src="docs/screenshot.png" alt="Immich Shuttle — source picker, albums, and import queue" width="900" />
@@ -133,7 +133,7 @@ PRs are welcome. Keep changes focused, include verification output, and update d
 
 ## Acknowledgements
 
-Immich Shuttle uses [**immich-go**](https://github.com/simulot/immich-go) by Stéphane Guillou ([@simulot](https://github.com/simulot)) as its bundled upload engine — it does the actual heavy lifting of transferring media to your Immich server. Immich Shuttle wraps it with a desktop UI for profile management, source selection, album targeting, and import monitoring. Huge thanks to the immich-go project and its contributors.
+Immich Shuttle uses [**immich-go**](https://github.com/simulot/immich-go) by Jean-François Cassan ([@simulot](https://github.com/simulot)) as its bundled upload engine — it does the actual heavy lifting of transferring media to your Immich server. Immich Shuttle wraps it with a desktop UI for profile management, source selection, album targeting, and import monitoring. Huge thanks to the immich-go project and its contributors.
 
 ## License
 
