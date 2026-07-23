@@ -34,8 +34,8 @@ describe("userDisplayNames", () => {
 
 describe("avatarStyle", () => {
   it("maps Immich avatar color names onto the shared palette", () => {
-    expect(avatarStyle({ id: "u1", avatar_color: "blue" }).bg).toBe("#1d4ed8");
-    expect(avatarStyle({ id: "u1", avatar_color: "pink" }).bg).toBe("#be185d");
+    expect(avatarStyle({ id: "u1", avatar_color: "blue" }).bg).toBe("#3d6f98");
+    expect(avatarStyle({ id: "u1", avatar_color: "pink" }).bg).toBe("#90556f");
   });
 
   it("uses dark text on yellow and amber for badge-size contrast", () => {
@@ -57,7 +57,7 @@ describe("avatarStyle", () => {
   });
 
   it("prefers the named color over the hash fallback", () => {
-    expect(avatarStyle({ id: "u-a", avatar_color: "gray" }).bg).toBe("#4b5563");
+    expect(avatarStyle({ id: "u-a", avatar_color: "gray" }).bg).toBe("#656970");
   });
 
   it("every palette pair meets WCAG 4.5:1 — initials render at 8-9px", () => {

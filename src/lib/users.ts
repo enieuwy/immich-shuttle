@@ -34,21 +34,24 @@ export interface AvatarStyle {
 }
 
 /**
- * Badge colors following Immich's avatar palette hues, darkened where needed
- * so every fg/bg pair meets WCAG 4.5:1 — the initials render at 8-9px, where
- * marginal contrast is simply unreadable. Yellow and amber keep dark text.
+ * Badge colors: a cohesive, muted family (uniform chroma, two luminance tiers)
+ * tuned to sit calmly on the dark, desaturated surfaces rather than the punchy
+ * saturated primaries that read as garish stickers on near-black. Hues still
+ * follow Immich's avatar-color names so identity stays per-person; every fg/bg
+ * pair clears WCAG 4.5:1 for legibility at 8-9px (enforced by a test). The
+ * warm light tier (orange/amber/yellow) uses dark text.
  */
 const AVATAR_COLORS: Record<string, AvatarStyle> = {
-  primary: { bg: "#4250af", fg: "#ffffff" },
-  pink: { bg: "#be185d", fg: "#ffffff" },
-  red: { bg: "#b91c1c", fg: "#ffffff" },
-  yellow: { bg: "#eab308", fg: "#292103" },
-  blue: { bg: "#1d4ed8", fg: "#ffffff" },
-  green: { bg: "#15803d", fg: "#ffffff" },
-  purple: { bg: "#9333ea", fg: "#ffffff" },
-  orange: { bg: "#c2410c", fg: "#ffffff" },
-  gray: { bg: "#4b5563", fg: "#ffffff" },
-  amber: { bg: "#d97706", fg: "#2b1a02" },
+  primary: { bg: "#5366a7", fg: "#ffffff" },
+  pink: { bg: "#90556f", fg: "#ffffff" },
+  red: { bg: "#95564e", fg: "#ffffff" },
+  yellow: { bg: "#cabf7f", fg: "#332800" },
+  blue: { bg: "#3d6f98", fg: "#ffffff" },
+  green: { bg: "#3a7957", fg: "#ffffff" },
+  purple: { bg: "#765d92", fg: "#ffffff" },
+  orange: { bg: "#e9b089", fg: "#471900" },
+  gray: { bg: "#656970", fg: "#ffffff" },
+  amber: { bg: "#dcb77f", fg: "#3f2100" },
 };
 
 /** Hash fallback rotation for servers that omit `avatarColor`. */
