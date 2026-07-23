@@ -1,6 +1,7 @@
 import { get, writable } from "svelte/store";
 
 import { albumCreate, albumShareLink, albumShareUsers, albumsList, usersList, type AlbumShareRole } from "$lib/api";
+import { avatarsState } from "$lib/state/avatars";
 import { errorsState } from "$lib/state/errors";
 import type { Album, AlbumUser } from "$lib/types";
 
@@ -113,6 +114,12 @@ export const albumsState = {
           error: null,
           loadedProfileId: profile.id,
         }));
+        // Warm the avatar cache for everyone who can render as a badge:
+        // album shared-with stacks plus the share-with-users picker.
+        avatarsState.prefetch(profile.id, [
+          ...availableAlbums.flatMap((album) => album.shared_with),
+          ...availableUsers,
+        ]);
         return;
       } catch (error) {
         if (!isCurrent()) return;

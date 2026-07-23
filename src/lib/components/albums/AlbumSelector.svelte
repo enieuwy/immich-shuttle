@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Link, Search, Plus, X, Images, KeyRound, ExternalLink } from "@lucide/svelte";
   import { userDisplayNames } from "$lib/users";
+  import UserAvatar from "$lib/components/albums/UserAvatar.svelte";
 
   import { albumsState } from "$lib/state/albums";
   import { errorsState } from "$lib/state/errors";
@@ -189,12 +190,8 @@
               <span class="truncate">{album.album_name}</span>
               {#if album.shared_with.length > 0}
                 <span class="flex shrink-0 -space-x-1" aria-hidden="true">
-                  {#each album.shared_with.slice(0, 3) as user}
-                    <span
-                      class="grid size-4 place-items-center rounded-full bg-primary/70 text-[8px] font-semibold text-primary-foreground ring-1 ring-card"
-                    >
-                      {user.name.charAt(0).toUpperCase()}
-                    </span>
+                  {#each album.shared_with.slice(0, 3) as user (user.id)}
+                    <UserAvatar {user} profileId={$activeProfile?.id} class="size-4 text-[8px]" />
                   {/each}
                   {#if album.shared_with.length > 3}
                     <span
@@ -228,7 +225,7 @@
         <div class="flex flex-col gap-2">
           <Label>Share with users (optional)</Label>
           <div class="flex flex-col gap-2 rounded-md border border-border bg-background p-3">
-            {#each $albumsState.availableUsers as user}
+            {#each $albumsState.availableUsers as user (user.id)}
               <label class="flex items-center gap-2 cursor-pointer">
                 <input
                   type="checkbox"
@@ -236,6 +233,7 @@
                   checked={selectedShareUserIds.includes(user.id)}
                   onchange={() => toggleShareUser(user.id)}
                 />
+                <UserAvatar {user} profileId={$activeProfile?.id} class="size-5 text-[9px]" />
                 <span class="text-sm font-medium leading-none text-foreground">{user.name}</span>
               </label>
             {/each}

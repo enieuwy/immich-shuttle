@@ -26,6 +26,10 @@ export interface AlbumUser {
   id: string;
   name: string;
   email?: string | null;
+  /** Immich avatar color name (e.g. "blue", "pink"); absent on older servers. */
+  avatar_color?: string | null;
+  /** True when the user has a profile image fetchable via `userProfileImage`. */
+  has_profile_image?: boolean;
 }
 
 export interface Album {

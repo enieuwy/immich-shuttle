@@ -67,6 +67,8 @@ function handle(cmd: string, args: InvokeArgs): unknown {
       return fixtures.albums;
     case "users_list":
       return fixtures.users;
+    case "user_profile_image":
+      return fixtures.profileImages[(args?.userId as string) ?? ""] ?? null;
     case "import_list_jobs":
       return fixtures.jobsForScenario(scenario);
     case "devices_list_removable":

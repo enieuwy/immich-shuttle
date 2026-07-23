@@ -190,6 +190,7 @@ pub fn run() {
             commands::preview::preview_cancel,
             commands::devices::devices_list_removable,
             commands::users::users_list,
+            commands::users::user_profile_image,
             commands::settings::get_server_info,
             commands::settings::get_logs_dir,
             commands::settings::get_recent_logs,

@@ -56,10 +56,33 @@ export const serverInfo: ServerInfo = {
 };
 
 export const users: AlbumUser[] = [
-  { id: "u-grace", name: "Grace Hopper", email: "grace@example.com" },
-  { id: "u-alan", name: "Alan Turing", email: "alan@example.com" },
-  { id: "u-katherine", name: "Katherine Johnson", email: "kat@example.com" },
+  {
+    id: "u-grace",
+    name: "Grace Hopper",
+    email: "grace@example.com",
+    avatar_color: "purple",
+    has_profile_image: true,
+  },
+  { id: "u-alan", name: "Alan Turing", email: "alan@example.com", avatar_color: "green" },
+  { id: "u-katherine", name: "Katherine Johnson", email: "kat@example.com", avatar_color: "amber" },
 ];
+
+/**
+ * Tiny inline SVG so the profile-image code path renders in the browser
+ * preview: a warm-toned "portrait" disc for Grace, everyone else falls back
+ * to their colored initial.
+ */
+export const profileImages: Record<string, string> = {
+  "u-grace":
+    "data:image/svg+xml;utf8," +
+    encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">' +
+        '<rect width="32" height="32" fill="#7c5cbf"/>' +
+        '<circle cx="16" cy="12" r="6" fill="#f2d5b8"/>' +
+        '<path d="M4 32a12 9 0 0 1 24 0z" fill="#e8b04b"/>' +
+        "</svg>",
+    ),
+};
 
 export const albums: Album[] = [
   { id: "a-vacation", album_name: "Summer Vacation 2024", shared_with: [users[0]] },

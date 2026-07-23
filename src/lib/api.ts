@@ -108,6 +108,10 @@ export function usersList(profileId: string): Promise<AlbumUser[]> {
   return invokeCommand<AlbumUser[]>("users_list", { profileId });
 }
 
+export function userProfileImage(profileId: string, userId: string): Promise<string | null> {
+  return invokeCommand<string | null>("user_profile_image", { profileId, userId });
+}
+
 export function getServerInfo(profileId: string): Promise<ServerInfo> {
   return invokeCommand<ServerInfo>("get_server_info", { profileId });
 }

@@ -21,13 +21,13 @@ use crate::models::album::{Album, AlbumShareLink, AlbumUser};
 /// misconfigured endpoint cannot make the app buffer an unbounded response.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-async fn response_text_limited(mut response: Response) -> Result<String, String> {
+async fn response_bytes_limited(
+    mut response: Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
     if let Some(content_length) = response.content_length() {
-        if content_length > MAX_RESPONSE_BYTES as u64 {
-            return Err(format!(
-                "response exceeds the {} byte limit",
-                MAX_RESPONSE_BYTES
-            ));
+        if content_length > max_bytes as u64 {
+            return Err(format!("response exceeds the {max_bytes} byte limit"));
         }
     }
 
@@ -41,15 +41,16 @@ async fn response_text_limited(mut response: Response) -> Result<String, String>
             .len()
             .checked_add(chunk.len())
             .ok_or_else(|| "response exceeds the byte limit".to_string())?;
-        if total > MAX_RESPONSE_BYTES {
-            return Err(format!(
-                "response exceeds the {} byte limit",
-                MAX_RESPONSE_BYTES
-            ));
+        if total > max_bytes {
+            return Err(format!("response exceeds the {max_bytes} byte limit"));
         }
         body.extend_from_slice(&chunk);
     }
+    Ok(body)
+}
 
+async fn response_text_limited(response: Response) -> Result<String, String> {
+    let body = response_bytes_limited(response, MAX_RESPONSE_BYTES).await?;
     String::from_utf8(body).map_err(|e| format!("response is not valid UTF-8: {e}"))
 }
 
@@ -124,6 +125,38 @@ pub struct MeUser {
     pub id: String,
     pub name: Option<String>,
     pub email: Option<String>,
+}
+
+/// Parse an Immich `UserResponseDto` into an `AlbumUser`. Shared by the user
+/// list and the album `albumUsers[].user` entries so avatar metadata stays
+/// consistent everywhere a person badge renders.
+fn parse_album_user(user: &Value) -> Option<AlbumUser> {
+    let id = user.get("id")?.as_str()?.to_string();
+    let name = user
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| user.get("email").and_then(Value::as_str))
+        .unwrap_or("Immich User")
+        .to_string();
+    let email = user
+        .get("email")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let avatar_color = user
+        .get("avatarColor")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let has_profile_image = user
+        .get("profileImagePath")
+        .and_then(Value::as_str)
+        .is_some_and(|p| !p.is_empty());
+    Some(AlbumUser {
+        id,
+        name,
+        email,
+        avatar_color,
+        has_profile_image,
+    })
 }
 
 pub struct ImmichClient {
@@ -236,24 +269,65 @@ impl ImmichClient {
         let raw = serde_json::from_value::<Vec<Value>>(value)
             .map_err(|e| format!("Failed parsing /users list: {e}"))?;
 
-        let users = raw
-            .into_iter()
-            .filter_map(|item| {
-                let id = item.get("id")?.as_str()?.to_string();
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .or_else(|| item.get("email").and_then(Value::as_str))
-                    .unwrap_or("Immich User")
-                    .to_string();
-                let email = item
-                    .get("email")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string);
-                Some(AlbumUser { id, name, email })
-            })
-            .collect();
+        let users = raw.iter().filter_map(parse_album_user).collect();
         Ok(users)
+    }
+    /// Fetch a user's profile image (avatar). `Ok(None)` means the user has no
+    /// image (404). Bytes are bounded so a misbehaving server cannot force an
+    /// unbounded buffer; avatars are small crops, so 8 MiB is generous.
+    pub async fn get_profile_image(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<(Vec<u8>, String)>, String> {
+        const MAX_AVATAR_BYTES: usize = 8 * 1024 * 1024;
+        let display_path = format!("/users/{user_id}/profile-image");
+        let candidates = api_endpoint_urls(&self.server_url, &["users", user_id, "profile-image"])?;
+
+        for (index, url) in candidates.iter().enumerate() {
+            let has_alternate = index + 1 < candidates.len();
+            match self
+                .http
+                .get(url.clone())
+                .header("x-api-key", &self.api_key)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.as_u16() == 404 {
+                        if has_alternate {
+                            continue;
+                        }
+                        return Ok(None);
+                    }
+                    if !status.is_success() {
+                        return Err(format!("API GET {display_path} failed at {url} ({status})"));
+                    }
+                    // Only a plain image MIME may flow into the data URL the
+                    // frontend renders; anything else falls back to JPEG.
+                    let mime = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.split(';').next())
+                        .map(str::trim)
+                        .filter(|v| v.starts_with("image/"))
+                        .unwrap_or("image/jpeg")
+                        .to_string();
+                    let bytes = response_bytes_limited(resp, MAX_AVATAR_BYTES)
+                        .await
+                        .map_err(|e| format!("Failed reading profile image: {e}"))?;
+                    return Ok(Some((bytes, mime)));
+                }
+                Err(e) => {
+                    if has_alternate {
+                        continue;
+                    }
+                    return Err(format!("API GET {display_path} failed at {url}: {e}"));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub async fn list_albums(&self, query: Option<&str>) -> Result<Vec<Album>, String> {
@@ -286,25 +360,7 @@ impl ImmichClient {
                 .map(|entries| {
                     entries
                         .iter()
-                        .filter_map(|entry| {
-                            let user = entry.get("user")?;
-                            let uid = user.get("id")?.as_str()?.to_string();
-                            let uname = user
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .or_else(|| user.get("email").and_then(Value::as_str))
-                                .unwrap_or("Immich User")
-                                .to_string();
-                            let email = user
-                                .get("email")
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string);
-                            Some(AlbumUser {
-                                id: uid,
-                                name: uname,
-                                email,
-                            })
-                        })
+                        .filter_map(|entry| parse_album_user(entry.get("user")?))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
