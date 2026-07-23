@@ -151,6 +151,9 @@ export interface ImportRecord {
   uploaded: number;
   duplicates: number;
   errors: number;
+  /** Full request that produced this run, for "Import again". Null on older
+   *  records saved before request persistence. */
+  request?: ImportInput | null;
 }
 
 export interface ThumbResult {

@@ -1,6 +1,6 @@
 import { writable } from "svelte/store";
 
-import type { ImportOrganization } from "$lib/types";
+import type { ImportInput, ImportOrganization } from "$lib/types";
 
 type ImportOptionsState = {
   keepFiles: boolean;
@@ -103,6 +103,38 @@ export const importOptionsState = {
   },
   clearDateRange() {
     state.update((s) => ({ ...s, dateFrom: null, dateTo: null }));
+  },
+  /**
+   * Repopulate every option from a persisted import request (History "Import
+   * again"). Mirrors the request-building in queueState.startImport in reverse.
+   */
+  hydrateFromRequest(request: ImportInput) {
+    const [from, to] = request.date_range?.split(",") ?? [];
+    const mediaType =
+      request.include_type === "VIDEO"
+        ? "video"
+        : request.include_type === "IMAGE"
+          ? "image"
+          : "all";
+    state.set({
+      keepFiles: request.keep_files,
+      stackRawJpeg: request.stack_raw_jpeg,
+      stackBurst: request.stack_burst,
+      concurrentTasks: request.concurrent_tasks ?? null,
+      dateFrom: from ?? null,
+      dateTo: to ?? null,
+      organization: request.organization ?? "single_album",
+      keepGoingOnErrors: request.on_errors === "continue",
+      overwrite: request.overwrite ?? false,
+      tags: request.tags ?? [],
+      sessionTag: request.session_tag ?? false,
+      // Explicit date bounds are restored above; "only new since last import" is
+      // a separate per-source mode a stored request cannot unambiguously encode.
+      onlyNewSinceLastImport: false,
+      mediaType,
+      includeExtensions: request.include_extensions ?? [],
+      excludeExtensions: request.exclude_extensions ?? [],
+    });
   },
 };
 

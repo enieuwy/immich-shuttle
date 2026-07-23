@@ -30,6 +30,18 @@
     importOptionsState.setConcurrentTasks(tasksValid ? tasksParsed : null);
   });
 
+  // Reflect external concurrency changes (e.g. History "Import again") into the
+  // local input. Only fires when the stored value diverges from what the input
+  // currently maps to, so it never fights user typing (out-of-range/blank input
+  // already maps the store to null, which stays equal here).
+  $effect(() => {
+    const stored = $importOptionsState.concurrentTasks;
+    const shown = tasksValid ? tasksParsed : null;
+    if (stored !== shown) {
+      tasksInput = stored == null ? "" : String(stored);
+    }
+  });
+
   const dateFrom = $derived($importOptionsState.dateFrom ?? "");
   const dateTo = $derived($importOptionsState.dateTo ?? "");
   const dateRangeInvalid = $derived(isDateRangeInvalid(dateFrom, dateTo));

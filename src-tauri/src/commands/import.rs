@@ -704,6 +704,15 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 uploaded: update.progress.uploaded,
                 duplicates: update.progress.duplicates,
                 errors: update.progress.errors,
+                // Persist the request so History can replay it. The staged
+                // subset is a one-time selection and is dropped: replay
+                // repopulates the source/options for review, then the user
+                // re-selects if needed.
+                request: {
+                    let mut req = input.clone();
+                    req.select_files = None;
+                    Some(req)
+                },
             },
         ) {
             let _ = logs::append_log(

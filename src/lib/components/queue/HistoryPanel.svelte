@@ -1,8 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { CheckCircle2, XCircle, CircleSlash, Clock, Trash2 } from "@lucide/svelte";
+  import { CheckCircle2, XCircle, CircleSlash, Clock, Trash2, RotateCcw } from "@lucide/svelte";
 
-  import { historyState } from "$lib/state/history";
+  import { historyState, replayImport } from "$lib/state/history";
+  import { errorsState } from "$lib/state/errors";
+  import type { ImportRecord } from "$lib/types";
   import { Card, CardHeader, CardContent } from "$lib/components/ui/card";
   import { Badge } from "$lib/components/ui/badge";
   import { Button } from "$lib/components/ui/button";
@@ -40,6 +42,15 @@
     const wk = Math.round(day / 7);
     if (wk < 5) return `${wk}w ago`;
     return new Date(ms).toLocaleDateString();
+  }
+
+  async function importAgain(record: ImportRecord) {
+    const staged = await replayImport(record);
+    if (!staged) {
+      errorsState.addError(
+        "This import can't be repeated — it was recorded before request details were saved.",
+      );
+    }
   }
 </script>
 
@@ -123,6 +134,16 @@
                 >
                   {record.errors} err
                 </span>
+                {#if record.request}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    class="ml-auto h-6 gap-1 px-2 text-xs"
+                    onclick={() => importAgain(record)}
+                  >
+                    <RotateCcw class="size-3.5" /> Import again
+                  </Button>
+                {/if}
               </div>
             </li>
           {/each}
