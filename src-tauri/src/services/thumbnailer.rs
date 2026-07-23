@@ -500,6 +500,39 @@ fn command_succeeds_within_timeout(command: &mut Command) -> bool {
         }
     }
 }
+/// Build a unique sibling path so an incomplete render is never observable at
+/// the cache path.
+#[cfg(any(target_os = "macos", test))]
+fn temporary_output_path(out: &Path, kind: &str) -> Option<PathBuf> {
+    Some(out.parent()?.join(format!(
+        ".{}-{kind}-{}",
+        out.file_name()?.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    )))
+}
+
+/// Promote a completed temporary render without exposing a partial cache file.
+///
+/// The copy fallback also uses a sibling temporary path so a failed copy cannot
+/// poison `out`; neither failure path removes an existing cache entry.
+#[cfg(any(target_os = "macos", test))]
+fn promote_temporary_output(tmp: &Path, out: &Path) -> bool {
+    match fs::rename(tmp, out) {
+        Ok(()) => out.is_file(),
+        Err(_) => {
+            let Some(copy_tmp) = temporary_output_path(out, "copy") else {
+                return false;
+            };
+            let copied = fs::copy(tmp, &copy_tmp).is_ok() && copy_tmp.is_file();
+            let promoted = copied && fs::rename(&copy_tmp, out).is_ok();
+            let _ = fs::remove_file(&copy_tmp);
+            if promoted {
+                let _ = fs::remove_file(tmp);
+            }
+            promoted && out.is_file()
+        }
+    }
+}
 
 /// Removes a Quick Look scratch directory even when its process times out or an
 /// early error returns from `generate_qlmanage`.
@@ -527,6 +560,9 @@ impl Drop for TempDirGuard {
 
 #[cfg(target_os = "macos")]
 fn generate_sips(src: &Path, max: u32, out: &Path) -> bool {
+    let Some(tmp) = temporary_output_path(out, "sips") else {
+        return false;
+    };
     let mut command = Command::new("/usr/bin/sips");
     command
         .arg("-Z")
@@ -534,10 +570,12 @@ fn generate_sips(src: &Path, max: u32, out: &Path) -> bool {
         .args(["-s", "format", "jpeg"])
         .arg(src)
         .arg("--out")
-        .arg(out);
-    let succeeded = command_succeeds_within_timeout(&mut command) && out.is_file();
+        .arg(&tmp);
+    let succeeded = command_succeeds_within_timeout(&mut command)
+        && tmp.is_file()
+        && promote_temporary_output(&tmp, out);
     if !succeeded {
-        let _ = fs::remove_file(out);
+        let _ = fs::remove_file(&tmp);
     }
     succeeded
 }
@@ -583,17 +621,11 @@ fn generate_qlmanage(src: &Path, max: u32, out: &Path) -> bool {
     };
 
     let moved = match produced {
-        Some(p) => fs::rename(&p, out)
-            .or_else(|_| fs::copy(&p, out).map(|_| ()))
-            .is_ok(),
+        Some(p) => promote_temporary_output(&p, out),
         None => false,
     };
 
-    let succeeded = moved && out.is_file();
-    if !succeeded {
-        let _ = fs::remove_file(out);
-    }
-    succeeded
+    moved && out.is_file()
 }
 
 /// The image crate must decode the source before it can resize. These limits
@@ -1034,6 +1066,20 @@ mod tests {
 
         assert!(!scratch.exists());
         assert!(unrelated.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_temporary_promotion_preserves_existing_cache_file() {
+        let dir = std::env::temp_dir().join(format!("immich_shuttle_promote_{}", Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let out = dir.join("thumb.jpg");
+        let missing_tmp = dir.join("missing.tmp");
+        fs::write(&out, b"completed by another renderer").unwrap();
+
+        assert!(!promote_temporary_output(&missing_tmp, &out));
+        assert_eq!(fs::read(&out).unwrap(), b"completed by another renderer");
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

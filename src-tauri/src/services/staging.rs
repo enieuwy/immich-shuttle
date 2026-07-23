@@ -44,9 +44,20 @@ impl Drop for StagingDir {
         // Cancellation and panic paths may drop this guard on an async worker.
         // Detached cleanup keeps that runtime worker from blocking on the filesystem.
         if let Some(path) = self.path.take() {
-            let _ = std::thread::spawn(move || {
+            // `thread::spawn` panics if the OS refuses a new thread; a panic in
+            // Drop during unwinding would abort the process. Use the fallible
+            // Builder and fall back to synchronous removal so cleanup still runs.
+            let spawned = std::thread::Builder::new()
+                .name("staging-cleanup".to_string())
+                .spawn({
+                    let path = path.clone();
+                    move || {
+                        let _ = fs::remove_dir_all(path);
+                    }
+                });
+            if spawned.is_err() {
                 let _ = fs::remove_dir_all(path);
-            });
+            }
         }
     }
 }

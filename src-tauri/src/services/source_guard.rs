@@ -20,24 +20,34 @@ const MAX_APPROVED_ROOTS: usize = 256;
 
 /// Record user-selected source roots as authorized for later path-scoped reads.
 ///
-/// Bounded to `MAX_APPROVED_ROOTS` to prevent unbounded growth across a long
-/// session. When at capacity we evict the OLDEST root to admit the newest,
-/// rather than dropping the new one — silently ignoring a just-selected root
-/// would make its scanned media fail `is_within_approved`, rejecting files the
-/// user legitimately selected.
+/// The current selection is ALWAYS fully authorized — it is never truncated,
+/// even if it exceeds `MAX_APPROVED_ROOTS` (rejecting a just-selected root would
+/// make its scanned media fail `is_within_approved`). The cap only bounds
+/// cross-session growth by evicting the oldest roots that are NOT part of this
+/// selection. Canonicalization runs before the lock so a slow filesystem cannot
+/// stall concurrent `is_within_approved` checks.
 pub fn record_roots(paths: &[String]) {
+    let batch: Vec<PathBuf> = paths
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p)))
+        .collect();
     let Ok(mut roots) = APPROVED_ROOTS.lock() else {
         return;
     };
-    for p in paths {
-        let canon = std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
-        if roots.contains(&canon) {
-            continue;
+    for canon in &batch {
+        if !roots.contains(canon) {
+            roots.push(canon.clone());
         }
-        while roots.len() >= MAX_APPROVED_ROOTS {
-            roots.remove(0);
+    }
+    // Evict the oldest roots that are not in the current selection until back
+    // under the soft cap; stop if everything left belongs to this selection.
+    while roots.len() > MAX_APPROVED_ROOTS {
+        match roots.iter().position(|r| !batch.contains(r)) {
+            Some(idx) => {
+                roots.remove(idx);
+            }
+            None => break,
         }
-        roots.push(canon);
     }
 }
 
