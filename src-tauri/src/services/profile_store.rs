@@ -1,7 +1,10 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::{LazyLock, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        LazyLock, Mutex,
+    },
 };
 
 use dirs::config_dir;
@@ -10,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::models::profile::Profile;
 
 static CONFIG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Serialize the read-modify-write of config.json so concurrent profile
 /// upserts/deletes can't read the same snapshot and clobber each other's
@@ -47,17 +52,13 @@ fn config_path() -> Result<PathBuf, String> {
     } else {
         config_dir().ok_or_else(|| "Could not resolve config directory".to_string())?
     };
-    let dir = base.join("immich-shuttle");
-    fs::create_dir_all(&dir).map_err(|e| format!("Could not create config directory: {e}"))?;
-    Ok(dir.join("config.json"))
+    Ok(base.join("immich-shuttle").join("config.json"))
 }
 
 pub fn load_config() -> Result<AppConfig, String> {
     let path = config_path()?;
     if !path.exists() {
-        let cfg = AppConfig::default();
-        save_config(&cfg)?;
-        return Ok(cfg);
+        return Ok(AppConfig::default());
     }
 
     let raw = fs::read_to_string(&path).map_err(|e| format!("Could not read config: {e}"))?;
@@ -66,7 +67,15 @@ pub fn load_config() -> Result<AppConfig, String> {
 
 pub fn save_config(config: &AppConfig) -> Result<(), String> {
     let path = config_path()?;
-    let tmp = path.with_extension("json.tmp");
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Could not resolve config directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| format!("Could not create config directory: {e}"))?;
+    let tmp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
     let content = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Could not serialize config: {e}"))?;
     fs::write(&tmp, content).map_err(|e| format!("Could not write temp config: {e}"))?;
@@ -134,12 +143,13 @@ mod tests {
     }
 
     #[test]
-    fn generates_default_config_when_missing() {
+    fn loading_missing_config_returns_default_without_creating_file() {
         let _guard = TEST_LOCK.lock().expect("lock test mutex");
         let dir = use_temp_config_home("default");
         let cfg = load_config().expect("load default config");
         assert!(cfg.profiles.is_empty());
         assert!(cfg.defaults.keep_files_on_disk);
+        assert!(!dir.join("immich-shuttle/config.json").exists());
         let _ = fs::remove_dir_all(dir);
     }
 

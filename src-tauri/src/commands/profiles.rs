@@ -19,7 +19,6 @@ pub async fn profile_upsert(input: ProfileInput) -> Result<Profile, String> {
         return Err("Server URL is required".to_string());
     }
 
-    let is_new = input.id.is_none();
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let profile = Profile {
         id: id.clone(),
@@ -31,34 +30,58 @@ pub async fn profile_upsert(input: ProfileInput) -> Result<Profile, String> {
         wan_server_url: input.wan_server_url,
     };
 
-    let stored_key = match input.api_key {
-        Some(api_key) if !api_key.trim().is_empty() => {
-            keychain::store_api_key(&id, api_key.trim())?;
-            true
-        }
-        _ => false,
+    let api_key = input
+        .api_key
+        .filter(|api_key| !api_key.trim().is_empty())
+        .map(|api_key| api_key.trim().to_string());
+    let previous_api_key = if api_key.is_some() {
+        keychain::get_api_key(&id)?
+    } else {
+        None
+    };
+
+    let stored_key = if let Some(api_key) = api_key {
+        keychain::store_api_key(&id, &api_key)?;
+        true
+    } else {
+        false
     };
 
     match profile_store::upsert_profile(profile) {
         Ok(saved) => Ok(saved),
-        Err(err) => {
-            // Roll back a just-stored credential for a brand-new profile so a
-            // failed save can't orphan an API key under an unreferenced UUID
-            // (each retry would otherwise mint a new UUID and leak another key).
-            if is_new && stored_key {
-                let _ = keychain::delete_api_key(&id);
+        Err(err) if stored_key => {
+            let rollback = match previous_api_key {
+                Some(api_key) => keychain::store_api_key(&id, &api_key),
+                None => keychain::delete_api_key(&id),
+            };
+            match rollback {
+                Ok(()) => Err(err),
+                Err(rollback_err) => Err(format!(
+                    "{err}; additionally failed to roll back the API key change: {rollback_err}"
+                )),
             }
-            Err(err)
         }
+        Err(err) => Err(err),
     }
 }
 
 #[tauri::command]
 pub async fn profile_delete(id: String) -> Result<(), String> {
-    // Remove the profile first: if this fails the credential stays intact so the
-    // profile remains usable, rather than leaving a broken, keyless profile.
-    profile_store::delete_profile(&id)?;
-    keychain::delete_api_key(&id)
+    let previous_api_key = keychain::get_api_key(&id)?;
+    keychain::delete_api_key(&id)?;
+
+    if let Err(err) = profile_store::delete_profile(&id) {
+        if let Some(api_key) = previous_api_key {
+            if let Err(rollback_err) = keychain::store_api_key(&id, &api_key) {
+                return Err(format!(
+                    "{err}; additionally failed to restore the API key after the profile delete failed: {rollback_err}"
+                ));
+            }
+        }
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
