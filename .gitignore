@@ -15,6 +15,7 @@ vite.config.ts.timestamp-*
 /test-results
 /playwright-report
 /playwright/.cache
+.playwright-cli/
 e2e/__screenshots__/
 
 # Beads / Dolt files (added by bd init)
