@@ -34,8 +34,8 @@ describe("userDisplayNames", () => {
 
 describe("avatarStyle", () => {
   it("maps Immich avatar color names onto the shared palette", () => {
-    expect(avatarStyle({ id: "u1", avatar_color: "blue" }).bg).toBe("#3b82f6");
-    expect(avatarStyle({ id: "u1", avatar_color: "pink" }).bg).toBe("#f472b6");
+    expect(avatarStyle({ id: "u1", avatar_color: "blue" }).bg).toBe("#1d4ed8");
+    expect(avatarStyle({ id: "u1", avatar_color: "pink" }).bg).toBe("#be185d");
   });
 
   it("uses dark text on yellow and amber for badge-size contrast", () => {
@@ -58,5 +58,24 @@ describe("avatarStyle", () => {
 
   it("prefers the named color over the hash fallback", () => {
     expect(avatarStyle({ id: "u-a", avatar_color: "gray" }).bg).toBe("#4b5563");
+  });
+
+  it("every palette pair meets WCAG 4.5:1 — initials render at 8-9px", () => {
+    const luminance = (hex: string): number => {
+      const [r, g, b] = [1, 3, 5]
+        .map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+        .map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    };
+    const colors = [
+      "primary", "pink", "red", "yellow", "blue",
+      "green", "purple", "orange", "gray", "amber",
+    ];
+    for (const color of colors) {
+      const { bg, fg } = avatarStyle({ id: "u1", avatar_color: color });
+      const [hi, lo] = [luminance(bg), luminance(fg)].sort((a, b) => b - a);
+      const ratio = (hi + 0.05) / (lo + 0.05);
+      expect(ratio, `${color} (${fg} on ${bg})`).toBeGreaterThanOrEqual(4.5);
+    }
   });
 });

@@ -34,19 +34,19 @@ export interface AvatarStyle {
 }
 
 /**
- * Badge colors matching Immich's avatar palette, so a person renders with the
- * same identity color here as in the Immich web app. Yellow and amber get dark
- * text because white monograms are unreadable on them at badge size.
+ * Badge colors following Immich's avatar palette hues, darkened where needed
+ * so every fg/bg pair meets WCAG 4.5:1 — the initials render at 8-9px, where
+ * marginal contrast is simply unreadable. Yellow and amber keep dark text.
  */
 const AVATAR_COLORS: Record<string, AvatarStyle> = {
   primary: { bg: "#4250af", fg: "#ffffff" },
-  pink: { bg: "#f472b6", fg: "#ffffff" },
-  red: { bg: "#ef4444", fg: "#ffffff" },
+  pink: { bg: "#be185d", fg: "#ffffff" },
+  red: { bg: "#b91c1c", fg: "#ffffff" },
   yellow: { bg: "#eab308", fg: "#292103" },
-  blue: { bg: "#3b82f6", fg: "#ffffff" },
-  green: { bg: "#16a34a", fg: "#ffffff" },
+  blue: { bg: "#1d4ed8", fg: "#ffffff" },
+  green: { bg: "#15803d", fg: "#ffffff" },
   purple: { bg: "#9333ea", fg: "#ffffff" },
-  orange: { bg: "#ea580c", fg: "#ffffff" },
+  orange: { bg: "#c2410c", fg: "#ffffff" },
   gray: { bg: "#4b5563", fg: "#ffffff" },
   amber: { bg: "#d97706", fg: "#2b1a02" },
 };

@@ -15,6 +15,20 @@ static HTTP: LazyLock<Client> = LazyLock::new(|| {
         .unwrap_or_else(|_| Client::new())
 });
 
+/// Client for authenticated raw-byte fetches (profile images). Redirects are
+/// refused outright: reqwest's cross-host filter strips only Authorization/
+/// Cookie-class headers, so a 3xx would otherwise resend the custom
+/// `x-api-key` header to whatever origin the server names. The image endpoint
+/// never legitimately redirects, so a 3xx is treated as "no image".
+static HTTP_NO_REDIRECT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| Client::new())
+});
+
 use crate::models::album::{Album, AlbumShareLink, AlbumUser};
 
 /// JSON API responses are expected to be small. Bound reads so a malicious or
@@ -158,6 +172,24 @@ fn parse_album_user(user: &Value) -> Option<AlbumUser> {
         has_profile_image,
     })
 }
+/// Identify an image format from its magic bytes. Covers the formats Immich
+/// stores as profile images; anything unrecognized is rejected rather than
+/// guessed, because the result is embedded verbatim in a `data:` URL.
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
 
 pub struct ImmichClient {
     server_url: String,
@@ -272,9 +304,12 @@ impl ImmichClient {
         let users = raw.iter().filter_map(parse_album_user).collect();
         Ok(users)
     }
+
     /// Fetch a user's profile image (avatar). `Ok(None)` means the user has no
-    /// image (404). Bytes are bounded so a misbehaving server cannot force an
-    /// unbounded buffer; avatars are small crops, so 8 MiB is generous.
+    /// usable image: a 404, a redirect (refused — see HTTP_NO_REDIRECT), or a
+    /// response that is not verifiably an image. Bytes are bounded so a
+    /// misbehaving server cannot force an unbounded buffer; avatars are small
+    /// crops, so 8 MiB is generous.
     pub async fn get_profile_image(
         &self,
         user_id: &str,
@@ -285,8 +320,7 @@ impl ImmichClient {
 
         for (index, url) in candidates.iter().enumerate() {
             let has_alternate = index + 1 < candidates.len();
-            match self
-                .http
+            match HTTP_NO_REDIRECT
                 .get(url.clone())
                 .header("x-api-key", &self.api_key)
                 .send()
@@ -300,24 +334,38 @@ impl ImmichClient {
                         }
                         return Ok(None);
                     }
+                    // A redirect here is a proxy quirk at best and a key-
+                    // exfiltration attempt at worst; never follow it.
+                    if status.is_redirection() {
+                        return Ok(None);
+                    }
                     if !status.is_success() {
                         return Err(format!("API GET {display_path} failed at {url} ({status})"));
                     }
-                    // Only a plain image MIME may flow into the data URL the
-                    // frontend renders; anything else falls back to JPEG.
-                    let mime = resp
+                    let declared_mime = resp
                         .headers()
                         .get(reqwest::header::CONTENT_TYPE)
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.split(';').next())
-                        .map(str::trim)
-                        .filter(|v| v.starts_with("image/"))
-                        .unwrap_or("image/jpeg")
-                        .to_string();
+                        .map(|v| v.trim().to_ascii_lowercase());
+                    // An explicit non-image Content-Type (HTML error page,
+                    // JSON from a mis-routed prefix) is not an avatar.
+                    if declared_mime
+                        .as_deref()
+                        .is_some_and(|v| !v.starts_with("image/"))
+                    {
+                        return Ok(None);
+                    }
                     let bytes = response_bytes_limited(resp, MAX_AVATAR_BYTES)
                         .await
                         .map_err(|e| format!("Failed reading profile image: {e}"))?;
-                    return Ok(Some((bytes, mime)));
+                    // Only bytes that verifiably look like an image may flow
+                    // into the data: URL the frontend renders; a declared
+                    // image/* type without a matching signature is refused too.
+                    let Some(mime) = sniff_image_mime(&bytes) else {
+                        return Ok(None);
+                    };
+                    return Ok(Some((bytes, mime.to_string())));
                 }
                 Err(e) => {
                     if has_alternate {
@@ -579,6 +627,29 @@ pub async fn probe_is_immich(server_url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::normalize_server_url;
+    #[test]
+    fn sniffs_only_known_image_signatures() {
+        use super::sniff_image_mime;
+        assert_eq!(
+            sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            sniff_image_mime(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00]),
+            Some("image/png")
+        );
+        assert_eq!(sniff_image_mime(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(
+            sniff_image_mime(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+            Some("image/webp")
+        );
+        // HTML/JSON error bodies and truncated headers must be refused — they
+        // would otherwise be embedded into a data: URL as a fake JPEG.
+        assert_eq!(sniff_image_mime(b"<!doctype html>"), None);
+        assert_eq!(sniff_image_mime(b"{\"error\":\"x\"}"), None);
+        assert_eq!(sniff_image_mime(b"RIFF\x00\x00\x00\x00WAVE"), None);
+        assert_eq!(sniff_image_mime(&[]), None);
+    }
 
     #[test]
     fn normalizes_api_path_without_changing_authority() {
