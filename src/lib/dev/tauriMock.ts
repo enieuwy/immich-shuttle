@@ -13,10 +13,44 @@ import type { ProfileInput } from "$lib/types";
 
 type InvokeArgs = Record<string, unknown> | undefined;
 
+type TauriEvent = { event: string; id: number; payload: unknown };
+
+// Registered `listen()` callbacks keyed by event name, so mocked commands can
+// push events (e.g. the streamed scan's `scan-progress`) the way the real
+// backend does. Real Tauri delivers events through this same callback channel.
+const eventListeners = new Map<string, Set<number>>();
+
+function emit(event: string, payload: unknown): void {
+  const ids = eventListeners.get(event);
+  if (!ids) return;
+  const w = window as unknown as Record<string, (e: TauriEvent) => void>;
+  for (const id of ids) {
+    const cb = w[`_${id}`];
+    if (typeof cb === "function") cb({ event, id, payload });
+  }
+}
+
 function handle(cmd: string, args: InvokeArgs): unknown {
   // Plugin channels: events never fire in preview, dialogs/opener resolve no-op.
   if (cmd.startsWith("plugin:event|")) {
-    return cmd.endsWith("listen") ? Math.floor(Math.random() * 1e9) : undefined;
+    if (cmd.endsWith("listen")) {
+      const event = args?.event as string | undefined;
+      const handler = args?.handler as number | undefined;
+      if (event && typeof handler === "number") {
+        const set = eventListeners.get(event) ?? new Set<number>();
+        set.add(handler);
+        eventListeners.set(event, set);
+        return handler;
+      }
+      return Math.floor(Math.random() * 1e9);
+    }
+    if (cmd.endsWith("unlisten")) {
+      const event = args?.event as string | undefined;
+      const eventId = args?.eventId as number | undefined;
+      if (event && typeof eventId === "number") eventListeners.get(event)?.delete(eventId);
+      return undefined;
+    }
+    return undefined;
   }
   if (cmd.startsWith("plugin:dialog|")) {
     return fixtures.PRESET_PATH;
@@ -37,9 +71,26 @@ function handle(cmd: string, args: InvokeArgs): unknown {
       return fixtures.jobsForScenario(scenario);
     case "devices_list_removable":
       return fixtures.devices;
-    case "scan_source":
-    case "scan_sources":
-      return fixtures.scanResultForScenario(scenario);
+    case "scan_sources_stream": {
+      const sr = fixtures.scanResultForScenario(scenario);
+      // Mirror the real streamed scan: emit the files as a `scan-progress`
+      // batch (the UI accumulates the grid from events), then return the
+      // terminal summary the awaited command resolves with.
+      emit("scan-progress", {
+        files: sr.files,
+        photo_count: sr.photo_count,
+        video_count: sr.video_count,
+        total_size_bytes: sr.total_size_bytes,
+        skipped_unreadable: sr.skipped_unreadable,
+      });
+      return {
+        status: "complete",
+        photo_count: sr.photo_count,
+        video_count: sr.video_count,
+        total_size_bytes: sr.total_size_bytes,
+        skipped_unreadable: sr.skipped_unreadable,
+      };
+    }
     case "preview_thumbnails":
       return fixtures.thumbsForPaths((args?.paths as string[]) ?? []);
     case "preview_dates":
