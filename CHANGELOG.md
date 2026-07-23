@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.5.0 - 2026-07-23
+
 ### UI
 - **The footer action bar is always visible.** The app now pins to the viewport height with the content area scrolling internally, so the footer (import stats, Logs, Start Import) no longer slides off the bottom of a long page. Absolutely-positioned controls inside the scroll area are correctly clipped instead of overflowing the layout and scrolling the whole window.
 - **"Open in Immich" deep-links.** A finished import's queue card and any selected album now offer an "Open in Immich" action that opens the album (`/albums/{id}`) — or the timeline (`/photos`) when there's no single album target — in your browser, using the reachable server URL (LAN/WAN failover, same as imports). Closes the import loop so you can jump straight to verifying uploads.
@@ -10,10 +12,9 @@
 - **Keep going on errors (default on).** Imports now pass immich-go `--on-errors=continue` so a single bad file no longer aborts a multi-thousand-file migration; failures are still listed per-file afterward. Turn the switch off to stop at the first error.
 - **Replace existing on server.** Optional `--overwrite` re-uploads assets the server already holds instead of skipping them, for re-syncs.
 - **Tags & session tagging.** Apply comma-separated `--tag` values (with `/` hierarchy) to every uploaded asset, and optionally add a timestamped `--session-tag` to label the whole batch.
-- **Only import media newer than last import.** Opt-in toggle that derives a capture-date floor from this source's stored last-import time (via `--date-range`), turning a repeat import of a large card from a full re-scan into a fast incremental. Server-side dedupe still guards the boundary; filters by EXIF capture date, so wrong camera clocks may skip files.
+- **Only import media newer than last import.** Opt-in toggle that derives a capture-date floor from this source's last import (via `--date-range`), turning a repeat import of a large card from a full re-scan into a fast incremental. The checkpoint is scoped per profile and advanced only by clean, complete imports (failed or partial runs never raise the floor), and is computed in the local calendar zone to avoid a timezone off-by-one. Server-side dedupe still guards the boundary; filters by EXIF capture date, so wrong camera clocks may skip files.
 - **Type & extension filters.** Import only Photos or only Videos, and add comma-separated include/exclude extension lists — mapped to immich-go's `--include-type`/`--include-extensions`/`--exclude-extensions` instead of hand-selecting files.
 - **Check server (pre-import forecast).** A read-only preflight that hashes the selected/scanned files and asks the server how many it already holds, showing "X to upload, Y already on server" before you start — reuses the verify-before-wipe SHA-1 + bulk-upload-check path.
-- The **"only new since last import"** checkpoint is now scoped per profile and advanced only by clean, complete imports (failed/partial runs no longer raise the date floor), and the date floor is computed in the local calendar zone to avoid a timezone off-by-one.
 
 ### Onboarding
 - **Scan network for your Immich server.** The profile editor can sweep the local `/24` (ports 2283/443/80) and list confirmed servers for one-click fill, so first-run setup no longer requires knowing the server's IP. Confirmation uses the unauthenticated ping endpoint only — the API key is never sent during discovery.
