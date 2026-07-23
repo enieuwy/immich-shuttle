@@ -423,10 +423,16 @@ impl ImmichClient {
 }
 
 /// Asset ids the server reports as already-present duplicates. An asset counts
-/// as confirmed-on-server ONLY when action=="reject" AND reason=="duplicate";
-/// any other reject reason is treated as NOT present. This guards
-/// verify-before-wipe (wipe::verify_uploaded) so a local original is never
-/// deleted unless the server actually holds an identical copy.
+/// as confirmed-on-server ONLY when action=="reject" AND reason=="duplicate"
+/// AND it is not trashed; any other reject reason is treated as NOT present.
+/// This guards verify-before-wipe (wipe::verify_uploaded) so a local original is
+/// never deleted unless the server actually holds a live identical copy.
+///
+/// `isTrashed` (Immich >= 1.115) is critical: bulk-upload-check matches a
+/// checksum even when the server's only copy is soft-deleted, so treating a
+/// trashed match as "present" would let us wipe the last live original and lose
+/// it permanently once the server trash is emptied. Older servers omit the
+/// field; there it defaults to false (unchanged, no-less-safe behavior).
 fn duplicates_from_results(results: &[Value]) -> Vec<String> {
     results
         .iter()
@@ -434,7 +440,11 @@ fn duplicates_from_results(results: &[Value]) -> Vec<String> {
             let id = result.get("id").and_then(Value::as_str)?;
             let action = result.get("action").and_then(Value::as_str)?;
             let reason = result.get("reason").and_then(Value::as_str);
-            if action == "reject" && reason == Some("duplicate") {
+            let is_trashed = result
+                .get("isTrashed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if action == "reject" && reason == Some("duplicate") && !is_trashed {
                 Some(id.to_string())
             } else {
                 None
@@ -598,6 +608,19 @@ mod tests {
         ];
         // Only the duplicate-reason reject is treated as present on the server.
         assert_eq!(duplicates_from_results(&results), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn trashed_duplicate_is_not_treated_as_present() {
+        use super::duplicates_from_results;
+        use serde_json::json;
+        // A duplicate whose only server copy is trashed must NOT count as
+        // present, or verify-before-wipe would delete the last live original.
+        let results = [
+            json!({ "id": "live", "action": "reject", "reason": "duplicate", "isTrashed": false }),
+            json!({ "id": "trashed", "action": "reject", "reason": "duplicate", "isTrashed": true }),
+        ];
+        assert_eq!(duplicates_from_results(&results), vec!["live".to_string()]);
     }
 
     #[test]
