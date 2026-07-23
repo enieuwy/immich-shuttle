@@ -34,6 +34,7 @@ pub async fn profile_upsert(input: ProfileInput) -> Result<Profile, String> {
         .api_key
         .filter(|api_key| !api_key.trim().is_empty())
         .map(|api_key| api_key.trim().to_string());
+    let _guard = profile_store::lock_config();
     let previous_api_key = if api_key.is_some() {
         keychain::get_api_key(&id)?
     } else {
@@ -47,7 +48,7 @@ pub async fn profile_upsert(input: ProfileInput) -> Result<Profile, String> {
         false
     };
 
-    match profile_store::upsert_profile(profile) {
+    match profile_store::upsert_profile_locked(profile) {
         Ok(saved) => Ok(saved),
         Err(err) if stored_key => {
             let rollback = match previous_api_key {
@@ -67,10 +68,11 @@ pub async fn profile_upsert(input: ProfileInput) -> Result<Profile, String> {
 
 #[tauri::command]
 pub async fn profile_delete(id: String) -> Result<(), String> {
+    let _guard = profile_store::lock_config();
     let previous_api_key = keychain::get_api_key(&id)?;
     keychain::delete_api_key(&id)?;
 
-    if let Err(err) = profile_store::delete_profile(&id) {
+    if let Err(err) = profile_store::delete_profile_locked(&id) {
         if let Some(api_key) = previous_api_key {
             if let Err(rollback_err) = keychain::store_api_key(&id, &api_key) {
                 return Err(format!(

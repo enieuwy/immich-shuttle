@@ -16,11 +16,12 @@ static CONFIG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Serialize the read-modify-write of config.json so concurrent profile
-/// upserts/deletes can't read the same snapshot and clobber each other's
-/// changes. Recovers from poisoning — the file on disk is the source of truth,
-/// so one panicking writer must not brick every future profile edit.
-fn lock_config() -> std::sync::MutexGuard<'static, ()> {
+/// Acquires the process-local config transaction lock.
+///
+/// Callers that must atomically coordinate a keychain change with a config
+/// mutation may hold this guard while calling the `*_locked` helpers. Recovers
+/// from poisoning because the file on disk remains the source of truth.
+pub fn lock_config() -> std::sync::MutexGuard<'static, ()> {
     CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -97,8 +98,14 @@ pub fn get_profile(profile_id: &str) -> Result<Profile, String> {
         .ok_or_else(|| format!("Profile not found: {profile_id}"))
 }
 
+#[cfg(test)]
 pub fn upsert_profile(profile: Profile) -> Result<Profile, String> {
     let _guard = lock_config();
+    upsert_profile_locked(profile)
+}
+
+/// Upserts a profile while the caller holds [`lock_config`].
+pub fn upsert_profile_locked(profile: Profile) -> Result<Profile, String> {
     let mut cfg = load_config()?;
     if let Some(existing) = cfg.profiles.iter_mut().find(|p| p.id == profile.id) {
         *existing = profile.clone();
@@ -109,8 +116,14 @@ pub fn upsert_profile(profile: Profile) -> Result<Profile, String> {
     Ok(profile)
 }
 
+#[cfg(test)]
 pub fn delete_profile(profile_id: &str) -> Result<(), String> {
     let _guard = lock_config();
+    delete_profile_locked(profile_id)
+}
+
+/// Deletes a profile while the caller holds [`lock_config`].
+pub fn delete_profile_locked(profile_id: &str) -> Result<(), String> {
     let mut cfg = load_config()?;
     cfg.profiles.retain(|p| p.id != profile_id);
     save_config(&cfg)
@@ -123,7 +136,10 @@ mod tests {
 
     use crate::models::profile::Profile;
 
-    use super::{delete_profile, get_profile, load_config, upsert_profile};
+    use super::{
+        delete_profile, get_profile, load_config, lock_config, upsert_profile,
+        upsert_profile_locked,
+    };
 
     static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -170,6 +186,29 @@ mod tests {
 
         upsert_profile(profile.clone()).expect("upsert profile");
         let loaded = get_profile("p1").expect("get profile");
+        assert_eq!(loaded.display_name, profile.display_name);
+        assert_eq!(loaded.server_url, profile.server_url);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn locked_upsert_mutates_config_under_held_guard() {
+        let _test_guard = TEST_LOCK.lock().expect("lock test mutex");
+        let dir = use_temp_config_home("locked-upsert");
+        let profile = Profile {
+            id: "p1".to_string(),
+            display_name: "Ellis".to_string(),
+            server_url: "https://immich.example.com".to_string(),
+            lan_server_url: None,
+            wan_server_url: None,
+        };
+
+        let _config_guard = lock_config();
+        upsert_profile_locked(profile.clone()).expect("upsert profile while locked");
+        drop(_config_guard);
+
+        let loaded = get_profile("p1").expect("get profile");
+        assert_eq!(loaded.id, profile.id);
         assert_eq!(loaded.display_name, profile.display_name);
         assert_eq!(loaded.server_url, profile.server_url);
         let _ = fs::remove_dir_all(dir);
