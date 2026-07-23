@@ -1,4 +1,4 @@
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::mpsc, thread, time::Duration};
 
 use sysinfo::Disks;
 use tauri::{AppHandle, Emitter};
@@ -6,6 +6,27 @@ use tokio::time::interval;
 
 use crate::models::device::RemovableDevice;
 
+const DCIM_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn run_probe_with_timeout(
+    probe: impl FnOnce() -> bool + Send + 'static,
+    timeout: Duration,
+) -> bool {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let _ = thread::spawn(move || {
+        let _ = sender.send(probe());
+    });
+
+    receiver.recv_timeout(timeout).unwrap_or(false)
+}
+
+fn has_dcim(mount: &str) -> bool {
+    let dcim_path = Path::new(mount).join("DCIM");
+
+    // A filesystem stat can hang on an unavailable network or removable mount.
+    // Its JoinHandle is intentionally dropped so stalled probes cannot delay other devices.
+    run_probe_with_timeout(move || dcim_path.is_dir(), DCIM_PROBE_TIMEOUT)
+}
 fn should_include_mount(path: &str, removable: bool) -> bool {
     if removable {
         return true;
@@ -21,7 +42,7 @@ fn should_include_mount(path: &str, removable: bool) -> bool {
 
 pub fn list_removable_devices() -> Vec<RemovableDevice> {
     let disks = Disks::new_with_refreshed_list();
-    disks
+    let candidates = disks
         .list()
         .iter()
         .filter_map(|disk| {
@@ -31,16 +52,21 @@ pub fn list_removable_devices() -> Vec<RemovableDevice> {
                 return None;
             }
 
-            let name = disk.name().to_string_lossy().to_string();
-            let has_dcim = Path::new(&mount).join("DCIM").is_dir();
-
             Some(RemovableDevice {
-                name,
+                name: disk.name().to_string_lossy().to_string(),
                 mount_path: mount,
                 total_space: disk.total_space(),
                 available_space: disk.available_space(),
-                has_dcim,
+                has_dcim: false,
             })
+        })
+        .collect::<Vec<_>>();
+
+    candidates
+        .into_iter()
+        .map(|mut device| {
+            device.has_dcim = has_dcim(&device.mount_path);
+            device
         })
         .collect()
 }
@@ -67,4 +93,25 @@ pub fn start_polling(app: AppHandle) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn timed_out_probe_does_not_wait_for_the_filesystem_operation() {
+        let started = Instant::now();
+        let result = run_probe_with_timeout(
+            || {
+                thread::sleep(Duration::from_millis(250));
+                true
+            },
+            Duration::from_millis(10),
+        );
+
+        assert!(!result);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
 }
