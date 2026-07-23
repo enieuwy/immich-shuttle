@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
-use crate::{models::history::ImportRecord, services::logs};
+use crate::models::history::ImportRecord;
 
 static STORE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -69,18 +69,10 @@ fn save(app: &tauri::AppHandle, data: &StoreData) -> Result<(), String> {
     Ok(())
 }
 
-pub fn append_history(app: &tauri::AppHandle, record: ImportRecord) {
+pub fn append_history(app: &tauri::AppHandle, record: ImportRecord) -> Result<(), String> {
     let _guard = lock_store();
 
-    let mut data = match load(app) {
-        Ok(data) => data,
-        // Reading the existing store failed — do NOT overwrite it with a fresh
-        // empty state, or we'd wipe the user's real history/source metadata.
-        Err(err) => {
-            let _ = logs::append_log("app.log", &format!("history_append_failed reason={err}"));
-            return;
-        }
-    };
+    let mut data = load(app)?;
     let key = source_key(&record.source_paths);
     data.sources.insert(
         key,
@@ -92,20 +84,15 @@ pub fn append_history(app: &tauri::AppHandle, record: ImportRecord) {
     data.history.insert(0, record);
     data.history.truncate(100);
 
-    if let Err(err) = save(app, &data) {
-        let _ = logs::append_log("app.log", &format!("history_append_failed reason={err}"));
-    }
+    save(app, &data)
 }
 
-pub fn list_history(app: &tauri::AppHandle) -> Vec<ImportRecord> {
+pub fn list_history(app: &tauri::AppHandle) -> Result<Vec<ImportRecord>, String> {
     let _guard = lock_store();
 
-    let mut history = match load(app) {
-        Ok(data) => data.history,
-        Err(_) => return Vec::new(),
-    };
+    let mut history = load(app)?.history;
     history.sort_by_key(|record| std::cmp::Reverse(record.finished_at));
-    history
+    Ok(history)
 }
 
 pub fn clear_history(app: &tauri::AppHandle) -> Result<(), String> {
@@ -128,8 +115,70 @@ pub fn last_import_for(app: &AppHandle, source_paths: &[String]) -> Option<i64> 
         .map(|source| source.last_imported_at)
 }
 
+// Changing this normalization changes persisted keys and resets existing `last_import` associations.
 fn source_key(paths: &[String]) -> String {
-    let mut sorted = paths.to_vec();
-    sorted.sort();
-    sorted.join("\n")
+    let mut normalized: Vec<String> = paths
+        .iter()
+        .map(|path| normalize_source_path(path))
+        .collect();
+    normalized.sort();
+    normalized.join("\n")
+}
+
+fn normalize_source_path(path: &str) -> String {
+    #[cfg(windows)]
+    let path = PathBuf::from(path.replace('\\', "/"));
+    #[cfg(not(windows))]
+    let path = PathBuf::from(path);
+
+    let normalized = fs::canonicalize(&path).unwrap_or(path);
+    let normalized = normalized.to_string_lossy();
+    #[cfg(windows)]
+    let normalized = normalized.replace('\\', "/");
+    #[cfg(not(windows))]
+    let normalized = normalized.as_ref();
+    let trimmed = normalized.trim_end_matches('/');
+
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_key;
+
+    #[test]
+    fn source_key_normalizes_trailing_slashes_and_order() {
+        let canonical_form = vec![
+            "__store_key_test__/second".to_string(),
+            "__store_key_test__/first".to_string(),
+        ];
+        let alternate_form = vec![
+            "__store_key_test__/first/".to_string(),
+            "__store_key_test__/second/".to_string(),
+        ];
+
+        assert_eq!(source_key(&canonical_form), source_key(&alternate_form));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_key_normalizes_windows_separators() {
+        assert_eq!(
+            source_key(&["__store_key_test__/first".to_string()]),
+            source_key(&["__store_key_test__\\first\\".to_string()])
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn source_key_preserves_backslashes_in_unix_filenames() {
+        assert_ne!(
+            source_key(&["__store_key_test__/first".to_string()]),
+            source_key(&["__store_key_test__\\first".to_string()])
+        );
+    }
 }

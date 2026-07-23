@@ -3,7 +3,7 @@ use crate::services::store;
 
 #[tauri::command]
 pub async fn history_list(app: tauri::AppHandle) -> Result<Vec<ImportRecord>, String> {
-    Ok(store::list_history(&app))
+    store::list_history(&app)
 }
 
 #[tauri::command]
