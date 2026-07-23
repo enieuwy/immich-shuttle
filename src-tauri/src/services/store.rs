@@ -63,8 +63,10 @@ fn save(app: &tauri::AppHandle, data: &StoreData) -> Result<(), String> {
         .map_err(|e| format!("Could not serialize store: {e}"))?;
     fs::write(&tmp, &content).map_err(|e| format!("Could not write temp store: {e}"))?;
     if fs::rename(&tmp, &path).is_err() {
-        fs::write(&path, content).map_err(|e| format!("Could not persist store: {e}"))?;
+        let fallback =
+            fs::write(&path, content).map_err(|e| format!("Could not persist store: {e}"));
         let _ = fs::remove_file(&tmp);
+        fallback?;
     }
     Ok(())
 }
@@ -139,7 +141,14 @@ fn normalize_source_path(path: &str) -> String {
     let normalized = fs::canonicalize(&path).unwrap_or(path);
     let normalized = normalized.to_string_lossy();
     #[cfg(windows)]
-    let normalized = normalized.replace('\\', "/");
+    let normalized = {
+        let normalized = normalized.replace('\\', "/");
+        normalized
+            .strip_prefix("//?/UNC/")
+            .map(|path| format!("//{path}"))
+            .or_else(|| normalized.strip_prefix("//?/").map(str::to_owned))
+            .unwrap_or(normalized)
+    };
     #[cfg(not(windows))]
     let normalized = normalized.as_ref();
     let trimmed = normalized.trim_end_matches('/');
@@ -196,6 +205,15 @@ mod tests {
         assert_eq!(
             source_key(&["__store_key_test__/first".to_string()]),
             source_key(&["__store_key_test__\\first\\".to_string()])
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_key_normalizes_windows_verbatim_prefix() {
+        assert_eq!(
+            source_key(&["//?/C:/Path".to_string()]),
+            source_key(&["C:/Path".to_string()])
         );
     }
 
