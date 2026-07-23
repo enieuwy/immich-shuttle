@@ -227,10 +227,20 @@
             </div>
           {/if}
           {#if $sourceState.scanning}
-            <p class="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <Loader2 class="h-3.5 w-3.5 animate-spin" />
-              Scanning media...
-            </p>
+            <div class="flex items-center gap-2 text-xs text-muted-foreground">
+              <p class="flex items-center gap-1.5">
+                <Loader2 class="h-3.5 w-3.5 animate-spin" />
+                Scanning… {($sourceState.scanResult?.photo_count ?? 0) + ($sourceState.scanResult?.video_count ?? 0)} found
+              </p>
+              <Button
+                variant="ghost"
+                size="sm"
+                class="h-6 px-2 text-xs"
+                onclick={() => void sourceState.cancelScan()}
+              >
+                Cancel
+              </Button>
+            </div>
           {:else if $sourceState.scanResult}
             <div class="flex flex-wrap items-center gap-1.5">
               <span class="rounded bg-muted px-2 py-0.5 text-xs tabular-nums text-foreground">

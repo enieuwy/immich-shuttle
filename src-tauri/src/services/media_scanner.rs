@@ -8,7 +8,9 @@ use std::{
 
 use walkdir::WalkDir;
 
-use crate::models::media::{MediaFile, ScanResult};
+use crate::models::media::MediaFile;
+#[cfg(test)]
+use crate::models::media::ScanResult;
 
 /// The reason a directory scan stopped before producing a complete result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +59,113 @@ fn is_video_ext(ext: &str) -> bool {
     matches!(ext, ".mp4" | ".mov" | ".m4v" | ".avi" | ".mkv")
 }
 
+pub const STREAM_BATCH_SIZE: usize = 256;
+
+/// Scan a source path in bounded batches, stopping before processing an entry
+/// when cancelled or when `deadline` has elapsed.
+///
+/// The controls are checked before the scan begins and between [`WalkDir`]
+/// entries. `on_batch` receives each full batch and the final remainder; the
+/// return value is the number of unreadable entries skipped during the walk.
+pub fn scan_directory_streaming(
+    path: &Path,
+    cancellation: Option<&AtomicBool>,
+    deadline: Option<Instant>,
+    on_batch: &mut dyn FnMut(Vec<MediaFile>),
+) -> Result<usize, ScanError> {
+    check_scan_controls(cancellation, deadline)?;
+    if !path.exists() {
+        return Err(ScanError::Failed(format!(
+            "Source path does not exist: {}",
+            path.display()
+        )));
+    }
+
+    let exts = supported_extensions();
+    let mut files: Vec<MediaFile> = Vec::with_capacity(STREAM_BATCH_SIZE);
+    let mut skipped_unreadable = 0_usize;
+
+    if path.is_file() {
+        check_scan_controls(cancellation, deadline)?;
+        let ext = path
+            .extension()
+            .map(|v| format!(".{}", v.to_string_lossy().to_lowercase()))
+            .unwrap_or_default();
+        if exts.contains(ext.as_str()) {
+            let meta = fs::metadata(path)
+                .map_err(|e| ScanError::Failed(format!("Could not read file metadata: {e}")))?;
+            files.push(MediaFile {
+                path: path.to_string_lossy().to_string(),
+                name: path
+                    .file_name()
+                    .map(|v| v.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string()),
+                extension: ext.clone(),
+                size_bytes: meta.len(),
+                is_video: is_video_ext(ext.as_str()),
+            });
+        }
+    } else {
+        let mut entries = WalkDir::new(path).into_iter();
+        loop {
+            check_scan_controls(cancellation, deadline)?;
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            check_scan_controls(cancellation, deadline)?;
+            let entry = match entry {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped_unreadable += 1;
+                    continue;
+                }
+            };
+            // Don't follow symlinks discovered inside the tree: a link pointing
+            // outside the selected source could otherwise be scanned (and later
+            // staged/uploaded), leaking files from outside the chosen folder.
+            if entry.path_is_symlink() {
+                continue;
+            }
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let ext = p
+                .extension()
+                .map(|v| format!(".{}", v.to_string_lossy().to_lowercase()))
+                .unwrap_or_default();
+            if !exts.contains(ext.as_str()) {
+                continue;
+            }
+            let meta = match fs::metadata(p) {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped_unreadable += 1;
+                    continue;
+                }
+            };
+            files.push(MediaFile {
+                path: p.to_string_lossy().to_string(),
+                name: p
+                    .file_name()
+                    .map(|v| v.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.display().to_string()),
+                extension: ext.clone(),
+                size_bytes: meta.len(),
+                is_video: is_video_ext(ext.as_str()),
+            });
+            if files.len() >= STREAM_BATCH_SIZE {
+                on_batch(std::mem::take(&mut files));
+            }
+        }
+    }
+
+    if !files.is_empty() {
+        on_batch(files);
+    }
+    Ok(skipped_unreadable)
+}
+
 #[cfg(test)]
 pub fn scan_directory(path: &Path) -> Result<ScanResult, String> {
     scan_directory_with_controls(path, None, None).map_err(|error| error.to_string())
@@ -68,6 +177,7 @@ pub fn scan_directory(path: &Path) -> Result<ScanResult, String> {
 /// `deadline` is an absolute [`Instant`]. The controls are checked before the
 /// scan begins and between [`WalkDir`] entries; a filesystem call already in
 /// progress cannot be interrupted by this synchronous iterator.
+#[cfg(test)]
 pub fn scan_directory_with_controls(
     path: &Path,
     cancellation: Option<&AtomicBool>,
@@ -279,6 +389,37 @@ mod tests {
         assert!(result.files[0].is_video);
 
         fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_scan_flushes_all_batches_and_counts_unreadable_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join(format!("scan-stream-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        for index in 0..(STREAM_BATCH_SIZE + 1) {
+            fs::write(tmp.join(format!("{index}.jpg")), b"photo").unwrap();
+        }
+
+        let unreadable = tmp.join("unreadable");
+        fs::create_dir(&unreadable).unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut batches = Vec::new();
+        let skipped = scan_directory_streaming(&tmp, None, None, &mut |batch| {
+            batches.push(batch);
+        })
+        .unwrap();
+
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&tmp).unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), STREAM_BATCH_SIZE);
+        assert_eq!(batches[1].len(), 1);
+        assert_eq!(batches.into_iter().flatten().count(), STREAM_BATCH_SIZE + 1);
+        assert_eq!(skipped, 1);
     }
 
     #[test]

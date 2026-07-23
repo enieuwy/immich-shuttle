@@ -3,15 +3,22 @@ import { get } from "svelte/store";
 
 import * as api from "$lib/api";
 
+vi.mock("@tauri-apps/api/event", () => ({
+  // The streamed scan subscribes to `scan-progress`; a no-op unlisten is enough
+  // here since these tests drive counts through the terminal summary.
+  listen: vi.fn(async () => () => {}),
+}));
+
 vi.mock("$lib/api", () => ({
   devicesListRemovable: vi.fn(async () => []),
-  scanSources: vi.fn(async () => ({
-    files: [],
-    total_size_bytes: 1024,
+  scanSourcesStream: vi.fn(async () => ({
+    status: "complete",
     photo_count: 1,
     video_count: 0,
+    total_size_bytes: 1024,
     skipped_unreadable: 0,
   })),
+  scanCancel: vi.fn(async () => {}),
 }));
 
 import { sourceState } from "./source";
@@ -33,7 +40,10 @@ describe("sourceState", () => {
     await sourceState.selectSources(["/tmp/photos", "/tmp/videos"]);
     const state = get(sourceState);
     expect(state.selectedPaths).toEqual(["/tmp/photos", "/tmp/videos"]);
-    expect(vi.mocked(api.scanSources)).toHaveBeenLastCalledWith(["/tmp/photos", "/tmp/videos"]);
+    expect(vi.mocked(api.scanSourcesStream)).toHaveBeenLastCalledWith([
+      "/tmp/photos",
+      "/tmp/videos",
+    ]);
   });
 
   it("loads removable devices", async () => {
@@ -54,24 +64,24 @@ describe("sourceState", () => {
     await sourceState.removePath("/a");
     let state = get(sourceState);
     expect(state.selectedPaths).toEqual(["/b"]);
-    expect(vi.mocked(api.scanSources)).toHaveBeenLastCalledWith(["/b"]);
+    expect(vi.mocked(api.scanSourcesStream)).toHaveBeenLastCalledWith(["/b"]);
     await sourceState.removePath("/b");
     state = get(sourceState);
     expect(state.selectedPaths).toEqual([]);
     expect(state.scanResult).toBeNull();
-    expect(vi.mocked(api.scanSources)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.scanSourcesStream)).toHaveBeenCalledTimes(2);
   });
 
   it("drops a stale scan result when a newer selection supersedes it", async () => {
     const stale = {
-      files: [],
+      status: "complete" as const,
       total_size_bytes: 1,
       photo_count: 99,
       video_count: 0,
       skipped_unreadable: 0,
     };
     const fresh = {
-      files: [],
+      status: "complete" as const,
       total_size_bytes: 2,
       photo_count: 1,
       video_count: 0,
@@ -79,9 +89,10 @@ describe("sourceState", () => {
     };
     let call = 0;
     const gate = Promise.withResolvers<void>();
-    vi.mocked(api.scanSources).mockImplementation(async () => {
+    vi.mocked(api.scanSourcesStream).mockImplementation(async () => {
       call += 1;
-      // The first (superseded) scan blocks until released, so it resolves LAST.
+      // The first (superseded) scan blocks in its stream call until released, so
+      // it resolves LAST — after a newer selection has advanced the generation.
       if (call === 1) {
         await gate.promise;
         return stale;
@@ -90,6 +101,9 @@ describe("sourceState", () => {
     });
 
     const first = sourceState.selectSources(["/a"]);
+    // Let the first scan pass its generation guard and reach the stream call
+    // (blocked on the gate) before the superseding selection bumps generation.
+    await vi.waitFor(() => expect(call).toBe(1));
     const second = sourceState.selectSources(["/b"]);
     await second;
     gate.resolve();

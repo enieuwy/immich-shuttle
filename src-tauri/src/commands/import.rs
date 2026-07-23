@@ -8,12 +8,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tauri::Emitter;
 use uuid::Uuid;
 
 use crate::{
     models::{
         job::{ImportInput, ImportJob, JobProgress, JobStatus},
-        media::ScanResult,
+        media::{ScanProgress, ScanSummary},
     },
     services::{
         keychain, logs, media_scanner, profile_store,
@@ -783,7 +784,18 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
     Ok(job)
 }
 
-async fn scan_paths(paths: Vec<String>) -> Result<ScanResult, String> {
+#[tauri::command]
+pub async fn scan_sources_stream(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+) -> Result<ScanSummary, String> {
+    if paths.is_empty() {
+        return Err("At least one path is required".to_string());
+    }
+    // The full selection defines the approved-root scope for this scan.
+    crate::services::source_guard::reset_roots();
+    crate::services::source_guard::record_roots(&paths);
+
     let cancellation = Arc::new(AtomicBool::new(false));
     let previous = {
         let mut active = ACTIVE_SCAN
@@ -797,51 +809,117 @@ async fn scan_paths(paths: Vec<String>) -> Result<ScanResult, String> {
 
     let deadline = Instant::now() + SCAN_DEADLINE;
     let scan_cancellation = cancellation.clone();
-    let mut scan_task =
-        tauri::async_runtime::spawn_blocking(move || -> Result<ScanResult, String> {
-            let paths = collapse_overlapping_roots(paths);
-            let mut merged = ScanResult {
-                files: Vec::new(),
-                total_size_bytes: 0,
-                photo_count: 0,
-                video_count: 0,
-                skipped_unreadable: 0,
-            };
-            let mut seen_file_paths = HashSet::new();
-            for path in paths {
-                let result = media_scanner::scan_directory_with_controls(
-                    PathBuf::from(path).as_path(),
-                    Some(scan_cancellation.as_ref()),
-                    Some(deadline),
-                )
-                .map_err(|error| error.to_string())?;
-                for file in result.files {
-                    let file_path = std::fs::canonicalize(&file.path)
-                        .unwrap_or_else(|_| PathBuf::from(&file.path));
-                    if !seen_file_paths.insert(file_path) {
-                        continue;
+    let progress = Arc::new(Mutex::new(ScanSummary {
+        status: "complete".to_string(),
+        photo_count: 0,
+        video_count: 0,
+        total_size_bytes: 0,
+        skipped_unreadable: 0,
+    }));
+    let scan_progress = progress.clone();
+    let mut scan_task = tauri::async_runtime::spawn_blocking(move || {
+        let paths = collapse_overlapping_roots(paths);
+        let mut seen_file_paths = HashSet::new();
+
+        for path in paths {
+            let source_path = PathBuf::from(path);
+            let progress_for_batch = scan_progress.clone();
+            let app_for_batch = app.clone();
+            let mut progress_error = None;
+            let skipped = media_scanner::scan_directory_streaming(
+                &source_path,
+                Some(scan_cancellation.as_ref()),
+                Some(deadline),
+                &mut |files| {
+                    if scan_cancellation.load(Ordering::Relaxed) {
+                        return;
                     }
-                    merged.total_size_bytes += file.size_bytes;
-                    if file.is_video {
-                        merged.video_count += 1;
-                    } else {
-                        merged.photo_count += 1;
+
+                    if progress_error.is_some() {
+                        return;
                     }
-                    merged.files.push(file);
-                }
-                merged.skipped_unreadable += result.skipped_unreadable;
+                    let survivors: Vec<_> = files
+                        .into_iter()
+                        .filter(|file| {
+                            let file_path = std::fs::canonicalize(&file.path)
+                                .unwrap_or_else(|_| PathBuf::from(&file.path));
+                            seen_file_paths.insert(file_path)
+                        })
+                        .collect();
+                    let mut summary = match progress_for_batch.lock() {
+                        Ok(summary) => summary,
+                        Err(_) => {
+                            progress_error = Some("Could not lock scan progress state".to_string());
+                            return;
+                        }
+                    };
+                    for file in &survivors {
+                        summary.total_size_bytes += file.size_bytes;
+                        if file.is_video {
+                            summary.video_count += 1;
+                        } else {
+                            summary.photo_count += 1;
+                        }
+                    }
+                    let payload = ScanProgress {
+                        files: survivors,
+                        photo_count: summary.photo_count,
+                        video_count: summary.video_count,
+                        total_size_bytes: summary.total_size_bytes,
+                        skipped_unreadable: summary.skipped_unreadable,
+                    };
+                    drop(summary);
+                    let _ = app_for_batch.emit("scan-progress", &payload);
+                },
+            );
+
+            if let Some(error) = progress_error {
+                return Err(error);
             }
-            Ok(merged)
-        });
+            match skipped {
+                Ok(skipped) => {
+                    let mut summary = scan_progress
+                        .lock()
+                        .map_err(|_| "Could not lock scan progress state".to_string())?;
+                    summary.skipped_unreadable += skipped;
+                }
+                Err(media_scanner::ScanError::Cancelled) => {
+                    let mut summary = scan_progress
+                        .lock()
+                        .map_err(|_| "Could not lock scan progress state".to_string())?
+                        .clone();
+                    summary.status = "cancelled".to_string();
+                    return Ok(summary);
+                }
+                Err(media_scanner::ScanError::TimedOut) => {
+                    let mut summary = scan_progress
+                        .lock()
+                        .map_err(|_| "Could not lock scan progress state".to_string())?
+                        .clone();
+                    summary.status = "timed_out".to_string();
+                    return Ok(summary);
+                }
+                Err(media_scanner::ScanError::Failed(error)) => return Err(error),
+            }
+        }
+
+        scan_progress
+            .lock()
+            .map(|summary| summary.clone())
+            .map_err(|_| "Could not lock scan progress state".to_string())
+    });
 
     let result = tokio::select! {
         joined = tokio::time::timeout(SCAN_DEADLINE, &mut scan_task) => match joined {
             Ok(result) => result.map_err(|error| format!("Scan task failed: {error}"))?,
             Err(_) => {
                 cancellation.store(true, Ordering::Relaxed);
-                // Dropping the join handle detaches a worker stuck inside a filesystem
-                // syscall; it remains until the OS returns, but the IPC/UI is unblocked.
-                Err(format!("Scan timed out after {} seconds", SCAN_DEADLINE.as_secs()))
+                let mut summary = progress
+                    .lock()
+                    .map_err(|_| "Could not lock scan progress state".to_string())?
+                    .clone();
+                summary.status = "timed_out".to_string();
+                Ok(summary)
             }
         },
         _ = async {
@@ -850,7 +928,12 @@ async fn scan_paths(paths: Vec<String>) -> Result<ScanResult, String> {
             }
         } => {
             cancellation.store(true, Ordering::Relaxed);
-            Err("Scan superseded by a newer request".to_string())
+            let mut summary = progress
+                .lock()
+                .map_err(|_| "Could not lock scan progress state".to_string())?
+                .clone();
+            summary.status = "cancelled".to_string();
+            Ok(summary)
         },
     };
 
@@ -867,26 +950,14 @@ async fn scan_paths(paths: Vec<String>) -> Result<ScanResult, String> {
 }
 
 #[tauri::command]
-pub async fn scan_source(path: String) -> Result<ScanResult, String> {
-    let path = path.trim().to_string();
-    if path.is_empty() {
-        return Err("Source path is required".to_string());
+pub async fn scan_cancel() -> Result<(), String> {
+    let active = ACTIVE_SCAN
+        .lock()
+        .map_err(|_| "Could not lock active scan state".to_string())?;
+    if let Some(cancellation) = active.as_ref() {
+        cancellation.store(true, Ordering::Relaxed);
     }
-    crate::services::source_guard::record_roots(std::slice::from_ref(&path));
-    scan_paths(vec![path]).await
-}
-
-#[tauri::command]
-pub async fn scan_sources(paths: Vec<String>) -> Result<ScanResult, String> {
-    if paths.is_empty() {
-        return Err("At least one path is required".to_string());
-    }
-    // The plural scan always receives the user's full current selection, so
-    // reset the approved-root scope before recording it. This de-authorizes
-    // roots that were removed from the selection (bounds the allowlist too).
-    crate::services::source_guard::reset_roots();
-    crate::services::source_guard::record_roots(&paths);
-    scan_paths(paths).await
+    Ok(())
 }
 
 #[tauri::command]
