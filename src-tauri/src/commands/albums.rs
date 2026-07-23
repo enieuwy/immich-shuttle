@@ -46,5 +46,7 @@ pub async fn album_share_link(
         .ok_or_else(|| format!("No API key found for profile: {profile_id}"))?;
     let server_url = url_resolver::resolve_server_url(&profile).await;
     let client = ImmichClient::new(&server_url, &api_key);
-    client.create_share_link(&album_id).await
+    client
+        .create_share_link(&album_id, &profile.server_url)
+        .await
 }

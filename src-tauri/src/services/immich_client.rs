@@ -1,6 +1,6 @@
 use std::{sync::LazyLock, time::Duration};
 
-use reqwest::{Client, Method};
+use reqwest::{Client, Method, Response, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -17,21 +17,99 @@ static HTTP: LazyLock<Client> = LazyLock::new(|| {
 
 use crate::models::album::{Album, AlbumShareLink, AlbumUser};
 
-/// Percent-encode a value for use as a single URL path segment. Everything
-/// outside RFC 3986 unreserved characters is escaped — crucially `/`, so an id
-/// can never introduce additional path segments or `../` traversal into an
-/// authenticated request path.
-fn encode_path_segment(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
+/// JSON API responses are expected to be small. Bound reads so a malicious or
+/// misconfigured endpoint cannot make the app buffer an unbounded response.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+async fn response_text_limited(mut response: Response) -> Result<String, String> {
+    if let Some(content_length) = response.content_length() {
+        if content_length > MAX_RESPONSE_BYTES as u64 {
+            return Err(format!(
+                "response exceeds the {} byte limit",
+                MAX_RESPONSE_BYTES
+            ));
         }
     }
-    out
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("failed reading response chunk: {e}"))?
+    {
+        let total = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| "response exceeds the byte limit".to_string())?;
+        if total > MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "response exceeds the {} byte limit",
+                MAX_RESPONSE_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body).map_err(|e| format!("response is not valid UTF-8: {e}"))
+}
+
+/// Immich server bases identify an origin (optionally behind a path-prefix), not
+/// a resource. Discard a query and fragment so they cannot be inherited by API
+/// requests or public share links.
+fn server_base_url(value: &str) -> Option<Url> {
+    let mut url = Url::parse(value.trim()).ok()?;
+    url.set_query(None);
+    url.set_fragment(None);
+
+    let path = url.path().trim_end_matches('/').to_string();
+    let root = path.strip_suffix("/api").unwrap_or(&path);
+    url.set_path(if root.is_empty() { "/" } else { root });
+    Some(url)
+}
+
+fn append_path_segments<'a>(
+    base: &Url,
+    segments: impl IntoIterator<Item = &'a str>,
+) -> Result<Url, String> {
+    let mut url = base.clone();
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| "Server URL cannot contain path segments".to_string())?;
+        path.pop_if_empty();
+        for segment in segments {
+            if matches!(segment, "." | "..") {
+                return Err("Server URL path cannot contain traversal segments".to_string());
+            }
+            if !segment.is_empty() {
+                // `push` percent-encodes each segment, preventing callers from
+                // injecting a separator or traversal through a dynamic id.
+                path.push(segment);
+            }
+        }
+    }
+    Ok(url)
+}
+
+fn api_endpoint_urls(server_url: &str, endpoint_segments: &[&str]) -> Result<Vec<Url>, String> {
+    let base =
+        server_base_url(server_url).ok_or_else(|| format!("Invalid server URL: {server_url}"))?;
+
+    // Prefer Immich's standard `/api` path, then retry the bare endpoint for a
+    // reverse proxy that strips `/api`.
+    Ok(vec![
+        append_path_segments(
+            &base,
+            std::iter::once("api").chain(endpoint_segments.iter().copied()),
+        )?,
+        append_path_segments(&base, endpoint_segments.iter().copied())?,
+    ])
+}
+
+fn share_link_url(server_url: &str, key: &str) -> Result<String, String> {
+    let base =
+        server_base_url(server_url).ok_or_else(|| format!("Invalid server URL: {server_url}"))?;
+    Ok(append_path_segments(&base, ["share", key])?.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,26 +144,17 @@ impl ImmichClient {
     async fn request_json(
         &self,
         method: Method,
-        path: &str,
+        path: &[&str],
         body: Option<Value>,
     ) -> Result<Value, String> {
-        let root = self.server_url.trim_end_matches('/');
-        // Try the `/api`-prefixed path first: standard Immich serves its API
-        // under `/api` and the web UI at the root, so probing the bare root
-        // first wasted a request (a 404, or an HTML 200 that fails JSON parse)
-        // on every call. The bare root stays as a fallback for reverse proxies
-        // that already strip `/api`.
-        let candidates = if root.ends_with("/api") {
-            vec![format!("{root}{path}")]
-        } else {
-            vec![format!("{root}/api{path}"), format!("{root}{path}")]
-        };
+        let display_path = format!("/{}", path.join("/"));
+        let candidates = api_endpoint_urls(&self.server_url, path)?;
 
-        let mut last_err = String::from("Unknown request error");
-        for url in candidates {
+        for (index, url) in candidates.iter().enumerate() {
+            let has_alternate = index + 1 < candidates.len();
             let mut req = self
                 .http
-                .request(method.clone(), &url)
+                .request(method.clone(), url.clone())
                 .header("x-api-key", &self.api_key)
                 .header("accept", "application/json");
 
@@ -96,32 +165,26 @@ impl ImmichClient {
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
-                    let text = resp
-                        .text()
+                    // A 404 proves this route did not perform the operation, so
+                    // it is safe for every method to try the alternate prefix.
+                    if status.as_u16() == 404 && has_alternate {
+                        continue;
+                    }
+
+                    let text = response_text_limited(resp)
                         .await
                         .map_err(|e| format!("Failed reading API response: {e}"))?;
                     if !status.is_success() {
-                        let err = format!("API {method} {path} failed at {url} ({status}): {text}");
-                        // Only a 404 justifies trying the alternate `/api` path
-                        // variant. Any other status (401/403/5xx) is authoritative
-                        // for this endpoint, so surface it instead of letting a
-                        // later candidate's 404 mask e.g. an expired API key.
-                        if status.as_u16() != 404 {
-                            return Err(err);
-                        }
-                        last_err = err;
-                        continue;
+                        return Err(format!(
+                            "API {method} {display_path} failed at {url} ({status}): {text}"
+                        ));
                     }
                     if text.trim().is_empty() {
                         return Ok(json!({}));
                     }
-                    match serde_json::from_str::<Value>(&text) {
-                        Ok(v) => return Ok(v),
-                        Err(_) => {
-                            last_err =
-                                format!("API {method} {path} returned non-JSON response at {url}");
-                        }
-                    }
+                    return serde_json::from_str::<Value>(&text).map_err(|_| {
+                        format!("API {method} {display_path} returned non-JSON response at {url}")
+                    });
                 }
                 Err(e) => {
                     let mut detail = e.to_string();
@@ -131,33 +194,45 @@ impl ImmichClient {
                         detail.push_str(&s.to_string());
                         src = s.source();
                     }
-                    last_err = format!("API {method} {path} failed at {url}: {detail}");
+                    let err = format!("API {method} {display_path} failed at {url}: {detail}");
+                    // A GET is idempotent, so retain its existing compatibility
+                    // fallback after transport failures. A write may have reached
+                    // the first endpoint despite its client-side error.
+                    if method == Method::GET && has_alternate {
+                        continue;
+                    }
+                    return Err(err);
                 }
             }
         }
 
-        Err(last_err)
+        Err(format!(
+            "API {method} {display_path} has no request candidates"
+        ))
     }
 
     pub async fn ping(&self) -> Result<(), String> {
-        self.request_json(Method::GET, "/server/ping", None).await?;
+        self.request_json(Method::GET, &["server", "ping"], None)
+            .await?;
         Ok(())
     }
 
     pub async fn get_server_version(&self) -> Result<ServerVersion, String> {
         let value = self
-            .request_json(Method::GET, "/server/version", None)
+            .request_json(Method::GET, &["server", "version"], None)
             .await?;
         serde_json::from_value(value).map_err(|e| format!("Failed parsing server version: {e}"))
     }
 
     pub async fn get_my_user(&self) -> Result<MeUser, String> {
-        let value = self.request_json(Method::GET, "/users/me", None).await?;
+        let value = self
+            .request_json(Method::GET, &["users", "me"], None)
+            .await?;
         serde_json::from_value(value).map_err(|e| format!("Failed parsing /users/me: {e}"))
     }
 
     pub async fn list_users(&self) -> Result<Vec<AlbumUser>, String> {
-        let value = self.request_json(Method::GET, "/users", None).await?;
+        let value = self.request_json(Method::GET, &["users"], None).await?;
         let raw = serde_json::from_value::<Vec<Value>>(value)
             .map_err(|e| format!("Failed parsing /users list: {e}"))?;
 
@@ -182,7 +257,7 @@ impl ImmichClient {
     }
 
     pub async fn list_albums(&self, query: Option<&str>) -> Result<Vec<Album>, String> {
-        let value = self.request_json(Method::GET, "/albums", None).await?;
+        let value = self.request_json(Method::GET, &["albums"], None).await?;
         let raw = serde_json::from_value::<Vec<Value>>(value)
             .map_err(|e| format!("Failed parsing /albums list: {e}"))?;
         let q = query.map(|v| v.to_lowercase());
@@ -245,7 +320,11 @@ impl ImmichClient {
 
     pub async fn create_album(&self, name: &str) -> Result<Album, String> {
         let value = self
-            .request_json(Method::POST, "/albums", Some(json!({ "albumName": name })))
+            .request_json(
+                Method::POST,
+                &["albums"],
+                Some(json!({ "albumName": name })),
+            )
             .await?;
         let id = value
             .get("id")
@@ -279,9 +358,9 @@ impl ImmichClient {
         };
         self.request_json(
             Method::PUT,
-            // Percent-encode the id so it can't smuggle extra path segments
-            // (e.g. `../`) into the authenticated request path.
-            &format!("/albums/{}/users", encode_path_segment(album_id)),
+            // Each raw segment is percent-encoded independently, so the id
+            // cannot introduce separators or traversal into the API path.
+            &["albums", album_id, "users"],
             Some(json!({
                 "albumUsers": user_ids.iter().map(|id| json!({"userId": id, "role": role})).collect::<Vec<_>>()
             })),
@@ -290,11 +369,15 @@ impl ImmichClient {
         Ok(())
     }
 
-    pub async fn create_share_link(&self, album_id: &str) -> Result<AlbumShareLink, String> {
+    pub async fn create_share_link(
+        &self,
+        album_id: &str,
+        public_server_url: &str,
+    ) -> Result<AlbumShareLink, String> {
         let value = self
             .request_json(
                 Method::POST,
-                "/shared-links",
+                &["shared-links"],
                 Some(share_link_payload(album_id)),
             )
             .await?;
@@ -304,7 +387,7 @@ impl ImmichClient {
             .and_then(Value::as_str)
             .ok_or_else(|| "Share link response missing key".to_string())?;
         Ok(AlbumShareLink {
-            url: format!("{}/share/{key}", self.server_url.trim_end_matches('/')),
+            url: share_link_url(public_server_url, key)?,
         })
     }
 
@@ -325,7 +408,7 @@ impl ImmichClient {
             let value = self
                 .request_json(
                     Method::POST,
-                    "/assets/bulk-upload-check",
+                    &["assets", "bulk-upload-check"],
                     Some(json!({ "assets": assets })),
                 )
                 .await?;
@@ -372,13 +455,19 @@ fn share_link_payload(album_id: &str) -> Value {
     })
 }
 
+/// Normalize a server base URL. Server-base queries and fragments are discarded
+/// because API endpoints and public links must be rooted at the server path.
 pub fn normalize_server_url(value: &str) -> String {
-    let trimmed = value.trim().trim_end_matches('/');
-    if let Some(root) = trimmed.strip_suffix("/api") {
-        root.to_string()
-    } else {
-        trimmed.to_string()
-    }
+    let trimmed = value.trim();
+    let Some(url) = server_base_url(trimmed) else {
+        return trimmed.trim_end_matches('/').to_string();
+    };
+
+    let serialized = url.as_str();
+    serialized
+        .strip_suffix('/')
+        .unwrap_or(serialized)
+        .to_string()
 }
 
 /// Confirm a candidate endpoint is a reachable Immich server WITHOUT sending the
@@ -389,24 +478,15 @@ pub fn normalize_server_url(value: &str) -> String {
 /// this probe; that residual risk is inherent to the user's transport choice.
 pub async fn probe_is_immich(server_url: &str) -> bool {
     let root = normalize_server_url(server_url);
-    let root = root.trim_end_matches('/');
     if root.is_empty() {
         return false;
     }
-    // Mirror request_json's `/api` path handling: a URL already ending in `/api`
-    // is used verbatim, otherwise try the `/api`-prefixed path first (standard
-    // Immich) and fall back to the bare path for `/api`-stripping proxies.
-    let candidates = if root.ends_with("/api") {
-        vec![format!("{root}/server/ping")]
-    } else {
-        vec![
-            format!("{root}/api/server/ping"),
-            format!("{root}/server/ping"),
-        ]
+    let Ok(candidates) = api_endpoint_urls(&root, &["server", "ping"]) else {
+        return false;
     };
     for url in candidates {
         let resp = HTTP
-            .get(&url)
+            .get(url)
             .header("accept", "application/json")
             // Short bound so failover stays snappy; covers connect + response.
             .timeout(Duration::from_millis(2000))
@@ -416,7 +496,7 @@ pub async fn probe_is_immich(server_url: &str) -> bool {
         if !resp.status().is_success() {
             continue;
         }
-        let Ok(text) = resp.text().await else {
+        let Ok(text) = response_text_limited(resp).await else {
             continue;
         };
         if serde_json::from_str::<Value>(&text)
@@ -435,11 +515,19 @@ mod tests {
     use super::normalize_server_url;
 
     #[test]
-    fn strips_trailing_api_segment() {
-        assert_eq!(
-            normalize_server_url("https://immich.example.com/api"),
-            "https://immich.example.com"
-        );
+    fn normalizes_api_path_without_changing_authority() {
+        for (input, expected) in [
+            ("https://api", "https://api"),
+            ("https://api/", "https://api"),
+            ("https://host/api", "https://host"),
+            ("https://host/api/", "https://host"),
+            (
+                "https://immich.example.com/api",
+                "https://immich.example.com",
+            ),
+        ] {
+            assert_eq!(normalize_server_url(input), expected);
+        }
     }
 
     #[test]
@@ -447,6 +535,54 @@ mod tests {
         assert_eq!(
             normalize_server_url("https://immich.example.com/"),
             "https://immich.example.com"
+        );
+    }
+
+    #[test]
+    fn share_link_uses_primary_server_url() {
+        use super::share_link_url;
+
+        assert_eq!(
+            share_link_url("https://wan.example.com/api", "share-key").unwrap(),
+            "https://wan.example.com/share/share-key"
+        );
+    }
+
+    #[test]
+    fn composes_api_and_share_paths_from_query_bearing_port_base() {
+        use super::{api_endpoint_urls, share_link_url};
+
+        let base = normalize_server_url("https://host:2283/api/?next=/");
+        assert_eq!(base, "https://host:2283");
+
+        for (path, api_url, bare_url) in [
+            (
+                "/albums",
+                "https://host:2283/api/albums",
+                "https://host:2283/albums",
+            ),
+            (
+                "/shared-links",
+                "https://host:2283/api/shared-links",
+                "https://host:2283/shared-links",
+            ),
+            (
+                "/server/ping",
+                "https://host:2283/api/server/ping",
+                "https://host:2283/server/ping",
+            ),
+        ] {
+            let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+            let urls = api_endpoint_urls(&base, &segments)
+                .unwrap()
+                .into_iter()
+                .map(|url| url.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(urls, [api_url, bare_url]);
+        }
+        assert_eq!(
+            share_link_url("https://host:2283/api/?next=/", "share-key").unwrap(),
+            "https://host:2283/share/share-key"
         );
     }
 
@@ -462,20 +598,6 @@ mod tests {
         ];
         // Only the duplicate-reason reject is treated as present on the server.
         assert_eq!(duplicates_from_results(&results), vec!["a".to_string()]);
-    }
-
-    #[test]
-    fn encode_path_segment_escapes_separators_and_traversal() {
-        use super::encode_path_segment;
-        // A normal UUID is untouched.
-        assert_eq!(
-            encode_path_segment("6b2f1c4e-0000-4a1b-9c3d-abcdef012345"),
-            "6b2f1c4e-0000-4a1b-9c3d-abcdef012345"
-        );
-        // Slashes (segment separators) are escaped, so no extra path can be added.
-        assert_eq!(encode_path_segment("../admin"), "..%2Fadmin");
-        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
-        assert!(!encode_path_segment("x/../y").contains('/'));
     }
 
     #[test]
