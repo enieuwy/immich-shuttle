@@ -152,10 +152,16 @@ export function selectNewlyTerminal(prev: ImportJob[], next: ImportJob[]): Impor
 async function fireTerminalNotifications(prev: ImportJob[], next: ImportJob[]) {
   const newlyTerminal = selectNewlyTerminal(prev, next);
   if (newlyTerminal.length === 0) return;
-  if (!(await ensureNotifyPermission())) return;
-  for (const job of newlyTerminal) {
-    const notification = notificationForJob(job);
-    if (notification) sendNotification(notification);
+  try {
+    if (!(await ensureNotifyPermission())) return;
+    for (const job of newlyTerminal) {
+      const notification = notificationForJob(job);
+      if (notification) sendNotification(notification);
+    }
+  } catch {
+    // Notifications are best-effort: a missing/denied permission backend or a
+    // throwing send must not surface as an unhandled rejection or disturb the
+    // already-refreshed queue state.
   }
 }
 

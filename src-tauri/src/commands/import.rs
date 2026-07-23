@@ -381,6 +381,11 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     let api_key_clone = api_key;
     let app_clone = app.clone();
     let device_uuid = format!("immich-shuttle-{}", Uuid::new_v4());
+    // The full request is persisted to history for "Import again". Move the
+    // original input in (it is unused after admission) and drop the one-time
+    // staged subset, avoiding a retained copy plus a deep clone of select_files.
+    let mut history_request = input;
+    history_request.select_files = None;
 
     tauri::async_runtime::spawn(async move {
         let api_key_for_album_assignment = api_key_clone.clone();
@@ -704,15 +709,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 uploaded: update.progress.uploaded,
                 duplicates: update.progress.duplicates,
                 errors: update.progress.errors,
-                // Persist the request so History can replay it. The staged
-                // subset is a one-time selection and is dropped: replay
-                // repopulates the source/options for review, then the user
-                // re-selects if needed.
-                request: {
-                    let mut req = input.clone();
-                    req.select_files = None;
-                    Some(req)
-                },
+                // Persist the request (source/options) so History can replay it.
+                request: Some(history_request),
             },
         ) {
             let _ = logs::append_log(

@@ -188,8 +188,10 @@
       fromInput !== "" ||
       toInput !== "" ||
       nameQuery.trim() !== "" ||
-      minMbInput !== "" ||
-      maxMbInput !== "",
+      // Numeric bind:value yields undefined when cleared, so key off the parsed
+      // bounds, not the raw input, to avoid a stuck "active" state.
+      minBytes !== null ||
+      maxBytes !== null,
   );
 
   function fmtSize(bytes: number): string {

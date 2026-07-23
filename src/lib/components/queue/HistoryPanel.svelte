@@ -45,8 +45,12 @@
   }
 
   async function importAgain(record: ImportRecord) {
-    const staged = await replayImport(record);
-    if (!staged) {
+    const outcome = await replayImport(record);
+    if (outcome === "profile-missing") {
+      errorsState.addError(
+        "The profile for this import no longer exists. Add it back, then try again.",
+      );
+    } else if (outcome === "no-request") {
       errorsState.addError(
         "This import can't be repeated — it was recorded before request details were saved.",
       );

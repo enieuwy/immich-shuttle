@@ -26,6 +26,7 @@
   import { queueState } from "$lib/state/queue";
   import { selectionState } from "$lib/state/selection";
   import { sourceState } from "$lib/state/source";
+  import { previewState } from "$lib/state/preview";
   import { openProfileEditor, panelTab } from "$lib/state/ui";
   import { themeState } from "$lib/state/theme";
   import { isDateRangeInvalid, importOptionsState } from "$lib/state/import-options";
@@ -84,10 +85,30 @@
   }
 
   function handleGlobalKeydown(event: KeyboardEvent) {
-    if ((event.metaKey || event.ctrlKey) && (event.key === "k" || event.key === "K")) {
+    const isPaletteChord =
+      (event.metaKey || event.ctrlKey) && (event.key === "k" || event.key === "K");
+    if (!isPaletteChord || event.repeat) return;
+
+    // Always allow the chord to close an open palette.
+    if (showPalette) {
       event.preventDefault();
-      showPalette = !showPalette;
+      showPalette = false;
+      return;
     }
+
+    // Don't hijack the text-editing chord inside inputs, or stack the palette
+    // over another open modal/overlay.
+    const target = event.target as HTMLElement | null;
+    const inEditable =
+      !!target &&
+      (target.isContentEditable ||
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.tagName === "SELECT");
+    if (inEditable || showManager || showLogs || showOnboarding || $previewState.open) return;
+
+    event.preventDefault();
+    showPalette = true;
   }
 
   const paletteCommands: PaletteCommand[] = [

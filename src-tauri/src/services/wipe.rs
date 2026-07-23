@@ -20,8 +20,26 @@ fn allowed_media_exts() -> HashSet<&'static str> {
     .collect()
 }
 
+/// A trash handle configured to avoid extra OS permission prompts. On macOS the
+/// crate's default backend drives Finder via AppleScript (needs automation
+/// permission and fails in headless sessions), so files that verified as
+/// uploaded would be wrongly kept; NSFileManager needs no such permission.
+#[cfg(target_os = "macos")]
+fn trash_context() -> trash::TrashContext {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos};
+    let mut ctx = trash::TrashContext::default();
+    ctx.set_delete_method(DeleteMethod::NsFileManager);
+    ctx
+}
+
+#[cfg(not(target_os = "macos"))]
+fn trash_context() -> trash::TrashContext {
+    trash::TrashContext::default()
+}
+
 pub fn wipe_files(paths: &[String]) -> WipeResult {
     let exts = allowed_media_exts();
+    let trash = trash_context();
     let mut result = WipeResult {
         deleted: 0,
         failed: 0,
@@ -48,7 +66,7 @@ pub fn wipe_files(paths: &[String]) -> WipeResult {
         // Move to the OS Trash instead of a hard delete so a mistaken wipe is
         // recoverable. The verify-before-wipe gate upstream is unchanged: only
         // server-confirmed files reach this function.
-        match trash::delete(path) {
+        match trash.delete(path) {
             Ok(_) => result.deleted += 1,
             Err(err) => {
                 result.failed += 1;
