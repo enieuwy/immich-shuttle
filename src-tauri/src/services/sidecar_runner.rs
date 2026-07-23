@@ -74,12 +74,15 @@ impl Drop for TempConfig {
 /// returned guard removes the whole directory when the run finishes.
 fn write_api_key_config(api_key: &str) -> Result<TempConfig, String> {
     let dir = std::env::temp_dir().join(format!("immich-shuttle-{}", Uuid::new_v4()));
-    let mut dir_builder = fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let dir_builder = {
         use std::os::unix::fs::DirBuilderExt;
-        dir_builder.mode(0o700);
-    }
+        let mut b = fs::DirBuilder::new();
+        b.mode(0o700);
+        b
+    };
+    #[cfg(not(unix))]
+    let dir_builder = fs::DirBuilder::new();
     dir_builder
         .create(&dir)
         .map_err(|e| format!("Could not create immich-go config directory: {e}"))?;
