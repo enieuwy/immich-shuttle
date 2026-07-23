@@ -1,4 +1,4 @@
-use keyring::Entry;
+use keyring::{Entry, Error as KeyringError};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 const KEYCHAIN_SERVICE: &str = "immich-shuttle";
@@ -41,14 +41,11 @@ pub fn get_api_key(profile_id: &str) -> Result<Option<String>, String> {
     let e = entry(profile_id)?;
     match e.get_password() {
         Ok(v) => Ok(Some(v)),
+        // No credential was ever stored for this profile — not an error.
+        Err(KeyringError::NoEntry) => Ok(None),
         Err(err) => {
             let msg = err.to_string();
-            if msg.contains("No entry found")
-                || msg.contains("Item not found")
-                || msg.contains("No matching entry")
-            {
-                Ok(None)
-            } else if cfg!(target_os = "linux")
+            if cfg!(target_os = "linux")
                 && (msg.contains("secret service")
                     || msg.contains("org.freedesktop.secrets")
                     || msg.contains("No such interface"))
@@ -66,17 +63,32 @@ pub fn delete_api_key(profile_id: &str) -> Result<(), String> {
     let _guard = keychain_guard();
     let e = entry(profile_id)?;
     match e.delete_credential() {
-        Ok(_) => Ok(()),
-        Err(err) => {
-            let msg = err.to_string();
-            if msg.contains("No entry found")
-                || msg.contains("Item not found")
-                || msg.contains("No matching entry")
-            {
-                Ok(())
-            } else {
-                Err(format!("Could not delete API key from keychain: {err}"))
-            }
-        }
+        Ok(()) => Ok(()),
+        // Already absent — deletion is idempotent.
+        Err(KeyringError::NoEntry) => Ok(()),
+        Err(err) => Err(format!("Could not delete API key from keychain: {err}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end round trip against the real OS credential store. Ignored by
+    /// default because it needs an unlocked keychain/secret-service and would be
+    /// flaky in headless CI; run explicitly with `cargo test -- --ignored` to
+    /// verify the credential backend (e.g. after a keyring version bump).
+    #[test]
+    #[ignore]
+    fn store_get_delete_round_trip() {
+        let profile = format!("__it_keychain_{}", uuid::Uuid::new_v4());
+        // Absent before storing.
+        assert_eq!(get_api_key(&profile).unwrap(), None);
+        store_api_key(&profile, "s3cr3t").unwrap();
+        assert_eq!(get_api_key(&profile).unwrap(), Some("s3cr3t".to_string()));
+        delete_api_key(&profile).unwrap();
+        // Absent again; a second delete is idempotent.
+        assert_eq!(get_api_key(&profile).unwrap(), None);
+        delete_api_key(&profile).unwrap();
     }
 }
