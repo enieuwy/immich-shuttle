@@ -12,6 +12,20 @@
 
   let actionError = $state("");
 
+  // Surface what's actionable now: running first, then queued, then failures
+  // (they carry Retry), then finished. Stable within a group, so the backend's
+  // order is the tiebreak.
+  const statusRank: Record<string, number> = {
+    running: 0,
+    pending: 1,
+    failed: 2,
+    completed: 3,
+    cancelled: 4,
+  };
+  const sortedJobs = $derived(
+    [...$queueState.jobs].sort((a, b) => (statusRank[a.status] ?? 9) - (statusRank[b.status] ?? 9)),
+  );
+
   onMount(() => {
     void queueState.loadJobs();
     queueState.startPolling();
@@ -110,7 +124,7 @@
       </div>
     {:else}
       <div class="flex flex-col gap-2" role="status" aria-live="polite">
-        {#each $queueState.jobs as job (job.id)}
+        {#each sortedJobs as job (job.id)}
           {@const pct = job.progress.total
             ? Math.round((job.progress.uploaded / job.progress.total) * 100)
             : 0}

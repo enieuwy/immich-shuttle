@@ -18,6 +18,11 @@
     void albumsState.loadAlbums();
   });
 
+  // Most-recently-finished first, regardless of backend order.
+  const sortedRecords = $derived(
+    [...$historyState.records].sort((a, b) => b.finished_at - a.finished_at),
+  );
+
 
   function basename(path: string) {
     const parts = path.split(/[\\/]/).filter(Boolean);
@@ -92,7 +97,7 @@
     {:else}
       <ScrollArea class="max-h-[26rem]">
         <ul class="flex flex-col gap-2 pr-3">
-          {#each $historyState.records as record (record.id)}
+          {#each sortedRecords as record (record.id)}
             {@const album = record.album_ids[0]
               ? ($albumsState.availableAlbums.find((a) => a.id === record.album_ids[0]) ?? null)
               : null}

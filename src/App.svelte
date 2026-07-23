@@ -9,6 +9,7 @@
   import ErrorToast from "$lib/components/feedback/ErrorToast.svelte";
   import LogViewer from "$lib/components/feedback/LogViewer.svelte";
   import ImportOptions from "$lib/components/import/ImportOptions.svelte";
+  import ImportPreflight from "$lib/components/import/ImportPreflight.svelte";
   import ImportQueue from "$lib/components/queue/ImportQueue.svelte";
   import HistoryPanel from "$lib/components/queue/HistoryPanel.svelte";
   import OnboardingOverlay from "$lib/components/onboarding/OnboardingOverlay.svelte";
@@ -276,6 +277,7 @@
         {/if}
       </div>
       <div class="flex shrink-0 items-center gap-2">
+        <ImportPreflight />
         <Button variant="ghost" size="sm" onclick={() => (showLogs = true)}>
           <FileText class="size-4" /> Logs
         </Button>

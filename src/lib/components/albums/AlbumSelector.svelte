@@ -13,7 +13,10 @@
   import { Badge } from "$lib/components/ui/badge";
   import { Card, CardHeader, CardTitle, CardAction, CardContent } from "$lib/components/ui/card";
   import { Label } from "$lib/components/ui/label";
+  import { Switch } from "$lib/components/ui/switch";
   import { Alert, AlertDescription } from "$lib/components/ui/alert";
+  import { importOptionsState } from "$lib/state/import-options";
+  import type { ImportOrganization } from "$lib/types";
 
   let search = $state("");
   let showCreate = $state(false);
@@ -21,6 +24,27 @@
   let selectedShareUserIds = $state<string[]>([]);
   let shareRole = $state<"viewer" | "editor">("viewer");
   let createPublicLink = $state(false);
+
+  const tagsText = $derived($importOptionsState.tags.join(", "));
+  function commitTags(raw: string) {
+    importOptionsState.setTags(
+      raw
+        .split(",")
+        .map((t) => t.trim())
+        .filter((t) => t.length > 0),
+    );
+  }
+
+  // Selected album(s) first, then alphabetical — keeps the active choice on
+  // screen without scrolling; the search box handles finding the rest.
+  const sortedAlbums = $derived(
+    [...$albumsState.availableAlbums].sort((a, b) => {
+      const aSel = $albumsState.selectedAlbumIds.includes(a.id);
+      const bSel = $albumsState.selectedAlbumIds.includes(b.id);
+      if (aSel !== bSel) return aSel ? -1 : 1;
+      return a.album_name.localeCompare(b.album_name);
+    }),
+  );
 
   $effect(() => {
     const _profile = $activeProfile;
@@ -71,7 +95,7 @@
       <span class="flex size-7 items-center justify-center rounded-lg bg-primary/10 text-primary">
         <Images class="h-4 w-4" />
       </span>
-      <CardTitle class="text-sm font-semibold text-foreground">Albums</CardTitle>
+      <CardTitle class="text-sm font-semibold text-foreground">Destination</CardTitle>
     </div>
     <CardAction>
       <Button variant="outline" size="sm" onclick={() => (showCreate = true)}>
@@ -175,7 +199,7 @@
         <p class="px-1 py-1 text-sm text-muted-foreground">No albums match.</p>
       {:else}
         <div class="flex flex-wrap gap-1.5">
-          {#each $albumsState.availableAlbums as album}
+          {#each sortedAlbums as album (album.id)}
             {@const selected = $albumsState.selectedAlbumIds.includes(album.id)}
             <button
               type="button"
@@ -208,6 +232,73 @@
       {/if}
     </div>
 
+    <div class="flex flex-col gap-3 border-t border-border/60 pt-3">
+      <div>
+        <div class="flex items-start justify-between gap-3">
+          <Label
+            for="album-option-organization"
+            class="flex min-w-0 flex-col items-start gap-1 font-normal"
+          >
+            <span class="text-sm font-medium text-foreground">Organize into albums</span>
+            <span class="text-xs text-muted-foreground">
+              Group uploads by the source folder structure instead of one album.
+            </span>
+          </Label>
+          <select
+            id="album-option-organization"
+            class="h-9 w-52 shrink-0 rounded-md border border-input bg-transparent px-2 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label="Organize into albums"
+            value={$importOptionsState.organization}
+            onchange={(e) =>
+              importOptionsState.setOrganization(e.currentTarget.value as ImportOrganization)}
+          >
+            <option value="single_album">Single album (selected)</option>
+            <option value="folder_name">Album per folder name</option>
+            <option value="folder_path">Album per folder path</option>
+            <option value="folder_tags">Tag by folder path</option>
+          </select>
+        </div>
+        {#if $importOptionsState.organization !== "single_album"}
+          <p class="mt-2 text-xs text-muted-foreground">
+            Albums or tags are derived from the source folders; the album picker above is ignored for this mode.
+          </p>
+        {/if}
+      </div>
+
+      <div>
+        <Label
+          for="album-option-tags"
+          class="flex min-w-0 flex-col items-start gap-1 font-normal"
+        >
+          <span class="text-sm font-medium text-foreground">Tags</span>
+          <span class="text-xs text-muted-foreground">Comma-separated tags applied to every uploaded asset. Use / for hierarchy (e.g. Trip/Iceland).</span>
+        </Label>
+        <Input
+          id="album-option-tags"
+          class="mt-2"
+          placeholder="Trip/Iceland, client-a"
+          aria-label="Tags"
+          value={tagsText}
+          onchange={(e) => commitTags(e.currentTarget.value)}
+        />
+      </div>
+
+      <div class="flex items-center justify-between gap-3">
+        <Label
+          for="album-option-session-tag"
+          class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
+        >
+          <span class="text-sm font-medium text-foreground">Tag this import session</span>
+          <span class="text-xs text-muted-foreground">Add a timestamped tag so this batch is easy to find later.</span>
+        </Label>
+        <Switch
+          id="album-option-session-tag"
+          aria-label="Tag this import session"
+          checked={$importOptionsState.sessionTag}
+          onCheckedChange={(v) => importOptionsState.setSessionTag(v)}
+        />
+      </div>
+    </div>
   </CardContent>
 
   <Dialog bind:open={showCreate}>
