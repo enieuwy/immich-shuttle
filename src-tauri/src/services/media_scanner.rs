@@ -1,8 +1,47 @@
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
 
 use walkdir::WalkDir;
 
 use crate::models::media::{MediaFile, ScanResult};
+
+/// The reason a directory scan stopped before producing a complete result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanError {
+    Cancelled,
+    TimedOut,
+    Failed(String),
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("Directory scan was cancelled"),
+            Self::TimedOut => f.write_str("Directory scan timed out"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ScanError {}
+
+fn check_scan_controls(
+    cancellation: Option<&AtomicBool>,
+    deadline: Option<Instant>,
+) -> Result<(), ScanError> {
+    if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+        return Err(ScanError::Cancelled);
+    }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(ScanError::TimedOut);
+    }
+    Ok(())
+}
 
 fn supported_extensions() -> HashSet<&'static str> {
     [
@@ -18,9 +57,28 @@ fn is_video_ext(ext: &str) -> bool {
     matches!(ext, ".mp4" | ".mov" | ".m4v" | ".avi" | ".mkv")
 }
 
+#[cfg(test)]
 pub fn scan_directory(path: &Path) -> Result<ScanResult, String> {
+    scan_directory_with_controls(path, None, None).map_err(|error| error.to_string())
+}
+
+/// Scan a source path, stopping before processing an entry when cancelled or
+/// when `deadline` has elapsed.
+///
+/// `deadline` is an absolute [`Instant`]. The controls are checked before the
+/// scan begins and between [`WalkDir`] entries; a filesystem call already in
+/// progress cannot be interrupted by this synchronous iterator.
+pub fn scan_directory_with_controls(
+    path: &Path,
+    cancellation: Option<&AtomicBool>,
+    deadline: Option<Instant>,
+) -> Result<ScanResult, ScanError> {
+    check_scan_controls(cancellation, deadline)?;
     if !path.exists() {
-        return Err(format!("Source path does not exist: {}", path.display()));
+        return Err(ScanError::Failed(format!(
+            "Source path does not exist: {}",
+            path.display()
+        )));
     }
 
     let exts = supported_extensions();
@@ -31,13 +89,14 @@ pub fn scan_directory(path: &Path) -> Result<ScanResult, String> {
     let mut skipped_unreadable = 0_usize;
 
     if path.is_file() {
+        check_scan_controls(cancellation, deadline)?;
         let ext = path
             .extension()
             .map(|v| format!(".{}", v.to_string_lossy().to_lowercase()))
             .unwrap_or_default();
         if exts.contains(ext.as_str()) {
-            let meta =
-                fs::metadata(path).map_err(|e| format!("Could not read file metadata: {e}"))?;
+            let meta = fs::metadata(path)
+                .map_err(|e| ScanError::Failed(format!("Could not read file metadata: {e}")))?;
             let is_video = is_video_ext(ext.as_str());
             if is_video {
                 video_count += 1;
@@ -57,7 +116,13 @@ pub fn scan_directory(path: &Path) -> Result<ScanResult, String> {
             });
         }
     } else {
-        for entry in WalkDir::new(path) {
+        let mut entries = WalkDir::new(path).into_iter();
+        loop {
+            check_scan_controls(cancellation, deadline)?;
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            check_scan_controls(cancellation, deadline)?;
             let entry = match entry {
                 Ok(v) => v,
                 Err(_) => {
@@ -162,6 +227,24 @@ mod tests {
     fn nonexistent_path_returns_err() {
         let missing = std::env::temp_dir().join(format!("scan-missing-{}", Uuid::new_v4()));
         assert!(scan_directory(&missing).is_err());
+    }
+
+    #[test]
+    fn scan_controls_return_typed_cancellation_errors() {
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            scan_directory_with_controls(std::path::Path::new("/not-used"), Some(&cancelled), None),
+            Err(ScanError::Cancelled)
+        ));
+
+        assert!(matches!(
+            scan_directory_with_controls(
+                std::path::Path::new("/not-used"),
+                None,
+                Some(Instant::now())
+            ),
+            Err(ScanError::TimedOut)
+        ));
     }
 
     #[test]
