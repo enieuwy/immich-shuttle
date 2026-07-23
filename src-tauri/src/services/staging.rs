@@ -13,6 +13,7 @@ use std::{
     collections::HashSet,
     fs,
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 use uuid::Uuid;
 
@@ -68,8 +69,12 @@ impl Drop for StagingDir {
 }
 
 /// Build a staging directory linking to `selected`. The returned guard removes
-/// the directory if it is not explicitly cleaned up.
-pub fn create_staging_dir(selected: &[String]) -> Result<StagingDir, String> {
+/// the directory if it is not explicitly cleaned up. If `cancel` is set, staging
+/// stops before linking the next selected file and drops its partial directory.
+pub fn create_staging_dir(
+    selected: &[String],
+    cancel: Option<&AtomicBool>,
+) -> Result<StagingDir, String> {
     if selected.is_empty() {
         return Err("No files selected to stage".to_string());
     }
@@ -94,6 +99,9 @@ pub fn create_staging_dir(selected: &[String]) -> Result<StagingDir, String> {
     let mut linked = 0_usize;
     let mut used: HashSet<PathBuf> = HashSet::new();
     for entry in selected {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err("Staging cancelled".to_string());
+        }
         let src = Path::new(entry);
         if !src.is_file() {
             continue;
@@ -249,10 +257,13 @@ mod tests {
         fs::write(&a, b"a").unwrap();
         fs::write(&b, b"b").unwrap();
 
-        let staged = create_staging_dir(&[
-            a.to_string_lossy().to_string(),
-            b.to_string_lossy().to_string(),
-        ])
+        let staged = create_staging_dir(
+            &[
+                a.to_string_lossy().to_string(),
+                b.to_string_lossy().to_string(),
+            ],
+            None,
+        )
         .unwrap();
 
         assert!(staged.path().join("100/IMG_1.JPG").exists());
@@ -268,7 +279,32 @@ mod tests {
 
     #[test]
     fn empty_selection_errors() {
-        assert!(create_staging_dir(&[]).is_err());
+        assert!(create_staging_dir(&[], None).is_err());
+    }
+
+    #[test]
+    fn pre_cancelled_staging_aborts_before_linking_files() {
+        let tmp = std::env::temp_dir().join(format!("stage-cancel-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let a = tmp.join("a.jpg");
+        let b = tmp.join("b.jpg");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        let cancel = AtomicBool::new(true);
+
+        let error = match create_staging_dir(
+            &[
+                a.to_string_lossy().to_string(),
+                b.to_string_lossy().to_string(),
+            ],
+            Some(&cancel),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("pre-cancelled staging must fail"),
+        };
+        assert_eq!(error, "Staging cancelled");
+        assert!(a.exists() && b.exists());
+        fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
@@ -282,10 +318,13 @@ mod tests {
         let a = tmp.join("photo.jpg");
         fs::write(&a, b"a").unwrap();
 
-        let staged = create_staging_dir(&[
-            a.to_string_lossy().to_string(),
-            a.to_string_lossy().to_string(),
-        ])
+        let staged = create_staging_dir(
+            &[
+                a.to_string_lossy().to_string(),
+                a.to_string_lossy().to_string(),
+            ],
+            None,
+        )
         .unwrap();
 
         assert_eq!(
@@ -325,7 +364,8 @@ mod tests {
 
         // Craft the first entry with literal `..` segments relative to the second.
         let crafted = format!("{}/album/../evilfile.jpg", tmp.to_string_lossy());
-        let staged = create_staging_dir(&[crafted, normal.to_string_lossy().to_string()]).unwrap();
+        let staged =
+            create_staging_dir(&[crafted, normal.to_string_lossy().to_string()], None).unwrap();
 
         for entry in walkdir_files(staged.path()) {
             assert!(
@@ -349,7 +389,7 @@ mod tests {
         fs::write(&source, b"x").unwrap();
 
         let staged_path = {
-            let staged = create_staging_dir(&[source.to_string_lossy().to_string()]).unwrap();
+            let staged = create_staging_dir(&[source.to_string_lossy().to_string()], None).unwrap();
             let path = staged.path().to_path_buf();
             assert!(path.exists());
             path

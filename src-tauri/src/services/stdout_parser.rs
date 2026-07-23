@@ -66,10 +66,24 @@ fn error_message(line: &str) -> Option<String> {
 ///
 /// immich-go (v0.32.0) logs files as `<fsRoot>:<name>` — e.g.
 /// `/Volumes/CANON:DCIM/IMG_0001.JPG` — where `fsRoot` is the source path passed
-/// to it and `name` is the path within. POSIX roots contain no colon, so the
-/// first colon is the separator; on Windows the root carries a drive colon
-/// (`C:\DCIM`), so the search skips a leading `<drive>:` first.
-fn fs_path_from_file_attr(file: &str) -> String {
+/// to it and `name` is the path within. Match the known roots first because a
+/// POSIX source path may itself contain a colon. Without source roots, retain
+/// the legacy separator heuristic; on Windows it skips a leading drive colon.
+fn fs_path_from_file_attr(file: &str, source_paths: &[String]) -> String {
+    if let Some((root, name)) = source_paths
+        .iter()
+        .filter_map(|root| {
+            file.strip_prefix(root)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .filter(|name| !name.is_empty())
+                .map(|name| (root, name))
+        })
+        .max_by_key(|(root, _)| root.len())
+    {
+        let separator = if root.ends_with(['/', '\\']) { "" } else { "/" };
+        return format!("{root}{separator}{name}");
+    }
+
     let search_from = if is_windows_drive_prefix(file) { 2 } else { 0 };
     if let Some(rel) = file.get(search_from..).and_then(|s| s.find(':')) {
         let idx = search_from + rel;
@@ -140,11 +154,19 @@ pub struct ProgressAccumulator {
     errors: u32,
     /// A trailing line not yet terminated by '\n'; reparsed once its rest arrives.
     pending: String,
+    source_paths: Vec<String>,
 }
 
 impl ProgressAccumulator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_source_paths(source_paths: &[String]) -> Self {
+        Self {
+            source_paths: source_paths.to_vec(),
+            ..Self::default()
+        }
     }
 
     /// Fold a chunk of newly-read log text. Only complete lines (terminated by
@@ -207,7 +229,7 @@ impl ProgressAccumulator {
         };
         if message.starts_with("uploaded successfully") {
             if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
-                let path = fs_path_from_file_attr(&file);
+                let path = fs_path_from_file_attr(&file, &self.source_paths);
                 if self.seen_paths.insert(path.clone()) {
                     self.completed_paths.push(path);
                     self.uploaded = self.uploaded.saturating_add(1);
@@ -216,7 +238,7 @@ impl ProgressAccumulator {
         } else if message.starts_with("server has duplicate") {
             self.duplicates = self.duplicates.saturating_add(1);
             if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
-                let path = fs_path_from_file_attr(&file);
+                let path = fs_path_from_file_attr(&file, &self.source_paths);
                 if self.seen_paths.insert(path.clone()) {
                     self.completed_paths.push(path);
                 }
@@ -236,8 +258,8 @@ impl ProgressAccumulator {
 /// - `uploaded successfully` -> uploaded (de-duplicated, with real fs path)
 /// - `server has duplicate` -> duplicates already on the server
 /// - ERROR lines carrying a `file=` -> per-file upload error events
-pub fn parse_run_progress(contents: &str) -> RunProgress {
-    let mut acc = ProgressAccumulator::new();
+pub fn parse_run_progress(contents: &str, source_paths: &[String]) -> RunProgress {
+    let mut acc = ProgressAccumulator::with_source_paths(source_paths);
     acc.push_chunk(contents);
     acc.finish();
     acc.snapshot()
@@ -247,7 +269,7 @@ pub fn parse_run_progress(contents: &str) -> RunProgress {
 /// `--log-file`). Only ERROR-level lines that carry a `file=` attribute are
 /// reported; aggregate/directory-scan errors (no `file=`) are surfaced as a
 /// count only. Failures are deduplicated by file, preserving the first reason.
-pub fn parse_error_log(contents: &str) -> Vec<FileError> {
+pub fn parse_error_log(contents: &str, source_paths: &[String]) -> Vec<FileError> {
     let mut out: Vec<FileError> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -256,7 +278,7 @@ pub fn parse_error_log(contents: &str) -> Vec<FileError> {
             continue;
         }
         let file = match attr_value(line, "file", &["error", "reason", "discovered_at"]) {
-            Some(f) if !f.is_empty() => f,
+            Some(f) if !f.is_empty() => fs_path_from_file_attr(&f, source_paths),
             _ => continue,
         };
         if !seen.insert(file.clone()) {
@@ -301,7 +323,7 @@ mod tests {
 
     #[test]
     fn counts_events_not_summary_report() {
-        let p = parse_run_progress(LOG).progress;
+        let p = parse_run_progress(LOG, &[]).progress;
         // 2 discovered image + 1 discovered video event lines (NOT the indented
         // "discovered image : 193" summary line).
         assert_eq!(p.total, 3);
@@ -317,7 +339,7 @@ mod tests {
         // Duplicates already on the server are safe-to-wipe candidates too, so
         // they join the completed paths (in log order: the duplicate line comes
         // before the two uploads) while `uploaded` stays a separate count.
-        let run = parse_run_progress(LOG);
+        let run = parse_run_progress(LOG, &[]);
         assert_eq!(
             run.completed_paths,
             vec![
@@ -332,7 +354,7 @@ mod tests {
 
     #[test]
     fn empty_log_is_all_zero() {
-        let p = parse_run_progress("").progress;
+        let p = parse_run_progress("", &[]).progress;
         assert_eq!(p.total, 0);
         assert_eq!(p.uploaded, 0);
         assert_eq!(p.duplicates, 0);
@@ -344,7 +366,8 @@ mod tests {
         let log =
             "2026-06-24 16:10:00 INF uploaded successfully file=/Volumes/CANON:DCIM/IMG_0001.JPG\n\
 2026-06-24 16:10:01 INF uploaded successfully file=C:\\DCIM:IMG_0002.JPG";
-        let run = parse_run_progress(log);
+        let roots = vec!["/Volumes/CANON".to_string(), "C:\\DCIM".to_string()];
+        let run = parse_run_progress(log, &roots);
         assert_eq!(
             run.completed_paths,
             vec!["/Volumes/CANON/DCIM/IMG_0001.JPG", "C:\\DCIM/IMG_0002.JPG"]
@@ -352,10 +375,22 @@ mod tests {
     }
 
     #[test]
+    fn resolves_colon_containing_source_root() {
+        let root = "/Volumes/CANON:Archive";
+        let log =
+            "2026-06-24 16:10:00 INF uploaded successfully file=/Volumes/CANON:Archive:DCIM/IMG_0001.JPG";
+        let run = parse_run_progress(log, &[root.to_string()]);
+        assert_eq!(
+            run.completed_paths,
+            vec!["/Volumes/CANON:Archive/DCIM/IMG_0001.JPG"]
+        );
+    }
+
+    #[test]
     fn handles_paths_with_spaces() {
         let log =
             "2026-06-24 16:10:05 INF uploaded successfully file=/Volumes/My Card:DCIM/VID 7.MP4";
-        let run = parse_run_progress(log);
+        let run = parse_run_progress(log, &[]);
         assert_eq!(run.completed_paths, vec!["/Volumes/My Card/DCIM/VID 7.MP4"]);
     }
 
@@ -363,7 +398,7 @@ mod tests {
     fn deduplicates_repeated_uploaded_paths() {
         let log = "2026-06-24 16:10:00 INF uploaded successfully file=Card:IMG_0001.JPG\n\
 2026-06-24 16:10:09 INF uploaded successfully file=Card:IMG_0001.JPG";
-        let run = parse_run_progress(log);
+        let run = parse_run_progress(log, &[]);
         assert_eq!(run.completed_paths.len(), 1);
         assert_eq!(run.progress.uploaded, 1);
     }
@@ -373,18 +408,26 @@ mod tests {
     #[test]
     fn parses_per_file_server_error() {
         let log = "2026-06-22 14:30:01 ERR server error file=/Volumes/CANON:DCIM/IMG_0001.JPG error=Internal Server Error (500)";
-        let errors = parse_error_log(log);
+        let errors = parse_error_log(log, &[]);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].file, "/Volumes/CANON:DCIM/IMG_0001.JPG");
+        assert_eq!(errors[0].file, "/Volumes/CANON/DCIM/IMG_0001.JPG");
         assert_eq!(errors[0].reason, "Internal Server Error (500)");
+    }
+
+    #[test]
+    fn resolves_error_path_against_colon_containing_source_root() {
+        let root = "/Volumes/CANON:Archive";
+        let log = "2026-06-22 14:30:01 ERR server error file=/Volumes/CANON:Archive:DCIM/IMG_0001.JPG error=boom";
+        let errors = parse_error_log(log, &[root.to_string()]);
+        assert_eq!(errors[0].file, "/Volumes/CANON:Archive/DCIM/IMG_0001.JPG");
     }
 
     #[test]
     fn parses_path_with_spaces_and_trailing_attr() {
         let log = "2026-06-22 14:30:05 ERR incomplete processing file=/Volumes/My Card:DCIM/VID 7.MP4 error=asset never reached final state discovered_at=2026-06-22T14:29:00Z";
-        let errors = parse_error_log(log);
+        let errors = parse_error_log(log, &[]);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].file, "/Volumes/My Card:DCIM/VID 7.MP4");
+        assert_eq!(errors[0].file, "/Volumes/My Card/DCIM/VID 7.MP4");
         assert_eq!(errors[0].reason, "asset never reached final state");
     }
 
@@ -392,15 +435,15 @@ mod tests {
     fn excludes_directory_scan_errors_without_file() {
         let log = "2026-06-24 16:09:14 ERR @tmp: file does not exist\n\
 2026-06-24 16:09:14 ERR PRIVATE/AVCHD/BDMV/STREAM: file does not exist";
-        assert!(parse_error_log(log).is_empty());
-        assert_eq!(parse_run_progress(log).progress.errors, 0);
+        assert!(parse_error_log(log, &[]).is_empty());
+        assert_eq!(parse_run_progress(log, &[]).progress.errors, 0);
     }
 
     #[test]
     fn deduplicates_by_file_keeping_first_reason() {
         let log = "2026-06-22 14:30:01 ERR server error file=/x/IMG_0003.JPG error=first\n\
 2026-06-22 14:30:09 ERR incomplete processing file=/x/IMG_0003.JPG error=second";
-        let errors = parse_error_log(log);
+        let errors = parse_error_log(log, &[]);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].reason, "first");
     }
@@ -409,7 +452,7 @@ mod tests {
     fn progress_deduplicates_repeated_error_paths() {
         let log = "2026-06-22 14:30:01 ERR server error file=/x/IMG_0003.JPG error=first\n\
 2026-06-22 14:30:09 ERR incomplete processing file=/x/IMG_0003.JPG error=second";
-        assert_eq!(parse_run_progress(log).progress.errors, 1);
+        assert_eq!(parse_run_progress(log, &[]).progress.errors, 1);
     }
 
     #[test]
@@ -420,14 +463,14 @@ mod tests {
                 "2026-06-22 14:30:01 ERR server error file=/x/IMG_{i:04}.JPG error=boom\n"
             ));
         }
-        assert_eq!(parse_error_log(&log).len(), 100);
+        assert_eq!(parse_error_log(&log, &[]).len(), 100);
     }
 
     // ---- incremental progress accumulator (ProgressAccumulator) ----
 
     #[test]
     fn incremental_chunks_match_full_parse() {
-        let full = parse_run_progress(LOG);
+        let full = parse_run_progress(LOG, &[]);
         // Feed the log one byte at a time (each chunk splits lines arbitrarily);
         // the running snapshot must equal a whole-log parse.
         let mut acc = ProgressAccumulator::new();
@@ -462,6 +505,6 @@ mod tests {
         let line = "1234567890123456789abcdé ERR file=Card:IMG_0001.JPG";
         assert!(!is_error_line(line));
         assert_eq!(info_line_message(line), None);
-        assert_eq!(parse_run_progress(line).progress.errors, 0);
+        assert_eq!(parse_run_progress(line, &[]).progress.errors, 0);
     }
 }

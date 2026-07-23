@@ -350,8 +350,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let api_key_for_album_assignment = api_key_clone.clone();
         let staging_dir = if staging_requested {
             let selected_files = select_files.clone();
+            let cancel_flag_for_staging = cancel_flag.clone();
             match tauri::async_runtime::spawn_blocking(move || {
-                staging::create_staging_dir(&selected_files)
+                staging::create_staging_dir(&selected_files, Some(cancel_flag_for_staging.as_ref()))
             })
             .await
             {
@@ -359,6 +360,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 Ok(Err(e)) => {
                     if let Ok(mut running) = RUNNING_IMPORTS.lock() {
                         running.remove(&job_id_clone);
+                    }
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        return;
                     }
                     let _ = set_job(ImportJob {
                         id: job_id_clone.clone(),
@@ -466,8 +470,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // The log is O_APPEND across multi-path runs, so one read afterwards
         // yields the authoritative totals, completed paths, and per-file errors.
         let log_contents = std::fs::read_to_string(&request.log_path).unwrap_or_default();
-        let file_errors = crate::services::stdout_parser::parse_error_log(&log_contents);
-        let run = crate::services::stdout_parser::parse_run_progress(&log_contents);
+        let file_errors =
+            crate::services::stdout_parser::parse_error_log(&log_contents, &source_paths);
+        let run = crate::services::stdout_parser::parse_run_progress(&log_contents, &source_paths);
         // parse_run_progress counts every distinct errored file (uncapped);
         // file_errors is capped at MAX_FILE_ERRORS for the UI payload. Keep the
         // true count so the final tally never undercounts a mass-failure run.
