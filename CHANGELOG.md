@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### UI
+- **Cmd/Ctrl-K command palette.** A global shortcut opens a searchable palette to jump between Queue/History, start an import, open logs, manage or edit profiles, and cycle the theme — no mouse hunting for the right control.
+- **Filename, type, and size filters in the preview grid.** Alongside the existing photo/video and capture-date filters, narrow the preview by filename substring (case-insensitive) and a min/max size window (MB). Filtering is purely visual — selection is keyed by path, so hidden tiles stay selected and "Select shown" scopes to the filtered set.
+
+### Import
+- **"Import again" from History.** Each history entry can replay its original run: the profile, album, all import options (stacking, concurrency, date range, organization, tags, error handling, type/extension filters), and source are restored and staged for review — it never auto-starts, so the wipe/delete safety gate always gets a fresh look. Older records saved before request details were recorded show no action and report why.
+- **OS notifications on import completion/failure.** A desktop notification fires when an import finishes or fails (cancellations stay silent), so you can walk away from a long migration. Uses the Tauri notification plugin; permission is requested once.
+- **Wiped source files go to the OS Trash instead of being hard-deleted.** The verify-before-wipe SHA-1 gate is unchanged — only server-confirmed files are removed — but a mistaken wipe is now recoverable from the Trash rather than gone.
+
 ## v0.5.0 - 2026-07-23
 
 ### UI
