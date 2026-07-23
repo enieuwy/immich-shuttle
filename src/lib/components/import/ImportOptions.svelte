@@ -9,6 +9,7 @@
   import { importOptionsState, isDateRangeInvalid } from "$lib/state/import-options";
   import { autoImportState } from "$lib/state/auto-import";
   import { sourceState } from "$lib/state/source";
+  import { selectionState } from "$lib/state/selection";
   import { activeProfile } from "$lib/state/profiles";
   import { importForecast, type ImportForecast } from "$lib/api";
   import DeviceRuleControl from "$lib/components/source/DeviceRuleControl.svelte";
@@ -59,22 +60,62 @@
   let forecast = $state<ImportForecast | null>(null);
   let forecasting = $state(false);
   let forecastError = $state("");
+  let forecastToken = 0;
   const canForecast = $derived(
     !!$activeProfile && $sourceState.selectedPaths.length > 0 && !forecasting,
   );
+  // The forecast can't cheaply replicate EXIF date filtering, so flag it whenever
+  // a date/only-new filter or overwrite would change the real import from the count.
+  const forecastCaveat = $derived(
+    $importOptionsState.onlyNewSinceLastImport ||
+      !!$importOptionsState.dateFrom ||
+      !!$importOptionsState.dateTo,
+  );
+
+  // Invalidate any shown/in-flight forecast when its inputs change, so stale
+  // counts from a previous profile/source/selection never sit under a new one.
+  $effect(() => {
+    void $activeProfile?.id;
+    void $sourceState.selectedPaths;
+    void $selectionState.selected;
+    void $importOptionsState.mediaType;
+    void $importOptionsState.includeExtensions;
+    void $importOptionsState.excludeExtensions;
+    forecastToken++;
+    forecast = null;
+    forecastError = "";
+  });
 
   async function checkServer() {
     const profile = $activeProfile;
-    if (!profile || $sourceState.selectedPaths.length === 0) return;
+    const sourcePaths = $sourceState.selectedPaths;
+    if (!profile || sourcePaths.length === 0) return;
+    // Match the import's scope: forecast the current selection when one exists
+    // (App.startImport imports only the selection), else the whole source.
+    const selection = [...$selectionState.selected];
+    const options = $importOptionsState;
+    const token = ++forecastToken;
     forecasting = true;
     forecastError = "";
     forecast = null;
     try {
-      forecast = await importForecast(profile.id, $sourceState.selectedPaths);
+      const result = await importForecast(
+        profile.id,
+        sourcePaths,
+        selection.length > 0 ? selection : null,
+        {
+          includeType:
+            options.mediaType === "image" ? "IMAGE" : options.mediaType === "video" ? "VIDEO" : null,
+          includeExtensions: options.includeExtensions,
+          excludeExtensions: options.excludeExtensions,
+        },
+      );
+      if (token === forecastToken) forecast = result;
     } catch (error) {
-      forecastError = error instanceof Error ? error.message : String(error);
+      if (token === forecastToken)
+        forecastError = error instanceof Error ? error.message : String(error);
     } finally {
-      forecasting = false;
+      if (token === forecastToken) forecasting = false;
     }
   }
 </script>
@@ -112,6 +153,9 @@
             <span class="text-muted-foreground">(sampled first {5000} files)</span>
           {/if}
         </div>
+        {#if forecastCaveat}
+          <p class="mt-1 text-xs text-muted-foreground">Estimate ignores the active date filter — the import may upload fewer.</p>
+        {/if}
       {/if}
     </div>
 

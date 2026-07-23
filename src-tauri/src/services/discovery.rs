@@ -1,6 +1,6 @@
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::time::Duration;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::{Duration, Instant};
 
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -15,20 +15,35 @@ const CANDIDATE_PORTS: &[(u16, &str)] = &[(2283, "http"), (443, "https"), (80, "
 /// for silent/absent hosts so the whole /24 sweep stays snappy.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
 
+/// Per-candidate cap on the Immich ping once a port is open, so one stalled HTTP
+/// endpoint can't burn `probe_is_immich`'s multi-candidate 2s-each budget.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
+
+/// Overall wall-clock ceiling: stop launching new batches past this so a subnet
+/// full of slow open ports still returns within a UI-sized window.
+const DISCOVERY_DEADLINE: Duration = Duration::from_secs(10);
+
 /// How many candidates to probe at once. Bounds sockets/CPU without needing the
 /// tokio `sync` feature: each batch is awaited before the next starts.
 const SCAN_CONCURRENCY: usize = 64;
 
-/// Best-effort local IPv4 of the primary interface. Opens a UDP socket and
-/// "connects" it to a public address to learn which local IP the OS would route
-/// from; no packets are actually sent.
-fn local_ipv4() -> Option<Ipv4Addr> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
-        _ => None,
-    }
+/// Private IPv4 addresses on broadcast-capable, non-loopback interfaces. The
+/// broadcast filter excludes point-to-point/VPN interfaces (utun/ppp), so a
+/// full-tunnel VPN can't redirect the sweep onto a corporate /24 — we scan the
+/// physical LAN(s) the machine is actually attached to.
+fn local_lan_ipv4s() -> Vec<Ipv4Addr> {
+    if_addrs::get_if_addrs()
+        .into_iter()
+        .flatten()
+        .filter_map(|iface| match iface.addr {
+            if_addrs::IfAddr::V4(v4)
+                if v4.broadcast.is_some() && v4.ip.is_private() && !v4.ip.is_loopback() =>
+            {
+                Some(v4.ip)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Every host address in the local /24 except the network address, the broadcast
@@ -64,27 +79,43 @@ async fn tcp_open(addr: SocketAddr) -> bool {
     )
 }
 
-/// Scan the local /24 for reachable Immich servers, returning confirmed base
+/// Scan the local LAN(s) for reachable Immich servers, returning confirmed base
 /// URLs (deduped, at most one per host — the preferred responding port wins).
 /// Read-only: only unauthenticated `/server/ping` probes, never the API key.
+/// Bounded by `DISCOVERY_DEADLINE` so it always returns within a UI-sized window.
 pub async fn discover_immich_servers() -> Vec<String> {
-    let Some(local) = local_ipv4() else {
+    // Sweep the /24 of every broadcast-capable private interface, de-duplicated
+    // (two addresses on the same subnet, or none at all when offline).
+    let mut seen_subnets: HashSet<(u8, u8, u8)> = HashSet::new();
+    let mut targets: Vec<(SocketAddr, String)> = Vec::new();
+    for local in local_lan_ipv4s() {
+        let [a, b, c, _] = local.octets();
+        if seen_subnets.insert((a, b, c)) {
+            targets.extend(subnet_hosts(local).into_iter().flat_map(host_targets));
+        }
+    }
+    if targets.is_empty() {
         return Vec::new();
-    };
-    let targets: Vec<(SocketAddr, String)> = subnet_hosts(local)
-        .into_iter()
-        .flat_map(host_targets)
-        .collect();
+    }
 
+    let deadline = Instant::now() + DISCOVERY_DEADLINE;
     let mut found_hosts: HashSet<IpAddr> = HashSet::new();
     let mut confirmed: Vec<String> = Vec::new();
     for chunk in targets.chunks(SCAN_CONCURRENCY) {
+        if Instant::now() >= deadline {
+            break;
+        }
         let mut handles = Vec::with_capacity(chunk.len());
         for (addr, url) in chunk {
             let addr = *addr;
             let url = url.clone();
             handles.push(tokio::spawn(async move {
-                if tcp_open(addr).await && probe_is_immich(&url).await {
+                if tcp_open(addr).await
+                    && matches!(
+                        timeout(PROBE_TIMEOUT, probe_is_immich(&url)).await,
+                        Ok(true)
+                    )
+                {
                     Some((addr.ip(), url))
                 } else {
                     None

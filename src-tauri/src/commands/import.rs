@@ -314,27 +314,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         .filter(|t| !t.is_empty())
         .collect();
     let session_tag = input.session_tag;
-    // Media-type filter is a fixed enum on immich-go's side; accept only those.
-    let include_type =
-        input
-            .include_type
-            .as_deref()
-            .and_then(|v| match v.trim().to_ascii_uppercase().as_str() {
-                "VIDEO" => Some("VIDEO".to_string()),
-                "IMAGE" => Some("IMAGE".to_string()),
-                _ => None,
-            });
-    // Normalize extensions to immich-go's leading-dot, lowercase form and drop
-    // blanks so the joined --include/--exclude-extensions arg is well-formed.
-    let normalize_exts = |exts: &[String]| -> Vec<String> {
-        exts.iter()
-            .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
-            .filter(|e| !e.is_empty())
-            .map(|e| format!(".{e}"))
-            .collect()
-    };
-    let include_extensions = normalize_exts(&input.include_extensions);
-    let exclude_extensions = normalize_exts(&input.exclude_extensions);
+    let include_type = sanitize_include_type(input.include_type.as_deref());
+    let include_extensions = normalize_extensions(&input.include_extensions);
+    let exclude_extensions = normalize_extensions(&input.exclude_extensions);
     // The "Open in Immich" deep-link points at a specific album only when the run
     // actually targets one: SingleAlbum mode AND a non-empty --into-album name
     // (folder/tag modes fan out; an unresolved selection sends no into_album, so
@@ -753,10 +735,14 @@ const FORECAST_MAX_FILES: usize = 5000;
 /// already holds vs. would upload. Reuses the SHA-1 + bulk-upload-check path;
 /// safe to run repeatedly and never mutates anything.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn import_forecast(
     profile_id: String,
     source_paths: Vec<String>,
     select_files: Option<Vec<String>>,
+    include_type: Option<String>,
+    include_extensions: Vec<String>,
+    exclude_extensions: Vec<String>,
 ) -> Result<wipe::ForecastResult, String> {
     let profile = profile_store::get_profile(&profile_id)?;
     let api_key = keychain::get_api_key(&profile_id)?
@@ -766,41 +752,99 @@ pub async fn import_forecast(
         return Err("No reachable Immich server URL for this profile.".to_string());
     }
 
+    // Apply the same type/extension filters immich-go would, so the forecast
+    // counts the files that will actually upload (both filters are extension-based
+    // on immich-go's side, so this matches). Date/only-new is intentionally NOT
+    // applied here — it needs per-file EXIF — so the UI flags the estimate.
+    let include_type = sanitize_include_type(include_type.as_deref());
+    let include_extensions = normalize_extensions(&include_extensions);
+    let exclude_extensions = normalize_extensions(&exclude_extensions);
+    let keep = move |path: &str| -> bool {
+        let ext = media_scanner::extension_of(path);
+        if let Some(kind) = include_type.as_deref() {
+            let is_video = media_scanner::is_video_ext(&ext);
+            if (kind == "VIDEO") != is_video {
+                return false;
+            }
+        }
+        if !include_extensions.is_empty() && !include_extensions.iter().any(|e| e == &ext) {
+            return false;
+        }
+        if exclude_extensions.iter().any(|e| e == &ext) {
+            return false;
+        }
+        true
+    };
+
     // Prefer an explicit selection; otherwise scan the sources (bounded) to find
     // candidate media. Scanning reads the filesystem, so keep it off the runtime.
-    let (candidates, truncated) = match select_files {
-        Some(files) => (files, false),
+    let (candidates, truncated, skipped_unreadable) = match select_files {
+        Some(mut files) => {
+            files.retain(|p| keep(p));
+            let truncated = files.len() > FORECAST_MAX_FILES;
+            files.truncate(FORECAST_MAX_FILES);
+            (files, truncated, 0usize)
+        }
         None => {
             let paths = collapse_overlapping_roots(source_paths);
             tauri::async_runtime::spawn_blocking(move || {
                 let deadline = Instant::now() + SCAN_DEADLINE;
                 let mut files: Vec<String> = Vec::new();
+                let mut seen = 0usize;
+                let mut skipped = 0usize;
                 for path in paths {
                     let source_path = PathBuf::from(&path);
-                    let _ = media_scanner::scan_directory_streaming(
+                    // Propagate scan failures/timeouts instead of forecasting a
+                    // partial (often empty) set as if it were complete.
+                    let scan_skipped = media_scanner::scan_directory_streaming(
                         &source_path,
                         None,
                         Some(deadline),
                         &mut |batch| {
                             for file in batch {
+                                if !keep(&file.path) {
+                                    continue;
+                                }
+                                seen += 1;
                                 if files.len() < FORECAST_MAX_FILES {
                                     files.push(file.path);
                                 }
                             }
                         },
-                    );
+                    )
+                    .map_err(|e| format!("Could not scan {path}: {e}"))?;
+                    skipped += scan_skipped;
                 }
-                let truncated = files.len() >= FORECAST_MAX_FILES;
-                (files, truncated)
+                // Truncated only when the cap actually discarded a candidate.
+                Ok::<_, String>((files, seen > FORECAST_MAX_FILES, skipped))
             })
             .await
-            .map_err(|e| format!("Scan task failed: {e}"))?
+            .map_err(|e| format!("Scan task failed: {e}"))??
         }
     };
 
     let mut result = wipe::forecast_upload(&server_url, &api_key, &candidates).await?;
     result.truncated = result.truncated || truncated;
+    result.unreadable += skipped_unreadable;
     Ok(result)
+}
+
+/// immich-go accepts only VIDEO or IMAGE for --include-type; anything else drops.
+fn sanitize_include_type(value: Option<&str>) -> Option<String> {
+    value.and_then(|v| match v.trim().to_ascii_uppercase().as_str() {
+        "VIDEO" => Some("VIDEO".to_string()),
+        "IMAGE" => Some("IMAGE".to_string()),
+        _ => None,
+    })
+}
+
+/// Normalize extensions to immich-go's leading-dot, lowercase form, dropping blanks.
+fn normalize_extensions(exts: &[String]) -> Vec<String> {
+    exts.iter()
+        .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|e| !e.is_empty())
+        .map(|e| format!(".{e}"))
+        .collect()
 }
 
 #[tauri::command]

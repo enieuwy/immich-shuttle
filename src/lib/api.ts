@@ -170,14 +170,24 @@ export interface ImportForecast {
   truncated: boolean;
 }
 
+export interface ForecastFilters {
+  includeType?: string | null;
+  includeExtensions?: string[];
+  excludeExtensions?: string[];
+}
+
 export function importForecast(
   profileId: string,
   sourcePaths: string[],
   selectFiles?: string[] | null,
+  filters?: ForecastFilters,
 ): Promise<ImportForecast> {
   return invokeCommand<ImportForecast>("import_forecast", {
     profileId,
     sourcePaths,
     selectFiles: selectFiles ?? null,
+    includeType: filters?.includeType ?? null,
+    includeExtensions: filters?.includeExtensions ?? [],
+    excludeExtensions: filters?.excludeExtensions ?? [],
   });
 }

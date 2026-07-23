@@ -55,8 +55,17 @@ fn supported_extensions() -> HashSet<&'static str> {
     .collect()
 }
 
-fn is_video_ext(ext: &str) -> bool {
+pub(crate) fn is_video_ext(ext: &str) -> bool {
     matches!(ext, ".mp4" | ".mov" | ".m4v" | ".avi" | ".mkv")
+}
+
+/// Lowercased, leading-dot extension of a path (e.g. "/a/IMG.JPG" -> ".jpg").
+/// Empty string when the path has no extension.
+pub(crate) fn extension_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy().to_ascii_lowercase()))
+        .unwrap_or_default()
 }
 
 pub const STREAM_BATCH_SIZE: usize = 256;
