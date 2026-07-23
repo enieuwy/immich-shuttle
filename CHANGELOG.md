@@ -6,6 +6,12 @@
 - **The footer action bar is always visible.** The app now pins to the viewport height with the content area scrolling internally, so the footer (import stats, Logs, Start Import) no longer slides off the bottom of a long page. Absolutely-positioned controls inside the scroll area are correctly clipped instead of overflowing the layout and scrolling the whole window.
 - **"Open in Immich" deep-links.** A finished import's queue card and any selected album now offer an "Open in Immich" action that opens the album (`/albums/{id}`) — or the timeline (`/photos`) when there's no single album target — in your browser, using the reachable server URL (LAN/WAN failover, same as imports). Closes the import loop so you can jump straight to verifying uploads.
 
+### Import options
+- **Keep going on errors (default on).** Imports now pass immich-go `--on-errors=continue` so a single bad file no longer aborts a multi-thousand-file migration; failures are still listed per-file afterward. Turn the switch off to stop at the first error.
+- **Replace existing on server.** Optional `--overwrite` re-uploads assets the server already holds instead of skipping them, for re-syncs.
+- **Tags & session tagging.** Apply comma-separated `--tag` values (with `/` hierarchy) to every uploaded asset, and optionally add a timestamped `--session-tag` to label the whole batch.
+- **Only import media newer than last import.** Opt-in toggle that derives a capture-date floor from this source's stored last-import time (via `--date-range`), turning a repeat import of a large card from a full re-scan into a fast incremental. Server-side dedupe still guards the boundary; filters by EXIF capture date, so wrong camera clocks may skip files.
+
 ### Maintenance
 - **Dependency bumps**: svelte 5.56.7, @lucide/svelte ^0.577.0, @internationalized/date 3.12.2, serde 1.0.229, serde_json 1.0.151, plus CI action-digest updates (actions/checkout, dtolnay/rust-toolchain, tauri-apps/tauri-action).
 

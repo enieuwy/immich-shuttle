@@ -28,6 +28,15 @@
   const dateFrom = $derived($importOptionsState.dateFrom ?? "");
   const dateTo = $derived($importOptionsState.dateTo ?? "");
   const dateRangeInvalid = $derived(isDateRangeInvalid(dateFrom, dateTo));
+  const tagsText = $derived($importOptionsState.tags.join(", "));
+  function commitTags(raw: string) {
+    importOptionsState.setTags(
+      raw
+        .split(",")
+        .map((t) => t.trim())
+        .filter((t) => t.length > 0),
+    );
+  }
 </script>
 
 <Card>
@@ -200,6 +209,100 @@
       {#if dateRangeInvalid}
         <p class="mt-2 text-xs text-destructive">The start date must be on or before the end date.</p>
       {/if}
+    </div>
+
+    <Separator class="my-2" />
+
+    <div class="rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <div class="flex items-center justify-between gap-3">
+        <Label
+          for="import-option-only-new"
+          class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
+        >
+          <span class="text-sm font-medium text-foreground">Only import media newer than last import</span>
+          <span class="text-xs text-muted-foreground">Skips a re-scan of already-imported files by filtering to a capture-date floor.</span>
+        </Label>
+        <Switch
+          id="import-option-only-new"
+          aria-label="Only import media newer than last import"
+          checked={$importOptionsState.onlyNewSinceLastImport}
+          onCheckedChange={(v) => importOptionsState.setOnlyNewSinceLastImport(v)}
+        />
+      </div>
+      {#if $importOptionsState.onlyNewSinceLastImport}
+        <p class="mt-2 text-xs text-muted-foreground">
+          Filters by EXIF capture date, not when files were added — a wrong camera clock or back-dated files may be skipped. Server-side dedupe still guards the boundary.
+        </p>
+      {/if}
+    </div>
+
+    <Separator class="my-2" />
+
+    <div class="flex items-center justify-between gap-3 rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <Label
+        for="import-option-keep-going"
+        class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
+      >
+        <span class="text-sm font-medium text-foreground">Keep going on errors</span>
+        <span class="text-xs text-muted-foreground">Finish the import even if some files fail, then list the failures. Off stops at the first error.</span>
+      </Label>
+      <Switch
+        id="import-option-keep-going"
+        aria-label="Keep going on errors"
+        checked={$importOptionsState.keepGoingOnErrors}
+        onCheckedChange={(v) => importOptionsState.setKeepGoingOnErrors(v)}
+      />
+    </div>
+
+    <div class="flex items-center justify-between gap-3 rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <Label
+        for="import-option-overwrite"
+        class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
+      >
+        <span class="text-sm font-medium text-foreground">Replace existing on server</span>
+        <span class="text-xs text-muted-foreground">Overwrite assets the server already has with the local copy instead of skipping them.</span>
+      </Label>
+      <Switch
+        id="import-option-overwrite"
+        aria-label="Replace existing on server"
+        checked={$importOptionsState.overwrite}
+        onCheckedChange={(v) => importOptionsState.setOverwrite(v)}
+      />
+    </div>
+
+    <Separator class="my-2" />
+
+    <div class="rounded-lg p-3 transition-colors hover:bg-muted/50">
+      <Label
+        for="import-option-tags"
+        class="flex min-w-0 flex-col items-start gap-1 font-normal"
+      >
+        <span class="text-sm font-medium text-foreground">Tags</span>
+        <span class="text-xs text-muted-foreground">Comma-separated tags applied to every uploaded asset. Use / for hierarchy (e.g. Trip/Iceland).</span>
+      </Label>
+      <Input
+        id="import-option-tags"
+        class="mt-2"
+        placeholder="Trip/Iceland, client-a"
+        aria-label="Tags"
+        value={tagsText}
+        onchange={(e) => commitTags(e.currentTarget.value)}
+      />
+      <div class="mt-2 flex items-center justify-between gap-3">
+        <Label
+          for="import-option-session-tag"
+          class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
+        >
+          <span class="text-sm font-medium text-foreground">Tag this import session</span>
+          <span class="text-xs text-muted-foreground">Add a timestamped tag so this batch is easy to find later.</span>
+        </Label>
+        <Switch
+          id="import-option-session-tag"
+          aria-label="Tag this import session"
+          checked={$importOptionsState.sessionTag}
+          onCheckedChange={(v) => importOptionsState.setSessionTag(v)}
+        />
+      </div>
     </div>
 
     <Separator class="my-2" />

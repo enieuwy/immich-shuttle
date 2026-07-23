@@ -2,6 +2,7 @@ import { get, writable } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import {
+  historySourceLastImport,
   importCancel,
   importClearFinished,
   importConfirmWipe,
@@ -247,6 +248,19 @@ export const queueState = {
           ? (albums.availableAlbums.find((a) => a.id === albumIds[0])?.album_name ?? null)
           : null;
 
+    // Explicit From/To range wins. Otherwise, "only new since last import"
+    // derives a capture-date floor from this source's stored last-import time.
+    // immich-go's --date-range needs both bounds, so pair the floor with a
+    // far-future upper bound (open-ended "floor," is rejected).
+    let dateRange = toImmichDateRange(options.dateFrom, options.dateTo);
+    if (!dateRange && options.onlyNewSinceLastImport) {
+      const lastMs = await historySourceLastImport(sourcePaths);
+      if (lastMs != null) {
+        const floor = new Date(lastMs).toISOString().slice(0, 10);
+        dateRange = `${floor},9999-12-31`;
+      }
+    }
+
     await importStart({
       profile_id: profile.id,
       source_paths: sourcePaths,
@@ -254,11 +268,15 @@ export const queueState = {
       keep_files: overrides?.keepFiles ?? options.keepFiles,
       stack_raw_jpeg: overrides?.stackRawJpeg ?? options.stackRawJpeg,
       stack_burst: overrides?.stackBurst ?? options.stackBurst,
-      date_range: toImmichDateRange(options.dateFrom, options.dateTo),
+      date_range: dateRange,
       concurrent_tasks: options.concurrentTasks,
       select_files: overrides?.selectFiles ?? null,
       into_album: intoAlbum,
       organization: overrides?.organization ?? options.organization,
+      on_errors: options.keepGoingOnErrors ? "continue" : null,
+      overwrite: options.overwrite,
+      tags: options.tags,
+      session_tag: options.sessionTag,
     });
     await refreshJobs();
   },

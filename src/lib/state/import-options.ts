@@ -13,6 +13,16 @@ type ImportOptionsState = {
   dateTo: string | null;
   /** How to map the source folder tree onto Immich albums/tags. */
   organization: ImportOrganization;
+  /** Keep importing when a file fails (immich-go --on-errors=continue). */
+  keepGoingOnErrors: boolean;
+  /** Replace assets already on the server (immich-go --overwrite). */
+  overwrite: boolean;
+  /** Tags applied to every uploaded asset (immich-go --tag). */
+  tags: string[];
+  /** Tag this upload session with a timestamp (immich-go --session-tag). */
+  sessionTag: boolean;
+  /** Import only media captured since this source's last import (date floor). */
+  onlyNewSinceLastImport: boolean;
 };
 
 const initialState: ImportOptionsState = {
@@ -23,6 +33,13 @@ const initialState: ImportOptionsState = {
   dateFrom: null,
   dateTo: null,
   organization: "single_album",
+  // Default to continue: one bad file must not abort a large migration; the app
+  // surfaces per-file errors from the run log afterward.
+  keepGoingOnErrors: true,
+  overwrite: false,
+  tags: [],
+  sessionTag: false,
+  onlyNewSinceLastImport: false,
 };
 
 const state = writable<ImportOptionsState>(initialState);
@@ -50,6 +67,21 @@ export const importOptionsState = {
   },
   setOrganization(organization: ImportOrganization) {
     state.update((s) => ({ ...s, organization }));
+  },
+  setKeepGoingOnErrors(keepGoingOnErrors: boolean) {
+    state.update((s) => ({ ...s, keepGoingOnErrors }));
+  },
+  setOverwrite(overwrite: boolean) {
+    state.update((s) => ({ ...s, overwrite }));
+  },
+  setTags(tags: string[]) {
+    state.update((s) => ({ ...s, tags }));
+  },
+  setSessionTag(sessionTag: boolean) {
+    state.update((s) => ({ ...s, sessionTag }));
+  },
+  setOnlyNewSinceLastImport(onlyNewSinceLastImport: boolean) {
+    state.update((s) => ({ ...s, onlyNewSinceLastImport }));
   },
   clearDateRange() {
     state.update((s) => ({ ...s, dateFrom: null, dateTo: null }));

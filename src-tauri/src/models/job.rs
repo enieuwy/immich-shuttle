@@ -60,6 +60,21 @@ pub struct ImportInput {
     /// How to map the source folder tree onto Immich albums/tags.
     #[serde(default)]
     pub organization: Organization,
+    /// immich-go `--on-errors`: "stop" (default), "continue", or a max error
+    /// count as a string. `None` leaves immich-go's default (stop).
+    #[serde(default)]
+    pub on_errors: Option<String>,
+    /// immich-go `--overwrite`: replace assets already on the server with the
+    /// local copy instead of skipping them.
+    #[serde(default)]
+    pub overwrite: bool,
+    /// immich-go `--tag` values applied to every uploaded asset (hierarchy via
+    /// `/`). One `--tag` argument is emitted per entry.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// immich-go `--session-tag`: tag this upload session with a timestamped tag.
+    #[serde(default)]
+    pub session_tag: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

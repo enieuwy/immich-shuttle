@@ -296,10 +296,33 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     let album_ids = input.album_ids.clone();
     let into_album = input.into_album.clone();
     let organization = input.organization;
+    // `on_errors` arrives over IPC; accept only immich-go's known modes or a
+    // non-negative integer count, else drop it (leaving immich-go's default).
+    let on_errors = input.on_errors.as_deref().and_then(|v| {
+        let v = v.trim();
+        if v == "stop" || v == "continue" || v.parse::<u32>().is_ok() {
+            Some(v.to_string())
+        } else {
+            None
+        }
+    });
+    let overwrite = input.overwrite;
+    let tags: Vec<String> = input
+        .tags
+        .iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let session_tag = input.session_tag;
     // The "Open in Immich" deep-link points at a specific album only when the run
-    // targets exactly one selected album (SingleAlbum mode); folder/tag modes fan
-    // out across many albums, so the link falls back to the timeline.
-    let target_album_id = if organization == Organization::SingleAlbum {
+    // actually targets one: SingleAlbum mode AND a non-empty --into-album name
+    // (folder/tag modes fan out; an unresolved selection sends no into_album, so
+    // the card must not claim an album the upload never populated).
+    let into_album_active = into_album
+        .as_deref()
+        .map(|a| !a.trim().is_empty())
+        .unwrap_or(false);
+    let target_album_id = if organization == Organization::SingleAlbum && into_album_active {
         album_ids.first().cloned()
     } else {
         None
@@ -443,6 +466,10 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             concurrent_tasks,
             into_album,
             organization,
+            on_errors,
+            overwrite,
+            tags,
+            session_tag,
         };
         let mut error_lines: Vec<String> = Vec::new();
         let mut exit_nonzero = false;

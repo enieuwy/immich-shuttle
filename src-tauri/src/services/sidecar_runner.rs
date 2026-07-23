@@ -48,6 +48,10 @@ pub struct UploadRequest {
     pub concurrent_tasks: Option<u32>,
     pub into_album: Option<String>,
     pub organization: Organization,
+    pub on_errors: Option<String>,
+    pub overwrite: bool,
+    pub tags: Vec<String>,
+    pub session_tag: bool,
 }
 
 /// Removes the private per-run config directory (with the api-key file inside)
@@ -322,6 +326,24 @@ fn build_upload_args(request: &UploadRequest, config_path: &Path) -> Vec<String>
             args.push(format!("--concurrent-tasks={tasks}"));
         }
     }
+    if let Some(on_errors) = request.on_errors.as_deref() {
+        let on_errors = on_errors.trim();
+        if !on_errors.is_empty() {
+            args.push(format!("--on-errors={on_errors}"));
+        }
+    }
+    if request.overwrite {
+        args.push("--overwrite".to_string());
+    }
+    for tag in &request.tags {
+        let tag = tag.trim();
+        if !tag.is_empty() {
+            args.push(format!("--tag={tag}"));
+        }
+    }
+    if request.session_tag {
+        args.push("--session-tag".to_string());
+    }
 
     args.push(request.source_path.clone());
     args
@@ -437,6 +459,10 @@ mod tests {
             concurrent_tasks: None,
             into_album: into_album.map(str::to_string),
             organization,
+            on_errors: None,
+            overwrite: false,
+            tags: Vec::new(),
+            session_tag: false,
         }
     }
 
@@ -498,5 +524,35 @@ mod tests {
         assert_eq!(level, Some(&"INFO".to_string()));
         assert!(!args.iter().any(|a| a == "DEBUG"));
         assert_eq!(args.last(), Some(&"/src".to_string()));
+    }
+
+    #[test]
+    fn resilience_and_tag_flags_absent_by_default() {
+        let args = args_for(Organization::SingleAlbum, None);
+        assert!(!args.iter().any(|a| a.starts_with("--on-errors")));
+        assert!(!args.iter().any(|a| a == "--overwrite"));
+        assert!(!args.iter().any(|a| a.starts_with("--tag=")));
+        assert!(!args.iter().any(|a| a == "--session-tag"));
+    }
+
+    #[test]
+    fn emits_on_errors_overwrite_and_tags_when_set() {
+        let mut req = request(Organization::SingleAlbum, None);
+        req.on_errors = Some("continue".to_string());
+        req.overwrite = true;
+        req.tags = vec![
+            "Trip/Iceland".to_string(),
+            "  ".to_string(),
+            "client-a".to_string(),
+        ];
+        req.session_tag = true;
+        let args = build_upload_args(&req, Path::new("/cfg.yaml"));
+        assert!(args.contains(&"--on-errors=continue".to_string()));
+        assert!(args.contains(&"--overwrite".to_string()));
+        assert!(args.contains(&"--tag=Trip/Iceland".to_string()));
+        assert!(args.contains(&"--tag=client-a".to_string()));
+        // Blank tags are dropped, not emitted as empty --tag= args.
+        assert_eq!(args.iter().filter(|a| a.starts_with("--tag=")).count(), 2);
+        assert!(args.contains(&"--session-tag".to_string()));
     }
 }

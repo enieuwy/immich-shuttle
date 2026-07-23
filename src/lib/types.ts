@@ -61,6 +61,14 @@ export interface ImportInput {
   select_files?: string[] | null;
   into_album?: string | null;
   organization?: ImportOrganization;
+  /** immich-go --on-errors: "stop" | "continue" | numeric count string. */
+  on_errors?: string | null;
+  /** immich-go --overwrite. */
+  overwrite?: boolean;
+  /** immich-go --tag values (one flag each). */
+  tags?: string[];
+  /** immich-go --session-tag. */
+  session_tag?: boolean;
 }
 
 export interface FileError {

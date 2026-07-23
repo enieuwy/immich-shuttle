@@ -34,6 +34,7 @@ vi.mock("$lib/api", () => ({
   devicesListRemovable: vi.fn(async () => []),
   albumsList: vi.fn(async () => [{ id: "a1", album_name: "Trip", shared_with: [] }]),
   usersList: vi.fn(async () => []),
+  historySourceLastImport: vi.fn(async () => null),
 }));
 
 import * as api from "$lib/api";
@@ -106,6 +107,69 @@ describe("queueState", () => {
     );
 
     importOptionsState.clearDateRange();
+  });
+
+  it("forwards error-resilience and tag options to importStart", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+
+    importOptionsState.setKeepGoingOnErrors(true);
+    importOptionsState.setOverwrite(true);
+    importOptionsState.setTags(["Trip/Iceland", "client-a"]);
+    importOptionsState.setSessionTag(true);
+    await queueState.startImport();
+
+    const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
+    expect(payload).toMatchObject({
+      on_errors: "continue",
+      overwrite: true,
+      tags: ["Trip/Iceland", "client-a"],
+      session_tag: true,
+    });
+
+    // Off -> immich-go default (stop): send null, not "continue".
+    importOptionsState.setKeepGoingOnErrors(false);
+    importOptionsState.setOverwrite(false);
+    importOptionsState.setTags([]);
+    importOptionsState.setSessionTag(false);
+    await queueState.startImport();
+    expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.on_errors).toBeNull();
+  });
+
+  it("derives a date-range floor from last import when only-new is on", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    importOptionsState.clearDateRange();
+    importOptionsState.setOnlyNewSinceLastImport(true);
+
+    // 2026-03-15T12:00:00Z -> floor 2026-03-15, paired with a far-future bound
+    // because immich-go's --date-range rejects an open-ended "floor,".
+    vi.mocked(api.historySourceLastImport).mockResolvedValueOnce(Date.UTC(2026, 2, 15, 12, 0, 0));
+    await queueState.startImport();
+    expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.date_range).toBe("2026-03-15,9999-12-31");
+
+    // No stored last-import -> no floor (import everything).
+    vi.mocked(api.historySourceLastImport).mockResolvedValueOnce(null);
+    await queueState.startImport();
+    expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.date_range).toBeNull();
+
+    importOptionsState.setOnlyNewSinceLastImport(false);
   });
 
   it("confirmWipe forwards args to importConfirmWipe", async () => {
