@@ -28,7 +28,7 @@
   import { sourceState } from "$lib/state/source";
   import { previewState } from "$lib/state/preview";
   import { openProfileEditor, panelTab } from "$lib/state/ui";
-  import { themeState } from "$lib/state/theme";
+  import { paletteState, themeState } from "$lib/state/theme";
   import { isDateRangeInvalid, importOptionsState } from "$lib/state/import-options";
 
 
@@ -132,6 +132,7 @@
       run: () => openProfileEditor.set(true),
     },
     { id: "cycle-theme", label: "Cycle Theme", keywords: ["dark", "light", "appearance"], run: () => themeState.cycle() },
+    { id: "cycle-palette", label: "Cycle Dark Palette", keywords: ["darkroom", "indigo", "ember", "color"], run: () => paletteState.cycle() },
   ];
 
   onMount(() => {

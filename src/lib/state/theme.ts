@@ -63,3 +63,58 @@ export const themeState = {
     this.setMode(next);
   },
 };
+
+/**
+ * Curated dark-mode palettes. "indigo" is the classic base `.dark` look;
+ * the others add a `palette-*` class whose CSS-var overrides live in app.css.
+ * Light mode is unaffected by the palette.
+ */
+export type ThemePalette = "darkroom" | "indigo" | "ember";
+
+const PALETTE_KEY = "immich-shuttle-palette";
+const PALETTE_ORDER: ThemePalette[] = ["darkroom", "indigo", "ember"];
+
+function getStoredPalette(): ThemePalette {
+  try {
+    const stored = localStorage.getItem(PALETTE_KEY);
+    if (stored === "darkroom" || stored === "indigo" || stored === "ember") {
+      return stored;
+    }
+  } catch {
+  }
+  return "darkroom";
+}
+
+function applyPalette(palette: ThemePalette): void {
+  const root = document.documentElement;
+  root.classList.remove("palette-darkroom", "palette-ember");
+  if (palette !== "indigo") {
+    root.classList.add(`palette-${palette}`);
+  }
+}
+
+const paletteStore = writable<ThemePalette>(getStoredPalette());
+
+applyPalette(get(paletteStore));
+
+export const paletteState = {
+  subscribe: paletteStore.subscribe,
+
+  get palette(): ThemePalette {
+    return get(paletteStore);
+  },
+
+  setPalette(palette: ThemePalette): void {
+    paletteStore.set(palette);
+    try {
+      localStorage.setItem(PALETTE_KEY, palette);
+    } catch {
+    }
+    applyPalette(palette);
+  },
+
+  cycle(): void {
+    const idx = PALETTE_ORDER.indexOf(get(paletteStore));
+    this.setPalette(PALETTE_ORDER[(idx + 1) % PALETTE_ORDER.length]);
+  },
+};

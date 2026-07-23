@@ -72,6 +72,59 @@
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.551 0.027 264.364);
 }
+/* Curated dark palettes, selectable from the theme controls (persisted as
+   `immich-shuttle-palette`). Bare `.dark` is the classic Indigo look; a
+   `palette-*` class layers one of these override sets on top. Light mode is
+   unaffected. Darkroom is the default. */
+
+/* Darkroom — OLED near-black with the accent swapped to the teal end of the
+   Immich lens. Chrome goes pitch so the photo thumbnails carry the color. */
+.dark.palette-darkroom {
+  --background: oklch(0.105 0 0);
+  --foreground: oklch(0.965 0.005 200);
+  --card: oklch(0.163 0.005 240);
+  --popover: oklch(0.163 0.005 240);
+  --secondary: oklch(0.218 0.006 240);
+  --muted: oklch(0.218 0.006 240);
+  --accent: oklch(0.218 0.006 240);
+  --muted-foreground: oklch(0.69 0.02 220);
+  --border: oklch(1 0 0 / 9%);
+  --input: oklch(1 0 0 / 13%);
+  --primary: oklch(0.77 0.115 187);
+  --primary-foreground: oklch(0.145 0.02 200);
+  --ring: oklch(0.77 0.115 187);
+  --brand-from: oklch(0.55 0.1 210);
+  --brand-mid: oklch(0.68 0.12 195);
+  --brand-to: oklch(0.8 0.13 180);
+  --brand-contrast: oklch(0.14 0.02 200);
+  --brand-shadow: oklch(0.7 0.12 190 / 0.4);
+  --glow-1: oklch(0.75 0.12 190 / 0.07);
+  --glow-2: oklch(0.55 0.1 220 / 0.05);
+}
+
+/* Ember — warm charcoal with an amber accent; darkroom-safelight vibe. */
+.dark.palette-ember {
+  --background: oklch(0.133 0.008 75);
+  --foreground: oklch(0.972 0.006 90);
+  --card: oklch(0.188 0.012 72);
+  --popover: oklch(0.188 0.012 72);
+  --secondary: oklch(0.245 0.014 70);
+  --muted: oklch(0.245 0.014 70);
+  --accent: oklch(0.245 0.014 70);
+  --muted-foreground: oklch(0.715 0.025 80);
+  --border: oklch(0.95 0.02 90 / 11%);
+  --input: oklch(0.95 0.02 90 / 15%);
+  --primary: oklch(0.765 0.14 70);
+  --primary-foreground: oklch(0.185 0.045 70);
+  --ring: oklch(0.765 0.14 70);
+  --brand-from: oklch(0.6 0.16 40);
+  --brand-mid: oklch(0.7 0.16 55);
+  --brand-to: oklch(0.8 0.14 80);
+  --brand-contrast: oklch(0.17 0.05 60);
+  --brand-shadow: oklch(0.7 0.15 60 / 0.4);
+  --glow-1: oklch(0.72 0.14 65 / 0.08);
+  --glow-2: oklch(0.6 0.12 40 / 0.04);
+}
 
 @theme inline {
   --radius-sm: calc(var(--radius) - 4px);
@@ -150,24 +203,40 @@
 }
 
 @layer components {
-  /* Immich lens-inspired brand sweep for the logo mark and hero accents. */
+  /* Immich lens-inspired brand sweep for the logo mark and hero accents.
+     Stops are var-driven so a theme variant can retune the entire brand
+     identity by setting --brand-* custom properties. */
   .brand-gradient {
     background-image: linear-gradient(
       135deg,
-      oklch(0.473 0.151 272.9) 0%,
-      oklch(0.599 0.23 286.2) 55%,
-      oklch(0.785 0.133 181.9) 100%
+      var(--brand-from, oklch(0.473 0.151 272.9)) 0%,
+      var(--brand-mid, oklch(0.599 0.23 286.2)) 55%,
+      var(--brand-to, oklch(0.785 0.133 181.9)) 100%
     );
   }
   .brand-text-gradient {
     background-image: linear-gradient(
       135deg,
-      oklch(0.473 0.151 272.9) 0%,
-      oklch(0.599 0.23 286.2) 100%
+      var(--brand-from, oklch(0.473 0.151 272.9)) 0%,
+      var(--brand-mid, oklch(0.599 0.23 286.2)) 100%
     );
     background-clip: text;
     -webkit-background-clip: text;
     color: transparent;
+  }
+  /* Ambient canvas glow behind the app shell (dark mode only via caller). */
+  .canvas-glow {
+    background:
+      radial-gradient(
+        110% 70% at 50% -8%,
+        var(--glow-1, oklch(0.5 0.17 273 / 0.16)),
+        transparent 60%
+      ),
+      radial-gradient(
+        80% 55% at 100% 0%,
+        var(--glow-2, oklch(0.74 0.14 196 / 0.07)),
+        transparent 55%
+      );
   }
 }
 
@@ -177,13 +246,13 @@
 .btn-brand {
   background-image: linear-gradient(
     135deg,
-    oklch(0.5 0.17 273) 0%,
-    oklch(0.62 0.21 283) 50%,
-    oklch(0.74 0.14 196) 100%
+    var(--brand-from, oklch(0.5 0.17 273)) 0%,
+    var(--brand-mid, oklch(0.62 0.21 283)) 50%,
+    var(--brand-to, oklch(0.74 0.14 196)) 100%
   );
-  color: #fff;
+  color: var(--brand-contrast, #fff);
   border-color: transparent;
-  box-shadow: 0 6px 18px -6px oklch(0.55 0.19 277 / 0.5);
+  box-shadow: 0 6px 18px -6px var(--brand-shadow, oklch(0.55 0.19 277 / 0.5));
 }
 .btn-brand:hover {
   filter: brightness(1.07) saturate(1.04);

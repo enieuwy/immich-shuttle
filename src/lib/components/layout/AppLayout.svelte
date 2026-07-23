@@ -21,9 +21,8 @@
 
 <div class="relative isolate grid h-screen grid-rows-[auto_1fr_auto] bg-background text-foreground">
   <div
-    class="pointer-events-none absolute inset-0 -z-10 opacity-0 transition-opacity dark:opacity-100"
+    class="canvas-glow pointer-events-none absolute inset-0 -z-10 opacity-0 transition-opacity dark:opacity-100"
     aria-hidden="true"
-    style="background: radial-gradient(110% 70% at 50% -8%, oklch(0.5 0.17 273 / 0.16), transparent 60%), radial-gradient(80% 55% at 100% 0%, oklch(0.74 0.14 196 / 0.07), transparent 55%);"
   ></div>
   <header class="relative sticky top-0 z-10 border-b border-border bg-card px-4 py-3" data-tauri-drag-region>
     <div class="flex w-full items-center justify-between gap-4" data-titlebar data-tauri-drag-region>

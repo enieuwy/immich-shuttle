@@ -36,3 +36,22 @@ if (typeof globalThis.localStorage === "undefined") {
     Object.defineProperty(window, "localStorage", { value: storage, configurable: true });
   }
 }
+
+// jsdom also lacks `matchMedia`, which the theme store consults for the
+// "system" mode. A static light-preferring stub is enough for tests.
+if (typeof window !== "undefined" && typeof window.matchMedia === "undefined") {
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    value: (query: string): MediaQueryList =>
+      ({
+        matches: false,
+        media: query,
+        onchange: null,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+        dispatchEvent: () => false,
+      }) as MediaQueryList,
+  });
+}
