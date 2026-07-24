@@ -13,7 +13,6 @@
   import { Badge } from "$lib/components/ui/badge";
   import { Card, CardHeader, CardTitle, CardAction, CardContent } from "$lib/components/ui/card";
   import { Label } from "$lib/components/ui/label";
-  import { Switch } from "$lib/components/ui/switch";
   import { Alert, AlertDescription } from "$lib/components/ui/alert";
   import { importOptionsState } from "$lib/state/import-options";
   import type { ImportOrganization } from "$lib/types";
@@ -280,22 +279,6 @@
           aria-label="Tags"
           value={tagsText}
           onchange={(e) => commitTags(e.currentTarget.value)}
-        />
-      </div>
-
-      <div class="flex items-center justify-between gap-3">
-        <Label
-          for="album-option-session-tag"
-          class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
-        >
-          <span class="text-sm font-medium text-foreground">Tag this import session</span>
-          <span class="text-xs text-muted-foreground">Add a timestamped tag so this batch is easy to find later.</span>
-        </Label>
-        <Switch
-          id="album-option-session-tag"
-          aria-label="Tag this import session"
-          checked={$importOptionsState.sessionTag}
-          onCheckedChange={(v) => importOptionsState.setSessionTag(v)}
         />
       </div>
     </div>

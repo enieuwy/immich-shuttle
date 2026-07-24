@@ -37,7 +37,6 @@
   const filterDateTo = $derived($importOptionsState.dateTo ?? "");
   const filterDateInvalid = $derived(isDateRangeInvalid(filterDateFrom, filterDateTo));
   const includeExtText = $derived($importOptionsState.includeExtensions.join(", "));
-  const excludeExtText = $derived($importOptionsState.excludeExtensions.join(", "));
   function parseExtensions(raw: string): string[] {
     return raw
       .split(",")
@@ -54,8 +53,7 @@
     ($importOptionsState.mediaType !== "all" ? 1 : 0) +
       (filterDateFrom !== "" || filterDateTo !== "" ? 1 : 0) +
       ($importOptionsState.onlyNewSinceLastImport ? 1 : 0) +
-      ($importOptionsState.includeExtensions.length > 0 ? 1 : 0) +
-      ($importOptionsState.excludeExtensions.length > 0 ? 1 : 0),
+      ($importOptionsState.includeExtensions.length > 0 ? 1 : 0),
   );
 
   let manualPath = $state("");
@@ -518,24 +516,6 @@
             aria-label="Only these extensions"
             value={includeExtText}
             onchange={(e) => importOptionsState.setIncludeExtensions(parseExtensions(e.currentTarget.value))}
-          />
-        </div>
-
-        <div class="rounded-lg p-3">
-          <Label
-            for="prefilter-exclude-ext"
-            class="flex min-w-0 flex-col items-start gap-1 font-normal"
-          >
-            <span class="text-sm font-medium text-foreground">Exclude extensions</span>
-            <span class="text-xs text-muted-foreground">Comma-separated (e.g. gif, aae) to skip.</span>
-          </Label>
-          <Input
-            id="prefilter-exclude-ext"
-            class="mt-2"
-            placeholder="gif, aae"
-            aria-label="Exclude extensions"
-            value={excludeExtText}
-            onchange={(e) => importOptionsState.setExcludeExtensions(parseExtensions(e.currentTarget.value))}
           />
         </div>
       {/if}

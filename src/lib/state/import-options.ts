@@ -51,7 +51,52 @@ const initialState: ImportOptionsState = {
   excludeExtensions: [],
 };
 
-const state = writable<ImportOptionsState>(initialState);
+const DEFAULTS_KEY = "immich-shuttle-import-defaults";
+
+// Durable, cross-import preferences (edited in Settings) live in this same
+// store but persist to localStorage; per-import fields (dates, selection, tags,
+// media type, include-extensions) stay ephemeral. Only this subset is saved.
+function loadDurable(base: ImportOptionsState): ImportOptionsState {
+  try {
+    const raw = localStorage.getItem(DEFAULTS_KEY);
+    if (!raw) return base;
+    const d = JSON.parse(raw) as Partial<ImportOptionsState>;
+    return {
+      ...base,
+      stackRawJpeg: d.stackRawJpeg ?? base.stackRawJpeg,
+      stackBurst: d.stackBurst ?? base.stackBurst,
+      concurrentTasks: d.concurrentTasks ?? base.concurrentTasks,
+      keepGoingOnErrors: d.keepGoingOnErrors ?? base.keepGoingOnErrors,
+      sessionTag: d.sessionTag ?? base.sessionTag,
+      excludeExtensions: d.excludeExtensions ?? base.excludeExtensions,
+    };
+  } catch {
+    return base;
+  }
+}
+
+/** Persist the durable subset (best-effort) and return the state unchanged so
+ *  it can be used inline inside `state.update`. */
+function persistDurable(s: ImportOptionsState): ImportOptionsState {
+  try {
+    localStorage.setItem(
+      DEFAULTS_KEY,
+      JSON.stringify({
+        stackRawJpeg: s.stackRawJpeg,
+        stackBurst: s.stackBurst,
+        concurrentTasks: s.concurrentTasks,
+        keepGoingOnErrors: s.keepGoingOnErrors,
+        sessionTag: s.sessionTag,
+        excludeExtensions: s.excludeExtensions,
+      }),
+    );
+  } catch {
+    // Persistence is best-effort (private mode, quota); defaults still work.
+  }
+  return s;
+}
+
+const state = writable<ImportOptionsState>(loadDurable(initialState));
 
 export const importOptionsState = {
   subscribe: state.subscribe,
@@ -59,14 +104,14 @@ export const importOptionsState = {
     state.update((s) => ({ ...s, keepFiles }));
   },
   setStackRawJpeg(stackRawJpeg: boolean) {
-    state.update((s) => ({ ...s, stackRawJpeg }));
+    state.update((s) => persistDurable({ ...s, stackRawJpeg }));
   },
   setStackBurst(stackBurst: boolean) {
-    state.update((s) => ({ ...s, stackBurst }));
+    state.update((s) => persistDurable({ ...s, stackBurst }));
   },
 
   setConcurrentTasks(concurrentTasks: number | null) {
-    state.update((s) => ({ ...s, concurrentTasks }));
+    state.update((s) => persistDurable({ ...s, concurrentTasks }));
   },
   setDateFrom(dateFrom: string | null) {
     state.update((s) => ({ ...s, dateFrom: dateFrom || null }));
@@ -78,7 +123,7 @@ export const importOptionsState = {
     state.update((s) => ({ ...s, organization }));
   },
   setKeepGoingOnErrors(keepGoingOnErrors: boolean) {
-    state.update((s) => ({ ...s, keepGoingOnErrors }));
+    state.update((s) => persistDurable({ ...s, keepGoingOnErrors }));
   },
   setOverwrite(overwrite: boolean) {
     state.update((s) => ({ ...s, overwrite }));
@@ -87,7 +132,7 @@ export const importOptionsState = {
     state.update((s) => ({ ...s, tags }));
   },
   setSessionTag(sessionTag: boolean) {
-    state.update((s) => ({ ...s, sessionTag }));
+    state.update((s) => persistDurable({ ...s, sessionTag }));
   },
   setOnlyNewSinceLastImport(onlyNewSinceLastImport: boolean) {
     state.update((s) => ({ ...s, onlyNewSinceLastImport }));
@@ -99,7 +144,7 @@ export const importOptionsState = {
     state.update((s) => ({ ...s, includeExtensions }));
   },
   setExcludeExtensions(excludeExtensions: string[]) {
-    state.update((s) => ({ ...s, excludeExtensions }));
+    state.update((s) => persistDurable({ ...s, excludeExtensions }));
   },
   clearDateRange() {
     state.update((s) => ({ ...s, dateFrom: null, dateTo: null }));

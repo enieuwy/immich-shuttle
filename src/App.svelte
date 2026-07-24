@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { Play, FileText, KeyRound } from "@lucide/svelte";
+  import { Play, FileText, KeyRound, Settings } from "@lucide/svelte";
 
   import AppLayout from "$lib/components/layout/AppLayout.svelte";
   import ThemeToggle from "$lib/components/layout/ThemeToggle.svelte";
+  import SettingsModal from "$lib/components/settings/SettingsModal.svelte";
   import AlbumSelector from "$lib/components/albums/AlbumSelector.svelte";
   import ErrorToast from "$lib/components/feedback/ErrorToast.svelte";
   import LogViewer from "$lib/components/feedback/LogViewer.svelte";
@@ -39,6 +40,7 @@
   let importError = $state("");
   let editTarget = $state<Profile | null>(null);
   let showPalette = $state(false);
+  let showSettings = $state(false);
 
   // When a profile has no API key, the Albums CTA requests its editor — open the
   // profile manager straight on that profile so the user lands on the key field.
@@ -134,6 +136,7 @@
     },
     { id: "cycle-theme", label: "Cycle Theme", keywords: ["dark", "light", "appearance"], run: () => themeState.cycle() },
     { id: "cycle-palette", label: "Cycle Dark Palette", keywords: ["darkroom", "indigo", "ember", "color"], run: () => paletteState.cycle() },
+    { id: "open-settings", label: "Import Defaults", keywords: ["settings", "preferences", "exclude", "stack"], run: () => (showSettings = true) },
   ];
 
   onMount(() => {
@@ -221,6 +224,15 @@
   {/snippet}
 
   {#snippet actions()}
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      aria-label="Import defaults"
+      title="Import defaults"
+      onclick={() => (showSettings = true)}
+    >
+      <Settings class="size-4" />
+    </Button>
     <ThemeToggle />
   {/snippet}
 
@@ -308,6 +320,8 @@
 </Dialog>
 
 <LogViewer bind:open={showLogs} />
+
+<SettingsModal bind:open={showSettings} />
 
 <PreviewDialog />
 
