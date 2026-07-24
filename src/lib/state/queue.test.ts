@@ -183,6 +183,40 @@ describe("queueState", () => {
     importOptionsState.setOnlyNewSinceLastImport(false);
   });
 
+  it("treats an explicit selection as the import: coarse filters do not compose", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+
+    // Coarse filters set (as History replay would), but a hand-picked selection
+    // is provided: the selection must win, and type/date/include must NOT also
+    // filter it, or picked files would be silently dropped.
+    importOptionsState.setMediaType("image");
+    importOptionsState.setDateFrom("2026-01-01");
+    importOptionsState.setDateTo("2026-01-31");
+    importOptionsState.setIncludeExtensions([".mp4"]);
+    importOptionsState.setOnlyNewSinceLastImport(true);
+
+    await queueState.startImport({ selectFiles: ["/Volumes/SD/DCIM/a.mov"] });
+    const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
+    expect(payload?.select_files).toEqual(["/Volumes/SD/DCIM/a.mov"]);
+    expect(payload?.include_type).toBeNull();
+    expect(payload?.date_range).toBeNull();
+    expect(payload?.include_extensions).toEqual([]);
+
+    importOptionsState.setMediaType("all");
+    importOptionsState.setIncludeExtensions([]);
+    importOptionsState.setOnlyNewSinceLastImport(false);
+    importOptionsState.clearDateRange();
+  });
+
   it("confirmWipe forwards args to importConfirmWipe", async () => {
     await queueState.confirmWipe("job-1", true);
     expect(vi.mocked(api.importConfirmWipe)).toHaveBeenCalledWith("job-1", true);

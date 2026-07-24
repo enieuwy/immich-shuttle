@@ -5,11 +5,11 @@
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open } from "@tauri-apps/plugin-dialog";
-  import { FolderOpen, FileImage, HardDrive, History, LayoutGrid, Loader2, X, Zap, ChevronRight } from "@lucide/svelte";
+  import { FolderOpen, FileImage, HardDrive, History, LayoutGrid, Loader2, X, Zap } from "@lucide/svelte";
 
   import { sourceState } from "$lib/state/source";
   import { autoImportState } from "$lib/state/auto-import";
-  import { importOptionsState, isDateRangeInvalid } from "$lib/state/import-options";
+  import { importOptionsState } from "$lib/state/import-options";
   import { previewState } from "$lib/state/preview";
   import { selectionState } from "$lib/state/selection";
   import { historyState } from "$lib/state/history";
@@ -29,32 +29,6 @@
   import { Switch } from "$lib/components/ui/switch";
   import DeviceRuleControl from "$lib/components/source/DeviceRuleControl.svelte";
 
-  // Pre-filter: coarse, server-side narrowing of the source (type / date /
-  // extension) applied before you preview and hand-pick. Bound to the shared
-  // import options so the values flow straight to the importer.
-  let preFilterOpen = $state(false);
-  const filterDateFrom = $derived($importOptionsState.dateFrom ?? "");
-  const filterDateTo = $derived($importOptionsState.dateTo ?? "");
-  const filterDateInvalid = $derived(isDateRangeInvalid(filterDateFrom, filterDateTo));
-  const includeExtText = $derived($importOptionsState.includeExtensions.join(", "));
-  function parseExtensions(raw: string): string[] {
-    return raw
-      .split(",")
-      .map((e) => e.trim().replace(/^\.+/, "").toLowerCase())
-      .filter((e) => e.length > 0)
-      .map((e) => `.${e}`);
-  }
-  const mediaTypes: Array<{ value: "all" | "image" | "video"; label: string }> = [
-    { value: "all", label: "All" },
-    { value: "image", label: "Photos" },
-    { value: "video", label: "Videos" },
-  ];
-  const activeFilterCount = $derived(
-    ($importOptionsState.mediaType !== "all" ? 1 : 0) +
-      (filterDateFrom !== "" || filterDateTo !== "" ? 1 : 0) +
-      ($importOptionsState.onlyNewSinceLastImport ? 1 : 0) +
-      ($importOptionsState.includeExtensions.length > 0 ? 1 : 0),
-  );
 
   let manualPath = $state("");
   let showPathInput = $state(false);
@@ -394,132 +368,32 @@
       {/if}
     {/if}
 
-    <section class="flex flex-col gap-1 rounded-lg border border-border/60 p-1">
-      <button
-        type="button"
-        class="flex items-center gap-1.5 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-muted/50"
-        aria-expanded={preFilterOpen}
-        onclick={() => (preFilterOpen = !preFilterOpen)}
-      >
-        <ChevronRight class="size-3.5 text-muted-foreground transition-transform {preFilterOpen ? 'rotate-90' : ''}" />
-        <span class="text-sm font-medium text-foreground">Pre-filter</span>
-        {#if activeFilterCount > 0}
-          <span class="rounded-full bg-primary/15 px-1.5 text-[10px] font-semibold text-primary">
-            {activeFilterCount} active
-          </span>
-        {/if}
-      </button>
-      <p class="px-2 pb-1 text-xs text-muted-foreground">
-        Narrow the source by type, date, or extension before you preview — trims the upload without loading thumbnails.
-      </p>
-      {#if preFilterOpen}
-        <div class="rounded-lg p-3">
-          <div class="flex min-w-0 flex-col items-start gap-1">
-            <span class="text-sm font-medium text-foreground">Media type</span>
-            <span class="text-xs text-muted-foreground">Import only one kind of media, or both.</span>
-          </div>
-          <div class="mt-2 flex gap-2" role="group" aria-label="Media type filter">
-            {#each mediaTypes as { value, label } (value)}
-              <Button
-                variant={$importOptionsState.mediaType === value ? "default" : "outline"}
-                size="sm"
-                aria-pressed={$importOptionsState.mediaType === value}
-                onclick={() => importOptionsState.setMediaType(value)}
-              >
-                {label}
-              </Button>
-            {/each}
-          </div>
-        </div>
-
-        <div class="rounded-lg p-3">
-          <div class="flex items-start justify-between gap-3">
-            <div class="flex min-w-0 flex-col items-start gap-1">
-              <span class="text-sm font-medium text-foreground">Capture date range</span>
-              <span class="text-xs text-muted-foreground">Only import files captured between these dates. Leave blank to import all.</span>
-            </div>
-            {#if filterDateFrom !== "" || filterDateTo !== ""}
-              <button
-                type="button"
-                class="shrink-0 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                onclick={() => importOptionsState.clearDateRange()}
-              >
-                Clear
-              </button>
-            {/if}
-          </div>
-          <div class="mt-2 flex items-center gap-2">
-            <Label for="prefilter-date-from" class="sr-only">From date</Label>
-            <Input
-              id="prefilter-date-from"
-              class="w-40 shrink-0"
-              type="date"
-              aria-label="From date"
-              aria-invalid={filterDateInvalid}
-              max={filterDateTo || undefined}
-              value={filterDateFrom}
-              onchange={(e) => importOptionsState.setDateFrom(e.currentTarget.value)}
-            />
-            <span class="text-xs text-muted-foreground">to</span>
-            <Label for="prefilter-date-to" class="sr-only">To date</Label>
-            <Input
-              id="prefilter-date-to"
-              class="w-40 shrink-0"
-              type="date"
-              aria-label="To date"
-              aria-invalid={filterDateInvalid}
-              min={filterDateFrom || undefined}
-              value={filterDateTo}
-              onchange={(e) => importOptionsState.setDateTo(e.currentTarget.value)}
-            />
-          </div>
-          {#if filterDateInvalid}
-            <p class="mt-2 text-xs text-destructive">The start date must be on or before the end date.</p>
-          {/if}
-        </div>
-
-        <div class="rounded-lg p-3">
-          <div class="flex items-center justify-between gap-3">
-            <Label
-              for="prefilter-only-new"
-              class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
-            >
-              <span class="text-sm font-medium text-foreground">Only media newer than last import</span>
-              <span class="text-xs text-muted-foreground">Skips a re-scan of already-imported files by filtering to a capture-date floor.</span>
-            </Label>
-            <Switch
-              id="prefilter-only-new"
-              aria-label="Only media newer than last import"
-              checked={$importOptionsState.onlyNewSinceLastImport}
-              onCheckedChange={(v) => importOptionsState.setOnlyNewSinceLastImport(v)}
-            />
-          </div>
-          {#if $importOptionsState.onlyNewSinceLastImport}
-            <p class="mt-2 text-xs text-muted-foreground">
-              Filters by EXIF capture date, not when files were added — a wrong camera clock or back-dated files may be skipped. Server-side dedupe still guards the boundary.
-            </p>
-          {/if}
-        </div>
-
-        <div class="rounded-lg p-3">
+    {#if $sourceState.selectedPaths.length > 0}
+      <div class="rounded-lg border border-border/60 p-3">
+        <div class="flex items-center justify-between gap-3">
           <Label
-            for="prefilter-include-ext"
-            class="flex min-w-0 flex-col items-start gap-1 font-normal"
+            for="only-new-toggle"
+            class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
           >
-            <span class="text-sm font-medium text-foreground">Only these extensions</span>
-            <span class="text-xs text-muted-foreground">Comma-separated (e.g. jpg, heic). Leave empty for all.</span>
+            <span class="text-sm font-medium text-foreground">Only import media new since last time</span>
+            <span class="text-xs text-muted-foreground">
+              Skip files older than this source's last import. Type, date, and extension filtering live in Preview &amp; select.
+            </span>
           </Label>
-          <Input
-            id="prefilter-include-ext"
-            class="mt-2"
-            placeholder="jpg, heic, mp4"
-            aria-label="Only these extensions"
-            value={includeExtText}
-            onchange={(e) => importOptionsState.setIncludeExtensions(parseExtensions(e.currentTarget.value))}
+          <Switch
+            id="only-new-toggle"
+            aria-label="Only import media new since last time"
+            checked={$importOptionsState.onlyNewSinceLastImport}
+            onCheckedChange={(v) => importOptionsState.setOnlyNewSinceLastImport(v)}
           />
         </div>
-      {/if}
-    </section>
+        {#if $importOptionsState.onlyNewSinceLastImport}
+          <p class="mt-2 text-xs text-muted-foreground">
+            Filters by EXIF capture date; server-side dedupe still guards the boundary. Ignored when you hand-pick files in Preview.
+          </p>
+        {/if}
+      </div>
+    {/if}
 
     {#if $sourceState.selectedPaths.length > 0 && $sourceState.scanResult && $sourceState.scanResult.files.length > 0}
       <div class="flex flex-wrap items-center gap-2">

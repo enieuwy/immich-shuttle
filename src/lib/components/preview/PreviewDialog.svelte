@@ -39,8 +39,9 @@
     <DialogHeader class="border-b border-border px-4 py-3">
       <DialogTitle>Preview &amp; select</DialogTitle>
       <DialogDescription>
-        Pick the photos and videos to import. Set albums and options on the main
-        screen, then Start Import.
+        Filter by type, date, name, or size and pick what to import — your
+        selection is exactly what uploads. Choose the album on the main screen,
+        then Start Import.
       </DialogDescription>
     </DialogHeader>
 

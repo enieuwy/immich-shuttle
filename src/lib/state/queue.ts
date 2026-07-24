@@ -315,21 +315,32 @@ export const queueState = {
           ? (albums.availableAlbums.find((a) => a.id === albumIds[0])?.album_name ?? null)
           : null;
 
+    // An explicit preview selection IS the import: the user hand-picked exact
+    // files, so coarse type/date/extension filters must not silently drop any
+    // of them. Those filters apply only on the no-preview (fast) path and to
+    // History replays (which clear the selection). Durable excludes are hygiene
+    // and always apply.
+    const selectFiles = overrides?.selectFiles ?? null;
+    const hasSelection = !!selectFiles && selectFiles.length > 0;
+
     // Explicit From/To range wins. Otherwise, "only new since last import"
     // derives a capture-date floor from this source's stored last-import time.
     // immich-go's --date-range needs both bounds, so pair the floor with a
     // far-future upper bound (open-ended "floor," is rejected).
-    let dateRange = toImmichDateRange(options.dateFrom, options.dateTo);
-    if (!dateRange && options.onlyNewSinceLastImport) {
-      const lastMs = await historySourceLastImport(profile.id, sourcePaths);
-      if (lastMs != null) {
-        // Format in the local calendar zone: immich-go parses --date-range in
-        // local time, so a UTC date could land a day off and skip newer files.
-        const d = new Date(lastMs);
-        const floor = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
-          d.getDate(),
-        ).padStart(2, "0")}`;
-        dateRange = `${floor},9999-12-31`;
+    let dateRange: string | null = null;
+    if (!hasSelection) {
+      dateRange = toImmichDateRange(options.dateFrom, options.dateTo);
+      if (!dateRange && options.onlyNewSinceLastImport) {
+        const lastMs = await historySourceLastImport(profile.id, sourcePaths);
+        if (lastMs != null) {
+          // Format in the local calendar zone: immich-go parses --date-range in
+          // local time, so a UTC date could land a day off and skip newer files.
+          const d = new Date(lastMs);
+          const floor = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+            d.getDate(),
+          ).padStart(2, "0")}`;
+          dateRange = `${floor},9999-12-31`;
+        }
       }
     }
 
@@ -342,16 +353,21 @@ export const queueState = {
       stack_burst: overrides?.stackBurst ?? options.stackBurst,
       date_range: dateRange,
       concurrent_tasks: options.concurrentTasks,
-      select_files: overrides?.selectFiles ?? null,
+      select_files: selectFiles,
       into_album: intoAlbum,
       organization: overrides?.organization ?? options.organization,
       on_errors: options.keepGoingOnErrors ? "continue" : null,
       overwrite: options.overwrite,
       tags: options.tags,
       session_tag: options.sessionTag,
-      include_type:
-        options.mediaType === "image" ? "IMAGE" : options.mediaType === "video" ? "VIDEO" : null,
-      include_extensions: options.includeExtensions,
+      include_type: hasSelection
+        ? null
+        : options.mediaType === "image"
+          ? "IMAGE"
+          : options.mediaType === "video"
+            ? "VIDEO"
+            : null,
+      include_extensions: hasSelection ? [] : options.includeExtensions,
       exclude_extensions: options.excludeExtensions,
     });
     await refreshJobs();
