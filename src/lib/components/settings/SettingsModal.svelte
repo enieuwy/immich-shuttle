@@ -173,10 +173,10 @@
           >
             <span class="text-sm font-medium text-foreground">Tag each import session</span>
             <span class="text-xs text-muted-foreground">Creates an auto-generated, timestamped tag <em>in Immich</em> and applies it to every asset in the batch, so you can find the whole import later.</span>
+            {#if $importOptionsState.sessionTag}
+              <code class="mt-0.5 rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">{exampleSessionTag}</code>
+            {/if}
           </Label>
-          {#if $importOptionsState.sessionTag}
-            <code class="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">{exampleSessionTag}</code>
-          {/if}
           <Switch
             id="settings-session-tag"
             aria-label="Tag each import session"
