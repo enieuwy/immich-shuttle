@@ -41,6 +41,15 @@
       .filter((e) => e.length > 0)
       .map((e) => `.${e}`);
   }
+
+  // Mirror immich-go's --session-tag format: "{immich-go}/YYYY-MM-DD HH-MM-SS".
+  const exampleSessionTag = $derived.by(() => {
+    void $importOptionsState.sessionTag; // re-evaluate when toggled on
+    const d = new Date();
+    const p = (n: number) => String(n).padStart(2, "0");
+    const stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+    return `{immich-go}/${stamp}`;
+  });
 </script>
 
 <Dialog bind:open>
@@ -163,8 +172,11 @@
             class="flex min-w-0 flex-col items-start gap-1 cursor-pointer font-normal"
           >
             <span class="text-sm font-medium text-foreground">Tag each import session</span>
-            <span class="text-xs text-muted-foreground">Add a timestamped tag to every batch so it's easy to find later.</span>
+            <span class="text-xs text-muted-foreground">Creates an auto-generated, timestamped tag <em>in Immich</em> and applies it to every asset in the batch, so you can find the whole import later.</span>
           </Label>
+          {#if $importOptionsState.sessionTag}
+            <code class="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">{exampleSessionTag}</code>
+          {/if}
           <Switch
             id="settings-session-tag"
             aria-label="Tag each import session"

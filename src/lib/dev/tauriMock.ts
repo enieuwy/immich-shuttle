@@ -65,6 +65,8 @@ function handle(cmd: string, args: InvokeArgs): unknown {
       return fixtures.profilesForScenario(scenario);
     case "albums_list":
       return fixtures.albums;
+    case "tags_list":
+      return fixtures.tags;
     case "users_list":
       return fixtures.users;
     case "user_profile_image":

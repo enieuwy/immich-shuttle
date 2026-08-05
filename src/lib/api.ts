@@ -12,6 +12,7 @@ import type {
   RemovableDevice,
   ScanSummary,
   ServerInfo,
+  Tag,
   ThumbResult,
 } from "./types";
 
@@ -50,6 +51,10 @@ export function albumsList(profileId: string, query?: string): Promise<Album[]> 
 
 export function albumCreate(profileId: string, name: string): Promise<Album> {
   return invokeCommand<Album>("album_create", { profileId, name });
+}
+
+export function tagsList(profileId: string): Promise<Tag[]> {
+  return invokeCommand<Tag[]>("tags_list", { profileId });
 }
 
 export type AlbumShareRole = "viewer" | "editor";

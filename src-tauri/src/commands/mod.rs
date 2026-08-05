@@ -5,4 +5,5 @@ pub mod import;
 pub mod preview;
 pub mod profiles;
 pub mod settings;
+pub mod tags;
 pub mod users;

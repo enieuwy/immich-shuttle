@@ -199,6 +199,7 @@ pub fn run() {
             commands::albums::album_create,
             commands::albums::album_share_users,
             commands::albums::album_share_link,
+            commands::tags::tags_list,
             commands::import::import_start,
             commands::import::import_forecast,
             commands::import::import_confirm_wipe,

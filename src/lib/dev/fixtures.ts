@@ -17,6 +17,7 @@ import type {
   RemovableDevice,
   ScanResult,
   ServerInfo,
+  Tag,
   ThumbResult,
 } from "$lib/types";
 
@@ -91,6 +92,15 @@ export const albums: Album[] = [
   { id: "a-pets", album_name: "Pets", shared_with: [] },
   { id: "a-travel", album_name: "Travel — Iceland", shared_with: [users[2]] },
   { id: "a-screenshots", album_name: "Screenshots", shared_with: [] },
+];
+
+export const tags: Tag[] = [
+  { id: "t-trip-iceland", value: "Trip/Iceland" },
+  { id: "t-trip-japan", value: "Trip/Japan" },
+  { id: "t-family", value: "Family" },
+  { id: "t-client-a", value: "client-a" },
+  { id: "t-favorites", value: "Favorites" },
+  { id: "t-2024", value: "2024" },
 ];
 
 export const shareLink: AlbumShareLink = {

@@ -42,6 +42,12 @@ export interface AlbumShareLink {
   url: string;
 }
 
+export interface Tag {
+  id: string;
+  /** Full hierarchical value, e.g. "Trip/Iceland". */
+  value: string;
+}
+
 export type JobStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 
 export interface JobProgress {

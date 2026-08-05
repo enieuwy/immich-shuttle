@@ -30,6 +30,7 @@ static HTTP_NO_REDIRECT: LazyLock<Client> = LazyLock::new(|| {
 });
 
 use crate::models::album::{Album, AlbumShareLink, AlbumUser};
+use crate::models::tag::Tag;
 
 /// JSON API responses are expected to be small. Bound reads so a malicious or
 /// misconfigured endpoint cannot make the app buffer an unbounded response.
@@ -420,6 +421,33 @@ impl ImmichClient {
             });
         }
         Ok(albums)
+    }
+
+    pub async fn list_tags(&self) -> Result<Vec<Tag>, String> {
+        let value = self.request_json(Method::GET, &["tags"], None).await?;
+        let raw = serde_json::from_value::<Vec<Value>>(value)
+            .map_err(|e| format!("Failed parsing /tags list: {e}"))?;
+
+        let mut tags = Vec::new();
+        for item in raw {
+            let id = match item.get("id").and_then(Value::as_str) {
+                Some(v) => v.to_string(),
+                None => continue,
+            };
+            // `value` is the full hierarchical path ("Parent/Child"); fall back
+            // to `name` (leaf) if a server omits it.
+            let value = item
+                .get("value")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("name").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            if value.is_empty() {
+                continue;
+            }
+            tags.push(Tag { id, value });
+        }
+        Ok(tags)
     }
 
     pub async fn create_album(&self, name: &str) -> Result<Album, String> {
