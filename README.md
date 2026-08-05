@@ -7,7 +7,7 @@
 <p align="center">A cross-platform desktop importer for Immich, built with Tauri v2 + Svelte 5. Powered by <a href="https://github.com/simulot/immich-go">immich-go</a>.</p>
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="Immich Shuttle — source picker, albums, and import queue" width="900" />
+  <img src="docs/screenshot.png" alt="Immich Shuttle — source card, album destination, and a live import queue" width="900" />
 </p>
 
 ## Features
