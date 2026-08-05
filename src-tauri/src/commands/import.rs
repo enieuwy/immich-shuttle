@@ -208,6 +208,60 @@ fn set_job(job: ImportJob) -> Result<(), String> {
     Ok(())
 }
 
+/// Commit a worker's terminal state for a job, refusing to move it out of
+/// `Cancelled`, and return the state that is actually stored.
+///
+/// `import_cancel` publishes `Cancelled` while the worker is still winding down,
+/// so the worker's own final write can land afterwards. Without this guard that
+/// write revives a cancelled import as Completed/Failed and — worse — leaves the
+/// wipe payload in place, offering the user's originals for deletion after they
+/// asked the run to stop. The status check and the write share one lock hold so a
+/// cancellation cannot slip between them.
+fn finalize_job(update: ImportJob) -> ImportJob {
+    let mut cancelled_id: Option<String> = None;
+    let mut evicted_ids: Vec<String> = Vec::new();
+
+    let stored = {
+        let Ok(mut jobs) = JOBS.lock() else {
+            return update;
+        };
+        let Some(index) = jobs.iter().position(|existing| existing.id == update.id) else {
+            return update;
+        };
+
+        if matches!(jobs[index].status, JobStatus::Cancelled)
+            && !matches!(update.status, JobStatus::Cancelled)
+        {
+            cancelled_id = Some(update.id);
+            jobs[index].clone()
+        } else {
+            let terminal = is_terminal(&update.status);
+            let stored = update.clone();
+            jobs[index] = update;
+            // Terminal jobs move to the end so eviction keeps the most recent.
+            if terminal {
+                let job = jobs.remove(index);
+                jobs.push(job);
+            }
+            evicted_ids = evict_old_terminal_jobs(&mut jobs);
+            stored
+        }
+    };
+
+    match cancelled_id {
+        // The cancel path already dropped its own payload; drop anything this run
+        // registered so a cancelled import cannot reach the wipe prompt.
+        Some(id) => {
+            if let Ok(mut pending) = PENDING_WIPE.lock() {
+                pending.remove(&id);
+            }
+        }
+        None => remove_job_state(&evicted_ids),
+    }
+
+    stored
+}
+
 /// Re-verify renderer-supplied selected paths against the user-approved source
 /// roots. The frontend sends `select_files` over IPC, so a compromised or buggy
 /// renderer could point staging at files outside the chosen folders; we reject
@@ -232,23 +286,67 @@ fn validate_selected_under_sources(
     Ok(())
 }
 
+/// Drop paths that do not resolve under one of the approved source roots,
+/// returning the kept paths and the number discarded.
+///
+/// Unlike `validate_selected_under_sources` this filters instead of failing: the
+/// input is the run log's own account of what it uploaded, where a single
+/// unresolvable entry (a file moved or unplugged mid-run) must not block the wipe
+/// for everything else.
+///
+/// This is the last containment check before originals become deletion
+/// candidates. It matters because `file=` values in the run log are
+/// attacker-influenced: console-slog writes attribute values unescaped, so a
+/// filename or directory containing a newline on untrusted media can forge a
+/// whole `INF uploaded successfully file=/somewhere/else` record. Such a path
+/// cannot be under a source root, so it dies here.
+fn retain_paths_under_sources(paths: Vec<String>, source_paths: &[String]) -> (Vec<String>, usize) {
+    let roots: Vec<PathBuf> = source_paths
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p)))
+        .collect();
+    let total = paths.len();
+    let kept: Vec<String> = paths
+        .into_iter()
+        .filter(|path| {
+            std::fs::canonicalize(path)
+                .is_ok_and(|canon| roots.iter().any(|root| canon.starts_with(root)))
+        })
+        .collect();
+    let dropped = total - kept.len();
+    (kept, dropped)
+}
+
 /// Final classification of an import process that ran to completion.
 struct RunOutcome {
     status: JobStatus,
     /// Whether the uploaded originals may proceed to the verify-then-delete wipe.
     wipe_eligible: bool,
+    /// Whether this run may advance the source's "only new since last import"
+    /// checkpoint. Deliberately stricter than `status`: see below.
+    checkpoint_eligible: bool,
 }
 
-/// Decide the final job status and wipe eligibility from a completed run's
-/// tallies. Kept pure (no globals, no I/O) because this is the verify-before-
-/// delete safety surface: a regression here could delete originals after a
-/// failed run or wrongly withhold deletion.
+/// Decide the final job status, wipe eligibility, and checkpoint eligibility from
+/// a completed run's tallies. Kept pure (no globals, no I/O) because this is the
+/// verify-before-delete safety surface: a regression here could delete originals
+/// after a failed run or wrongly withhold deletion.
 ///
 /// A run is a failure only when nothing landed on the server (no uploads, no
 /// duplicate matches) AND it ended badly (non-zero exit or per-file errors); a
 /// partial run that uploaded or matched duplicates succeeds, surfacing errors.
 /// Wipe is eligible only for a successful run with keep-files off and at least
 /// one completed path.
+///
+/// The checkpoint is separate and stricter because advancing it is a silent,
+/// irreversible narrowing of every later import: it becomes a capture-date floor
+/// passed to immich-go, and media added afterwards with an older capture date
+/// falls below it and is never offered again. So it requires positive evidence
+/// that this run actually processed the source — at least one landed asset and no
+/// aggregate scan error. A zero-asset run (empty card, or filters that excluded
+/// everything) is still `Completed`, because nothing went wrong; it just has not
+/// earned the right to raise the floor. Erring this way costs a re-scan that
+/// server-side dedupe makes harmless; erring the other way loses photos.
 fn classify_completed_run(
     uploaded: u32,
     duplicates: u32,
@@ -256,18 +354,22 @@ fn classify_completed_run(
     file_errors_len: usize,
     keep_files: bool,
     completed_paths_len: usize,
+    scan_errors: u32,
 ) -> RunOutcome {
-    let nothing_landed = uploaded == 0 && duplicates == 0;
-    let failed = nothing_landed && (exit_nonzero || file_errors_len > 0);
+    let landed = uploaded > 0 || duplicates > 0;
+    let failed = !landed && (exit_nonzero || file_errors_len > 0);
     let status = if failed {
         JobStatus::Failed
     } else {
         JobStatus::Completed
     };
     let wipe_eligible = !failed && !keep_files && completed_paths_len > 0;
+    let checkpoint_eligible =
+        !failed && landed && file_errors_len == 0 && !exit_nonzero && scan_errors == 0;
     RunOutcome {
         status,
         wipe_eligible,
+        checkpoint_eligible,
     }
 }
 
@@ -534,11 +636,31 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // selected originals instead. SHA-1 verify_uploaded still gates deletion
         // to files the server actually holds, so unuploaded picks are kept safe.
         let completed_asset_paths = if staged_import {
+            // Already validated under the source roots at admission.
             select_files.clone()
         } else {
-            run.completed_paths
+            // Re-contain what the log claims was uploaded: these paths become
+            // deletion candidates, and the log is not a trusted channel.
+            let (kept, dropped) = retain_paths_under_sources(run.completed_paths, &source_paths);
+            if dropped > 0 {
+                let _ = logs::append_log(
+                    "app.log",
+                    &format!(
+                        "import_completed_paths_outside_sources job_id={job_id_clone} dropped={dropped}"
+                    ),
+                );
+            }
+            kept
         };
 
+        // The sidecar can exit on its own between the loop's last cancel check and
+        // a cancel request arriving, so run_upload returns Ok and `cancelled` stays
+        // false even though the user did cancel. Re-read the flag here, before any
+        // wipe payload is built: a cancelled run must never become wipe-eligible.
+        let cancelled = cancelled || cancel_flag.load(Ordering::Relaxed);
+
+        // Only a completed run can earn the checkpoint; cancelled/failed stay false.
+        let mut checkpoint_eligible = false;
         let update = if cancelled {
             ImportJob {
                 id: job_id_clone.clone(),
@@ -577,6 +699,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             let RunOutcome {
                 status,
                 wipe_eligible,
+                checkpoint_eligible: eligible,
             } = classify_completed_run(
                 progress.uploaded,
                 progress.duplicates,
@@ -584,7 +707,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 file_errors.len(),
                 keep_files,
                 completed_asset_paths.len(),
+                run.scan_errors,
             );
+            checkpoint_eligible = eligible;
             let failed = matches!(status, JobStatus::Failed);
             if wipe_eligible {
                 if let Ok(mut pending) = PENDING_WIPE.lock() {
@@ -689,7 +814,13 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             ),
         );
         let _ = logs::rotate_recent_logs(5);
-        let _ = set_job(update.clone());
+        // A cancel request that lands during finalization has already written
+        // Cancelled; finalize_job refuses to move the job back out of it and
+        // returns what is actually stored, so the log/history below record the
+        // outcome the user was shown rather than the one this task computed.
+        let update = finalize_job(update);
+        let checkpoint_eligible =
+            checkpoint_eligible && matches!(update.status, JobStatus::Completed);
         let status = match &update.status {
             JobStatus::Completed => "completed",
             JobStatus::Cancelled => "cancelled",
@@ -712,6 +843,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 // Persist the request (source/options) so History can replay it.
                 request: Some(history_request),
             },
+            checkpoint_eligible,
         ) {
             let _ = logs::append_log(
                 "app.log",
@@ -885,19 +1017,39 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
                 .await
                 {
                     Ok(wipe_result) => {
-                        let kept = wipe_result.failed + wipe_result.skipped + unverified_count;
+                        let kept = wipe_result.failed
+                            + wipe_result.skipped
+                            + wipe_result.changed
+                            + unverified_count;
+                        // A file kept because it changed after verification is the
+                        // safety gate doing its job, so name it explicitly rather
+                        // than folding it into an anonymous "kept" total.
+                        let changed_note = if wipe_result.changed > 0 {
+                            format!(
+                                " {} changed after verification and were kept.",
+                                wipe_result.changed
+                            )
+                        } else {
+                            String::new()
+                        };
                         job.summary = Some(format!(
-                            "Verified {} of {} files on the server and deleted {}. Kept {} ({} not found on server).",
+                            "Verified {} of {} files on the server and deleted {}. Kept {} ({} not found on server).{}",
                             confirmed_count,
                             pending_count,
                             wipe_result.deleted,
                             kept,
                             unverified_count,
+                            changed_note,
                         ));
                         job.error = if wipe_result.failed > 0 {
                             Some(format!(
                                 "Wipe completed with errors: deleted={}, failed={}, skipped={}",
                                 wipe_result.deleted, wipe_result.failed, wipe_result.skipped
+                            ))
+                        } else if wipe_result.changed > 0 {
+                            Some(format!(
+                                "{} file(s) changed after they were verified and were kept for safety.",
+                                wipe_result.changed
                             ))
                         } else if unverified_count > 0 {
                             Some(format!(
@@ -909,8 +1061,8 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
                         let _ = logs::append_log(
                             "app.log",
                             &format!(
-                                "import_wipe_verified job_id={} confirmed={} unverified={} deleted={}",
-                                job_id, confirmed_count, unverified_count, wipe_result.deleted
+                                "import_wipe_verified job_id={} confirmed={} unverified={} deleted={} changed={}",
+                                job_id, confirmed_count, unverified_count, wipe_result.deleted, wipe_result.changed
                             ),
                         );
                     }
@@ -1301,49 +1453,100 @@ mod tests {
 
     #[test]
     fn nothing_landed_and_bad_exit_is_failed_not_wipe_eligible() {
-        let o = classify_completed_run(0, 0, true, 0, false, 3);
+        let o = classify_completed_run(0, 0, true, 0, false, 3, 0);
         assert!(is_failed(&o));
         assert!(!o.wipe_eligible, "a failed run must never be wipe-eligible");
+        assert!(!o.checkpoint_eligible);
     }
 
     #[test]
     fn nothing_landed_with_file_errors_is_failed() {
-        let o = classify_completed_run(0, 0, false, 2, false, 3);
+        let o = classify_completed_run(0, 0, false, 2, false, 3, 0);
         assert!(is_failed(&o));
         assert!(!o.wipe_eligible);
+        assert!(!o.checkpoint_eligible);
     }
 
     #[test]
     fn uploads_present_succeed_despite_errors_and_bad_exit() {
         // A partial run that uploaded something is a success even with per-file
         // errors and a non-zero exit; deletion of the originals stays eligible.
-        let o = classify_completed_run(5, 0, true, 4, false, 5);
+        let o = classify_completed_run(5, 0, true, 4, false, 5, 0);
         assert!(!is_failed(&o));
         assert!(o.wipe_eligible);
+        assert!(
+            !o.checkpoint_eligible,
+            "a partial run must not raise the only-new date floor"
+        );
     }
 
     #[test]
     fn duplicates_only_count_as_landed() {
         // Everything was already on the server (all duplicates): success, and the
         // originals are still eligible for deletion.
-        let o = classify_completed_run(0, 7, false, 0, false, 7);
+        let o = classify_completed_run(0, 7, false, 0, false, 7, 0);
         assert!(!is_failed(&o));
         assert!(o.wipe_eligible);
+        assert!(
+            o.checkpoint_eligible,
+            "the server holds every file, so the source is fully imported"
+        );
     }
 
     #[test]
     fn keep_files_blocks_wipe_on_success() {
-        let o = classify_completed_run(5, 0, false, 0, true, 5);
+        let o = classify_completed_run(5, 0, false, 0, true, 5, 0);
         assert!(!is_failed(&o));
         assert!(!o.wipe_eligible, "keep-files must suppress deletion");
+        assert!(o.checkpoint_eligible, "keeping files is not a failure");
     }
 
     #[test]
     fn no_completed_paths_blocks_wipe() {
         // Success but nothing to delete (e.g. immich-go reported no completed
         // local paths): not wipe-eligible, so we never delete on an empty set.
-        let o = classify_completed_run(0, 3, false, 0, false, 0);
+        let o = classify_completed_run(0, 3, false, 0, false, 0, 0);
         assert!(!is_failed(&o));
         assert!(!o.wipe_eligible);
+    }
+
+    /// An empty card, or filters that excluded every file, is not an error — but it
+    /// is no evidence the source was imported either. Advancing the checkpoint here
+    /// would set a date floor of "now" and permanently hide any media added later
+    /// with an older capture date.
+    #[test]
+    fn a_zero_asset_run_completes_without_earning_the_checkpoint() {
+        let o = classify_completed_run(0, 0, false, 0, false, 0, 0);
+        assert!(
+            !is_failed(&o),
+            "nothing went wrong, so this is not a failure"
+        );
+        assert!(!o.wipe_eligible);
+        assert!(
+            !o.checkpoint_eligible,
+            "a run that landed nothing must not raise the date floor"
+        );
+    }
+
+    /// A source immich-go could not enumerate is reported only as an aggregate ERR
+    /// line with no `file=`. Files from that source were never seen, so the
+    /// checkpoint must not advance past them even though other sources succeeded.
+    #[test]
+    fn a_scan_error_blocks_the_checkpoint_even_when_uploads_succeeded() {
+        let o = classify_completed_run(9, 0, false, 0, false, 9, 1);
+        assert!(!is_failed(&o), "the files that did upload still count");
+        assert!(o.wipe_eligible, "verified uploads remain deletable");
+        assert!(
+            !o.checkpoint_eligible,
+            "an unreadable source must not be marked fully imported"
+        );
+    }
+
+    #[test]
+    fn a_clean_full_run_earns_the_checkpoint() {
+        let o = classify_completed_run(12, 3, false, 0, false, 15, 0);
+        assert!(!is_failed(&o));
+        assert!(o.wipe_eligible);
+        assert!(o.checkpoint_eligible);
     }
 }

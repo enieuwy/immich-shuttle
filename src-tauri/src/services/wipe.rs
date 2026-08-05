@@ -1,4 +1,9 @@
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::HashSet,
+    fs, io,
+    path::Path,
+    time::{Duration, SystemTime},
+};
 
 use crate::services::immich_client::ImmichClient;
 
@@ -7,7 +12,66 @@ pub struct WipeResult {
     pub deleted: usize,
     pub failed: usize,
     pub skipped: usize,
+    /// Files kept because they no longer matched the identity that was verified
+    /// against the server (see `FileIdentity`).
+    pub changed: usize,
     pub errors: Vec<String>,
+}
+
+/// Filesystem identity of a source file, captured at the moment its contents
+/// were hashed for the server existence check.
+///
+/// Verification and deletion are separated by a full SHA-1 pass over every file
+/// plus a server round trip — minutes for a large video batch on slow removable
+/// media. Anything writing to the card in that window (a camera sync, an editor
+/// autosave, a still-finishing copy) leaves the server holding the OLD contents
+/// while the path now points at NEW, unuploaded bytes. Deleting then destroys
+/// data the server never received, so the identity observed at hash time is
+/// carried through to the delete and re-checked there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub len: u64,
+    /// `None` when the platform/filesystem does not report a modification time;
+    /// length alone then carries the check.
+    pub modified: Option<SystemTime>,
+}
+
+impl FileIdentity {
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+
+    /// Whether `other` is the same file contents this identity was taken from.
+    ///
+    /// mtime is compared with a one-second tolerance: some filesystems (FAT32 on
+    /// camera cards, SMB shares) store second- or two-second-granularity
+    /// timestamps, and a stat that rounds differently than the one taken at hash
+    /// time must not be read as a rewrite.
+    fn matches(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        match (self.modified, other.modified) {
+            (Some(a), Some(b)) => a
+                .duration_since(b)
+                .or_else(|_| b.duration_since(a))
+                .is_ok_and(|drift| drift <= Duration::from_secs(1)),
+            // An unreadable mtime on either side leaves length as the only
+            // signal; do not treat that as a mismatch and keep everything.
+            _ => true,
+        }
+    }
+}
+
+/// A file the server confirmed it holds, paired with the identity that was
+/// hashed. Deletion is conditional on the identity still matching.
+#[derive(Debug, Clone)]
+pub struct VerifiedFile {
+    pub path: String,
+    pub identity: FileIdentity,
 }
 
 fn allowed_media_exts() -> HashSet<&'static str> {
@@ -37,18 +101,25 @@ fn trash_context() -> trash::TrashContext {
     trash::TrashContext::default()
 }
 
-pub fn wipe_files(paths: &[String]) -> WipeResult {
+/// Move server-confirmed originals to the Trash.
+///
+/// Every file is re-stat'd immediately before deletion and kept if its identity
+/// no longer matches what was hashed for the server check — the stat and the
+/// delete are deliberately adjacent so the window a concurrent writer could slip
+/// into is as small as the loop body.
+pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
     let exts = allowed_media_exts();
     let trash = trash_context();
     let mut result = WipeResult {
         deleted: 0,
         failed: 0,
         skipped: 0,
+        changed: 0,
         errors: Vec::new(),
     };
 
-    for raw in paths {
-        let path = Path::new(raw);
+    for file in files {
+        let path = Path::new(&file.path);
         if !path.exists() || !path.is_file() {
             result.skipped += 1;
             continue;
@@ -61,6 +132,29 @@ pub fn wipe_files(paths: &[String]) -> WipeResult {
         if !exts.contains(ext.as_str()) {
             result.skipped += 1;
             continue;
+        }
+
+        // Identity check last, so it is the most recent observation before the
+        // delete. An unreadable stat here means the file changed underneath us in
+        // a way we cannot reason about: keep it.
+        match fs::metadata(path) {
+            Ok(metadata) if file.identity.matches(&FileIdentity::of(&metadata)) => {}
+            Ok(_) => {
+                result.changed += 1;
+                result.errors.push(format!(
+                    "Kept {}: the file changed after it was verified on the server.",
+                    path.display()
+                ));
+                continue;
+            }
+            Err(err) => {
+                result.changed += 1;
+                result.errors.push(format!(
+                    "Kept {}: could not re-check the file before deleting it ({err}).",
+                    path.display()
+                ));
+                continue;
+            }
         }
 
         // Move to the OS Trash instead of a hard delete so a mistaken wipe is
@@ -82,35 +176,48 @@ pub fn wipe_files(paths: &[String]) -> WipeResult {
 
 #[derive(Debug, Clone)]
 pub struct VerifyResult {
-    /// Files the server confirmed it holds (safe to delete).
-    pub confirmed: Vec<String>,
+    /// Files the server confirmed it holds, with the identity that was hashed.
+    pub confirmed: Vec<VerifiedFile>,
     /// Files not confirmed on the server (kept for safety).
     pub unverified: Vec<String>,
 }
 
-fn file_sha1_hex(path: &str) -> Result<String, String> {
+/// SHA-1 the file contents and capture the identity of the handle we read.
+///
+/// One open serves both: the identity comes from the same file handle the bytes
+/// were read through (`File::metadata`), not from a second path lookup that could
+/// resolve to a replacement file. It is taken AFTER the read so a write that
+/// lands mid-hash is reflected in the recorded mtime rather than hidden by it.
+fn hash_file(path: &str) -> Result<(String, FileIdentity), String> {
     use sha1::{Digest, Sha1};
     let mut file = fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
     let mut hasher = Sha1::new();
     let mut buf = [0u8; 65536];
     loop {
-        let read =
-            std::io::Read::read(&mut file, &mut buf).map_err(|e| format!("read {path}: {e}"))?;
+        let read = io::Read::read(&mut file, &mut buf).map_err(|e| format!("read {path}: {e}"))?;
         if read == 0 {
             break;
         }
         hasher.update(&buf[..read]);
     }
-    Ok(hasher
+    let identity = file
+        .metadata()
+        .map(|metadata| FileIdentity::of(&metadata))
+        .map_err(|e| format!("stat {path}: {e}"))?;
+    let checksum = hasher
         .finalize()
         .iter()
         .map(|b| format!("{b:02x}"))
-        .collect())
+        .collect();
+    Ok((checksum, identity))
 }
 
 /// Verifies which of `paths` the Immich server already holds (matched by SHA-1
 /// checksum) and partitions them into `confirmed` (present on the server, safe
 /// to delete) and `unverified` (missing or unreadable, kept for safety).
+///
+/// Each confirmed entry carries the identity observed while hashing so the wipe
+/// worker can refuse to delete a file that changed since.
 pub async fn verify_uploaded(
     server_url: &str,
     api_key: &str,
@@ -125,23 +232,28 @@ pub async fn verify_uploaded(
 
     // Hashing reads files from (possibly slow) media; keep it off the async runtime.
     let owned: Vec<String> = paths.to_vec();
-    let hashed: Vec<(String, Option<String>)> = tokio::task::spawn_blocking(move || {
-        owned
-            .into_iter()
-            .map(|path| {
-                let checksum = file_sha1_hex(&path).ok();
-                (path, checksum)
-            })
-            .collect()
-    })
-    .await
-    .map_err(|e| format!("Checksum task failed: {e}"))?;
+    let hashed: Vec<(String, Option<(String, FileIdentity)>)> =
+        tokio::task::spawn_blocking(move || {
+            owned
+                .into_iter()
+                .map(|path| {
+                    let hashed = hash_file(&path).ok();
+                    (path, hashed)
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| format!("Checksum task failed: {e}"))?;
 
     let mut unverified: Vec<String> = Vec::new();
     let mut to_check: Vec<(String, String)> = Vec::new();
-    for (path, checksum) in hashed {
-        match checksum {
-            Some(sum) => to_check.push((path, sum)),
+    let mut identities: Vec<FileIdentity> = Vec::new();
+    for (path, hashed) in hashed {
+        match hashed {
+            Some((sum, identity)) => {
+                to_check.push((path, sum));
+                identities.push(identity);
+            }
             None => unverified.push(path),
         }
     }
@@ -149,10 +261,10 @@ pub async fn verify_uploaded(
     let client = ImmichClient::new(server_url, api_key);
     let present = client.bulk_upload_check(&to_check).await?;
 
-    let mut confirmed: Vec<String> = Vec::new();
-    for (path, _) in to_check {
+    let mut confirmed: Vec<VerifiedFile> = Vec::new();
+    for ((path, _), identity) in to_check.into_iter().zip(identities) {
         if present.contains(&path) {
-            confirmed.push(path);
+            confirmed.push(VerifiedFile { path, identity });
         } else {
             unverified.push(path);
         }
@@ -194,7 +306,8 @@ pub async fn forecast_upload(
         owned
             .into_iter()
             .map(|path| {
-                let checksum = file_sha1_hex(&path).ok();
+                // The forecast never deletes, so the identity is not needed here.
+                let checksum = hash_file(&path).ok().map(|(checksum, _)| checksum);
                 (path, checksum)
             })
             .collect()
@@ -237,8 +350,12 @@ fn partition_present(
 
 #[cfg(test)]
 mod tests {
-    use super::{file_sha1_hex, partition_present, wipe_files};
-    use std::{fs, path::PathBuf};
+    use super::{hash_file, partition_present, wipe_files, FileIdentity, VerifiedFile};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
     fn temp_file(stem: &str, ext: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -250,6 +367,27 @@ mod tests {
         path
     }
 
+    /// A file as the wipe worker would receive it: verified against the server
+    /// with the identity captured at hash time.
+    fn verified(path: &Path) -> VerifiedFile {
+        let (_, identity) = hash_file(path.to_str().expect("path")).expect("hash");
+        VerifiedFile {
+            path: path.to_string_lossy().to_string(),
+            identity,
+        }
+    }
+
+    /// A file whose recorded identity cannot match anything on disk.
+    fn verified_with_stale_identity(path: &Path) -> VerifiedFile {
+        VerifiedFile {
+            path: path.to_string_lossy().to_string(),
+            identity: FileIdentity {
+                len: 999_999,
+                modified: None,
+            },
+        }
+    }
+
     #[test]
     fn moves_only_selected_media_files_to_trash() {
         let photo = temp_file("photo", "jpg");
@@ -257,10 +395,7 @@ mod tests {
         fs::write(&photo, b"a").expect("write photo");
         fs::write(&other, b"b").expect("write text");
 
-        let result = wipe_files(&[
-            photo.to_string_lossy().to_string(),
-            other.to_string_lossy().to_string(),
-        ]);
+        let result = wipe_files(&[verified(&photo), verified(&other)]);
         // trash::delete moves the file to the OS Trash: it leaves the origin
         // path (counted as deleted) but, unlike a hard delete, stays recoverable.
 
@@ -274,7 +409,7 @@ mod tests {
     #[test]
     fn skips_missing_files() {
         let missing = temp_file("missing", "jpg");
-        let result = wipe_files(&[missing.to_string_lossy().to_string()]);
+        let result = wipe_files(&[verified_with_stale_identity(&missing)]);
         assert_eq!(result.deleted, 0);
         assert_eq!(result.skipped, 1);
     }
@@ -283,21 +418,84 @@ mod tests {
     fn skips_non_media_file_extensions() {
         let text = temp_file("notes", "txt");
         fs::write(&text, b"x").expect("write text");
-        let result = wipe_files(&[text.to_string_lossy().to_string()]);
+        let result = wipe_files(&[verified(&text)]);
         assert_eq!(result.deleted, 0);
         assert_eq!(result.skipped, 1);
         assert!(text.exists());
         let _ = fs::remove_file(text);
     }
 
+    /// The core verify-before-wipe invariant: a file rewritten between the
+    /// server check and the delete holds bytes the server never received, so it
+    /// must be kept even though the server confirmed the OLD contents.
+    #[test]
+    fn keeps_a_file_that_changed_after_verification() {
+        let stable = temp_file("stable", "jpg");
+        let rewritten = temp_file("rewritten", "jpg");
+        fs::write(&stable, b"stable").expect("write stable");
+        fs::write(&rewritten, b"original").expect("write original");
+
+        let batch = vec![verified(&stable), verified(&rewritten)];
+
+        // A camera sync/editor replaces the file after it was hashed and checked.
+        fs::write(&rewritten, b"replaced with longer contents").expect("rewrite");
+
+        let result = wipe_files(&batch);
+
+        assert_eq!(result.changed, 1, "the rewritten file must be kept");
+        assert!(rewritten.exists(), "changed file must survive the wipe");
+        assert_eq!(result.deleted, 1, "the unchanged file still gets deleted");
+        assert!(!stable.exists());
+        assert!(
+            result.errors.iter().any(|e| e.contains("changed after it")),
+            "the user must be told why it was kept: {:?}",
+            result.errors
+        );
+
+        let _ = fs::remove_file(rewritten);
+    }
+
+    /// Coarse-granularity filesystems (FAT32 cards, SMB) can report an mtime that
+    /// rounds differently between two stats of an untouched file; that must not be
+    /// read as a rewrite and block a legitimate wipe.
+    #[test]
+    fn sub_second_mtime_drift_is_not_treated_as_a_change() {
+        let base = FileIdentity {
+            len: 10,
+            modified: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(1_500)),
+        };
+        let rounded = FileIdentity {
+            len: 10,
+            modified: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+        };
+        assert!(base.matches(&rounded));
+        assert!(rounded.matches(&base));
+
+        let two_seconds_later = FileIdentity {
+            len: 10,
+            modified: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(4)),
+        };
+        assert!(!base.matches(&two_seconds_later));
+
+        let same_time_new_length = FileIdentity {
+            len: 11,
+            modified: base.modified,
+        };
+        assert!(
+            !base.matches(&same_time_new_length),
+            "a length change is a rewrite regardless of mtime"
+        );
+    }
+
     #[test]
     fn computes_lowercase_hex_sha1() {
         let file = temp_file("hash", "bin");
         fs::write(&file, b"hello").expect("write file");
-        let hex = file_sha1_hex(file.to_str().expect("path")).expect("hash");
+        let (hex, identity) = hash_file(file.to_str().expect("path")).expect("hash");
         let _ = fs::remove_file(&file);
         // Immich matches assets by SHA-1; this is sha1("hello").
         assert_eq!(hex, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
+        assert_eq!(identity.len, 5, "identity is captured alongside the hash");
     }
 
     #[test]

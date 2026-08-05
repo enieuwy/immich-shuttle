@@ -71,16 +71,26 @@ fn save(app: &tauri::AppHandle, data: &StoreData) -> Result<(), String> {
     Ok(())
 }
 
-pub fn append_history(app: &tauri::AppHandle, record: ImportRecord) -> Result<(), String> {
+/// Append a run to history, advancing the incremental checkpoint only when the
+/// caller certifies this run earned it.
+///
+/// `checkpoint_eligible` is decided by `classify_completed_run`, which sees the
+/// run's full tallies (landed assets, per-file errors, aggregate scan errors).
+/// It is passed in rather than re-derived from the record because status +
+/// `errors` alone cannot express it: a run that read nothing at all — an empty
+/// card, filters that excluded every file, or a source immich-go could not
+/// enumerate — is legitimately `completed` with `errors == 0`, yet must NOT raise
+/// the date floor, or the next "only new" import silently skips media whose
+/// capture date predates this run.
+pub fn append_history(
+    app: &tauri::AppHandle,
+    record: ImportRecord,
+    checkpoint_eligible: bool,
+) -> Result<(), String> {
     let _guard = lock_store();
 
     let mut data = load(app)?;
-    // Only a clean, complete import advances the incremental checkpoint. Failed,
-    // cancelled, or error-bearing runs must NOT raise the date floor, or a later
-    // "only new" import would silently skip files that never actually landed
-    // (especially under the new default --on-errors=continue, where a partial
-    // run is still marked completed).
-    if record.status == "completed" && record.errors == 0 {
+    if checkpoint_eligible {
         data.sources.insert(
             checkpoint_key(&record.profile_id, &record.source_paths),
             SourceMeta {

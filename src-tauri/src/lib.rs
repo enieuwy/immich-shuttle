@@ -1,6 +1,7 @@
 use std::{fs, path::Path, time::Duration};
 
 use fs4::fs_std::FileExt;
+use tauri::Manager;
 use uuid::Uuid;
 
 // A cross-process ownership lease is the thorough long-term fix. Until then,
@@ -148,6 +149,32 @@ mod services;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // MUST stay the first plugin: it decides whether this process is the
+        // owner or a duplicate launch before any other setup runs.
+        //
+        // Import admission, the profile/history stores, and run-log rotation are
+        // all process-local (JOBS/RUNNING_IMPORTS, CONFIG_LOCK/STORE_LOCK,
+        // retention by mtime). A second instance would therefore admit a
+        // concurrent import of the same card, clobber the other's profile and
+        // history writes, and rotate away a live run log. One instance per
+        // machine is the invariant those subsystems already assume; enforce it
+        // here rather than retrofitting cross-process leases onto each of them.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // A duplicate launch is a request to reach the running window.
+            let _ = crate::services::logs::append_log(
+                "app.log",
+                "duplicate_launch_rejected focusing_existing_window",
+            );
+            // macOS: makeKeyAndOrderFront alone does not bring a background app
+            // forward, so unhide the application before raising its window.
+            #[cfg(target_os = "macos")]
+            let _ = app.show();
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())

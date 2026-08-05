@@ -23,6 +23,10 @@ pub struct RunProgress {
     /// Local filesystem paths of files uploaded successfully (safe-to-wipe
     /// candidates, re-verified against the server by SHA-1 before deletion).
     pub completed_paths: Vec<String>,
+    /// Aggregate (non per-file) error events, i.e. ERR lines carrying no `file=`.
+    /// A source immich-go could not enumerate shows up here and nowhere else, so
+    /// this is what tells a "nothing was even read" run apart from a clean one.
+    pub scan_errors: u32,
 }
 
 /// Extract the value of a space-delimited `key=` attribute from a console-slog
@@ -69,7 +73,14 @@ fn error_message(line: &str) -> Option<String> {
 /// to it and `name` is the path within. Match the known roots first because a
 /// POSIX source path may itself contain a colon. Without source roots, retain
 /// the legacy separator heuristic; on Windows it skips a leading drive colon.
-fn fs_path_from_file_attr(file: &str, source_paths: &[String]) -> String {
+///
+/// Returns `None` when source roots are known but the value matches none of
+/// them. The run log is not a trusted channel: console-slog writes attribute
+/// values unescaped, so a filename containing a newline on untrusted media can
+/// forge additional log records with an arbitrary `file=`. A value that does not
+/// carry a known `<fsRoot>:` prefix did not come from the scan, so it is not a
+/// real asset path and must not be collected as a wipe candidate.
+fn fs_path_from_file_attr(file: &str, source_paths: &[String]) -> Option<String> {
     if let Some((root, name)) = source_paths
         .iter()
         .filter_map(|root| {
@@ -81,7 +92,15 @@ fn fs_path_from_file_attr(file: &str, source_paths: &[String]) -> String {
         .max_by_key(|(root, _)| root.len())
     {
         let separator = if root.ends_with(['/', '\\']) { "" } else { "/" };
-        return format!("{root}{separator}{name}");
+        return Some(format!("{root}{separator}{name}"));
+    }
+
+    // A staged (selected) import runs immich-go against a temp symlink dir, so
+    // its logged roots legitimately differ from the user's source paths. Those
+    // runs discard the parsed paths (the originals are wiped instead), so the
+    // strict branch only needs to hold when roots are actually comparable.
+    if !source_paths.is_empty() {
+        return None;
     }
 
     let search_from = if is_windows_drive_prefix(file) { 2 } else { 0 };
@@ -90,10 +109,10 @@ fn fs_path_from_file_attr(file: &str, source_paths: &[String]) -> String {
         let root = &file[..idx];
         let name = &file[idx + 1..];
         if !root.is_empty() && !name.is_empty() {
-            return format!("{root}/{name}");
+            return Some(format!("{root}/{name}"));
         }
     }
-    file.to_string()
+    Some(file.to_string())
 }
 
 /// Whether `s` begins with a Windows drive prefix like `C:\` or `C:/`.
@@ -152,6 +171,8 @@ pub struct ProgressAccumulator {
     /// Number of distinct failed paths tracked, capped at
     /// `MAX_TRACKED_ERROR_PATHS`.
     errors: u32,
+    /// Aggregate error events with no `file=` (e.g. an unreadable source root).
+    scan_errors: u32,
     /// A trailing line not yet terminated by '\n'; reparsed once its rest arrives.
     pending: String,
     source_paths: Vec<String>,
@@ -208,19 +229,30 @@ impl ProgressAccumulator {
         RunProgress {
             progress,
             completed_paths: self.completed_paths.clone(),
+            scan_errors: self.scan_errors,
         }
     }
 
     fn apply_line(&mut self, line: &str) {
         if is_error_line(line) {
-            if let Some(file) = attr_value(line, "file", &["error", "reason", "discovered_at"])
+            match attr_value(line, "file", &["error", "reason", "discovered_at"])
                 .filter(|f| !f.is_empty())
             {
-                if self.failed_paths.len() < MAX_TRACKED_ERROR_PATHS
-                    && self.failed_paths.insert(file)
-                {
-                    self.errors = self.errors.saturating_add(1);
+                Some(file) => {
+                    if self.failed_paths.len() < MAX_TRACKED_ERROR_PATHS
+                        && self.failed_paths.insert(file)
+                    {
+                        self.errors = self.errors.saturating_add(1);
+                    }
                 }
+                // An ERR line with no `file=` is not a per-file upload failure but
+                // an aggregate one — most importantly a source immich-go could not
+                // enumerate ("ERR @/Volumes/CARD: file does not exist"). Those used
+                // to be dropped entirely, which let a run that never read a source
+                // finish "clean" and advance the only-new checkpoint past media it
+                // never saw. Tracked separately so it can gate the checkpoint
+                // without inflating the per-file error count shown in the UI.
+                None => self.scan_errors = self.scan_errors.saturating_add(1),
             }
             return;
         }
@@ -229,18 +261,25 @@ impl ProgressAccumulator {
         };
         if message.starts_with("uploaded successfully") {
             if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
-                let path = fs_path_from_file_attr(&file, &self.source_paths);
-                if self.seen_paths.insert(path.clone()) {
-                    self.completed_paths.push(path);
+                // Dedupe on the logged value, not the resolved path: the counters
+                // must stay correct even for a run whose paths do not resolve
+                // (a staged import logs the temp dir, not the source root).
+                if self.seen_paths.insert(file.clone()) {
                     self.uploaded = self.uploaded.saturating_add(1);
+                    // Only a path that resolves under a known root may become a
+                    // wipe candidate; see fs_path_from_file_attr.
+                    if let Some(path) = fs_path_from_file_attr(&file, &self.source_paths) {
+                        self.completed_paths.push(path);
+                    }
                 }
             }
         } else if message.starts_with("server has duplicate") {
             self.duplicates = self.duplicates.saturating_add(1);
             if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
-                let path = fs_path_from_file_attr(&file, &self.source_paths);
-                if self.seen_paths.insert(path.clone()) {
-                    self.completed_paths.push(path);
+                if self.seen_paths.insert(file.clone()) {
+                    if let Some(path) = fs_path_from_file_attr(&file, &self.source_paths) {
+                        self.completed_paths.push(path);
+                    }
                 }
             }
         } else if message.starts_with("discovered image") || message.starts_with("discovered video")
@@ -278,7 +317,11 @@ pub fn parse_error_log(contents: &str, source_paths: &[String]) -> Vec<FileError
             continue;
         }
         let file = match attr_value(line, "file", &["error", "reason", "discovered_at"]) {
-            Some(f) if !f.is_empty() => fs_path_from_file_attr(&f, source_paths),
+            // Display only — nothing is deleted from this list, so an unresolvable
+            // value still tells the user which file the server rejected.
+            Some(f) if !f.is_empty() => {
+                fs_path_from_file_attr(&f, source_paths).unwrap_or_else(|| f.clone())
+            }
             _ => continue,
         };
         if !seen.insert(file.clone()) {
@@ -431,12 +474,59 @@ mod tests {
         assert_eq!(errors[0].reason, "asset never reached final state");
     }
 
+    /// Aggregate scan errors stay out of the per-file error list and count (that
+    /// list drives the UI's "these files failed" view), but they must still be
+    /// counted as scan errors so the run cannot pass as fully imported.
     #[test]
-    fn excludes_directory_scan_errors_without_file() {
+    fn directory_scan_errors_are_tracked_separately_from_file_errors() {
         let log = "2026-06-24 16:09:14 ERR @tmp: file does not exist\n\
 2026-06-24 16:09:14 ERR PRIVATE/AVCHD/BDMV/STREAM: file does not exist";
         assert!(parse_error_log(log, &[]).is_empty());
-        assert_eq!(parse_run_progress(log, &[]).progress.errors, 0);
+        let run = parse_run_progress(log, &[]);
+        assert_eq!(run.progress.errors, 0, "not per-file failures");
+        assert_eq!(run.scan_errors, 2, "but the source could not be read");
+    }
+
+    /// immich-go's console-slog handler writes `file=` values unescaped, so a
+    /// filename or directory containing a newline on untrusted media forges a
+    /// complete extra log record. Such a value cannot carry a known `<root>:`
+    /// prefix, so it must never become a wipe candidate — deletion candidates come
+    /// from the scanned source, not from arbitrary text in the log.
+    #[test]
+    fn forged_log_records_do_not_become_wipe_candidates() {
+        let root = "/Volumes/CARD";
+        // The attacker-controlled directory name ends with a newline, so line two
+        // is a syntactically perfect "uploaded" record for an unrelated path.
+        let log =
+            "2026-06-24 16:10:00 INF uploaded successfully file=/Volumes/CARD:DCIM/real.jpg\n\
+2026-06-24 16:10:00 INF uploaded successfully file=/Users/victim/Pictures/target.jpg";
+        let run = parse_run_progress(log, &[root.to_string()]);
+
+        assert_eq!(
+            run.completed_paths,
+            vec!["/Volumes/CARD/DCIM/real.jpg"],
+            "only the path under the scanned root may be deletable"
+        );
+        assert_eq!(
+            run.progress.uploaded, 2,
+            "progress still reflects both logged events"
+        );
+    }
+
+    /// A staged (selected) import points immich-go at a temp symlink dir, so its
+    /// logged root legitimately differs from the user's source paths. Those runs
+    /// wipe the originals instead, but their progress counters must stay correct.
+    #[test]
+    fn unresolvable_paths_still_count_toward_progress() {
+        let log = "2026-06-24 16:10:00 INF uploaded successfully file=/tmp/immich-shuttle-stage-1:IMG_0001.JPG\n\
+2026-06-24 16:10:01 INF server has duplicate file=/tmp/immich-shuttle-stage-1:IMG_0002.JPG";
+        let run = parse_run_progress(log, &["/Volumes/CARD".to_string()]);
+        assert_eq!(run.progress.uploaded, 1);
+        assert_eq!(run.progress.duplicates, 1);
+        assert!(
+            run.completed_paths.is_empty(),
+            "staged paths resolve to no source root and are supplied separately"
+        );
     }
 
     #[test]
