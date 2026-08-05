@@ -80,11 +80,16 @@ test('logs dialog shows recent activity', async ({ page }) => {
 test('parallel uploads input validates its range', async ({ page }) => {
   await page.goto('/?scenario=default');
 
-  const input = page.getByRole('spinbutton', { name: /Parallel uploads/ });
+  // Durable preferences moved off the main screen into the Import defaults
+  // modal, so the control has to be opened before it can be exercised.
+  await page.getByRole('button', { name: 'Import defaults' }).click();
+  const dialog = page.getByRole('dialog');
+
+  const input = dialog.getByRole('spinbutton', { name: /Parallel uploads/ });
   await input.fill('69');
-  await expect(page.getByText(/between 1 and 20/)).toBeVisible();
+  await expect(dialog.getByText(/between 1 and 20/)).toBeVisible();
   await input.fill('6');
-  await expect(page.getByText(/between 1 and 20/)).toHaveCount(0);
+  await expect(dialog.getByText(/between 1 and 20/)).toHaveCount(0);
 
   await captureScenario(page, 'concurrency');
 });
