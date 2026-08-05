@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.6.0 - 2026-08-05
 
 ### UI
 - **Cmd/Ctrl-K command palette.** A global shortcut opens a searchable palette to jump between Queue/History, start an import, open logs, manage or edit profiles, and cycle the theme — no mouse hunting for the right control.
@@ -25,6 +25,9 @@
 
 ### Safety
 - **One app instance per machine.** Launching the app again now focuses the running window instead of starting a second copy. Import admission, the profile/history stores, and log rotation are all per-process, so two instances could import and wipe the same card at once, overwrite each other's profiles and history, and delete a live run log.
+
+### Maintenance
+- **Dependency bumps**: svelte 5.56.8, @playwright/test 1.62.1, @internationalized/date 3.12.3, keyring 4.1.6, plus postcss 8.5.25 and undici 7.29.0 to clear two high-severity advisories in build tooling (nothing shipped in the bundle was affected).
 
 ## v0.5.0 - 2026-07-23
 
