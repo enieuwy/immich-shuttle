@@ -82,6 +82,34 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: ${{ github.ref_name }}
+          # Each matrix job uploads into the SAME draft. It has to stay a draft
+          # until every platform is in: the jobs finish minutes apart, so
+          # publishing here would expose a release carrying only whichever
+          # platform happened to finish first. The publish job below opens it.
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }}
+
+  # Publishes the finished release. `needs` waits for every matrix combination
+  # and only runs when all of them succeeded, so a failed platform leaves the
+  # release as a draft instead of shipping an incomplete one.
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Notes come from this tag's CHANGELOG section. The script exits
+          # non-zero when that section is missing, so the release stays a draft
+          # rather than going out with an empty body (how v0.5.0 shipped).
+          ./scripts/changelog-notes.sh "$TAG" > "$RUNNER_TEMP/release-notes.md"
+          gh release edit "$TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --draft=false
