@@ -41,6 +41,15 @@ const loads = createGeneration();
 
 export const historyState = {
   subscribe: state.subscribe,
+  /**
+   * Signal that a completed run was recorded and may have advanced its
+   * per-source checkpoint. Source consumers key their async reads on this
+   * version; without the bump, the card can keep showing the checkpoint from
+   * before the just-finished run.
+   */
+  noteImportRecorded() {
+    state.update((s) => ({ ...s, lastImportVersion: s.lastImportVersion + 1 }));
+  },
   async loadHistory() {
     const isCurrent = loads.begin();
     state.update((s) => ({ ...s, loading: true, error: null }));

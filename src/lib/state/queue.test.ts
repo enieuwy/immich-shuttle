@@ -40,6 +40,8 @@ vi.mock("$lib/api", () => ({
   albumsList: vi.fn(async () => [{ id: "a1", album_name: "Trip", shared_with: [] }]),
   usersList: vi.fn(async () => []),
   historySourceLastImport: vi.fn(async () => null),
+  historyList: vi.fn(async () => []),
+  historyClear: vi.fn(async () => undefined),
 }));
 
 import * as api from "$lib/api";
@@ -47,6 +49,7 @@ import { queueState, selectNewlyTerminal } from "./queue";
 import { profilesState } from "./profiles";
 import { sourceState } from "./source";
 import { albumsState } from "./albums";
+import { historyState } from "./history";
 import { errorsState } from "./errors";
 import { importOptionsState } from "./import-options";
 import { get } from "svelte/store";
@@ -519,6 +522,37 @@ describe("queueState", () => {
     await stale;
 
     expect(get(queueState).jobs).toEqual([completedFresh]);
+  });
+
+  it("bumps the source checkpoint version only on a completed transition", async () => {
+    const running: ImportJob = {
+      id: "job-checkpoint",
+      status: "running",
+      progress: { total: 4, uploaded: 1, duplicates: 0, errors: 0 },
+      awaiting_wipe_confirmation: false,
+      pending_wipe_count: 0,
+      file_errors: [],
+      profile_id: "p1",
+    };
+    const completed: ImportJob = {
+      ...running,
+      status: "completed",
+      progress: { total: 4, uploaded: 4, duplicates: 0, errors: 0 },
+      error: null,
+      summary: "Imported 4 items.",
+    };
+
+    vi.mocked(api.importListJobs).mockResolvedValueOnce([running]);
+    await queueState.loadJobs();
+    const before = get(historyState).lastImportVersion;
+
+    vi.mocked(api.importListJobs).mockResolvedValueOnce([completed]);
+    await queueState.loadJobs();
+    expect(get(historyState).lastImportVersion).toBe(before + 1);
+
+    vi.mocked(api.importListJobs).mockResolvedValueOnce([completed]);
+    await queueState.loadJobs();
+    expect(get(historyState).lastImportVersion).toBe(before + 1);
   });
 
   it("a failing cancelImport reports through errorsState and resolves rather than rejecting", async () => {

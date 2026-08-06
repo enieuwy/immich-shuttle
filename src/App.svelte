@@ -25,6 +25,7 @@
   import { activeProfile, getProfilesSnapshot, profilesState } from "$lib/state/profiles";
   import { albumsState } from "$lib/state/albums";
   import type { Profile } from "$lib/types";
+  import { importAwaitTerminal, importCancel } from "$lib/api";
   import { queueState } from "$lib/state/queue";
   import { selectionState } from "$lib/state/selection";
   import { sourceState } from "$lib/state/source";
@@ -68,6 +69,10 @@
     isDateRangeInvalid($importOptionsState.dateFrom, $importOptionsState.dateTo),
   );
 
+  // The queue snapshot is refreshed only after importStart resolves, so the
+  // backend may have admitted a worker while the store still appears idle.
+  const pendingImportStarts = new Set<Promise<void>>();
+
 
   async function startImport() {
     importError = "";
@@ -77,13 +82,17 @@
     }
 
     const selection = selectedPaths;
+    const pendingStart = queueState.startImport(
+      selection.length > 0 ? { selectFiles: selection } : {},
+    );
+    pendingImportStarts.add(pendingStart);
     try {
-      await queueState.startImport(
-        selection.length > 0 ? { selectFiles: selection } : {},
-      );
+      await pendingStart;
       selectionState.clear();
     } catch (error) {
       importError = error instanceof Error ? error.message : String(error);
+    } finally {
+      pendingImportStarts.delete(pendingStart);
     }
   }
 
@@ -144,6 +153,9 @@
     let unlistenClose: (() => void) | undefined;
     let allowCloseAfterCancel = false;
     let cancellingForClose = false;
+    // Cancellation publishes a terminal status before the worker exits; retain
+    // timed-out jobs so a retry cannot mistake that status for safe shutdown.
+    const shutdownPendingJobIds = new Set<string>();
 
 
     void profilesState.loadProfiles().then(() => {
@@ -164,8 +176,15 @@
           return;
         }
 
-        const runningJobs = $queueState.jobs.filter((job) => job.status === "running");
-        if (runningJobs.length === 0) {
+        const pendingStarts = [...pendingImportStarts];
+        const runningJobIds = $queueState.jobs
+          .filter((job) => job.status === "running")
+          .map((job) => job.id);
+        if (
+          runningJobIds.length === 0 &&
+          pendingStarts.length === 0 &&
+          shutdownPendingJobIds.size === 0
+        ) {
           return;
         }
         event.preventDefault();
@@ -179,22 +198,39 @@
         cancellingForClose = true;
 
         void (async () => {
-          let cancellationTimeout: ReturnType<typeof setTimeout> | undefined;
           try {
-            await Promise.race([
-              Promise.allSettled(runningJobs.map((job) => queueState.cancelImport(job.id))),
-              new Promise<void>((resolve) => {
-                cancellationTimeout = setTimeout(resolve, 5_000);
-              }),
-            ]);
+            // A pending start has no job id to cancel until startImport's
+            // post-admission refresh commits it to the queue snapshot.
+            await Promise.allSettled(pendingStarts);
+            const jobIdsToCancel = new Set(runningJobIds);
+            for (const job of $queueState.jobs) {
+              if (job.status === "running") jobIdsToCancel.add(job.id);
+            }
+            for (const jobId of jobIdsToCancel) shutdownPendingJobIds.add(jobId);
+            const cancellationResults = await Promise.allSettled(
+              [...jobIdsToCancel].map((jobId) => importCancel(jobId)),
+            );
+            const jobIdsToAwait = [...shutdownPendingJobIds];
+            const terminalResults = await Promise.allSettled(
+              jobIdsToAwait.map((jobId) => importAwaitTerminal(jobId, 30_000)),
+            );
+            const shutdownIncomplete =
+              cancellationResults.some((result) => result.status === "rejected") ||
+              terminalResults.some((result) => result.status === "rejected");
+            if (shutdownIncomplete) {
+              importError =
+                "The import is still shutting down. Keep this window open and retry quitting.";
+              return;
+            }
+
             allowCloseAfterCancel = true;
             await getCurrentWindow().close();
-          } catch (error) {
-            importError = error instanceof Error ? error.message : String(error);
+            for (const jobId of jobIdsToAwait) shutdownPendingJobIds.delete(jobId);
+          } catch {
+            allowCloseAfterCancel = false;
+            importError =
+              "The import is still shutting down. Keep this window open and retry quitting.";
           } finally {
-            if (cancellationTimeout !== undefined) {
-              clearTimeout(cancellationTimeout);
-            }
             cancellingForClose = false;
           }
         })();

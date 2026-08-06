@@ -1688,4 +1688,59 @@ mod tests {
 
         std::fs::remove_dir_all(&unapproved).unwrap();
     }
+
+    /// The whole point of `import_await_terminal`: a terminal STATUS is not a
+    /// terminal WORKER. `import_cancel` publishes `Cancelled` immediately while
+    /// the worker is still resolving a server, cleaning staging, or waiting for
+    /// the sidecar to die — and the close handler quits on this call returning.
+    /// Drop the `RUNNING_IMPORTS` half of the condition and this test fails,
+    /// which is exactly the bug that let the app exit mid-upload.
+    #[test]
+    fn await_terminal_holds_until_the_worker_is_gone_not_just_the_status() {
+        let job_id = format!("await-terminal-{}", Uuid::new_v4());
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+
+        // These are the same process-global maps the worker uses; recover from
+        // poisoning the way every other holder in this crate does rather than
+        // letting an unrelated failed test cascade into this one.
+        fn lock_jobs() -> std::sync::MutexGuard<'static, Vec<ImportJob>> {
+            JOBS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+        fn lock_running() -> std::sync::MutexGuard<'static, HashMap<String, Arc<AtomicBool>>> {
+            RUNNING_IMPORTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        {
+            let mut job = terminal_job(&job_id, false);
+            job.status = JobStatus::Cancelled;
+            lock_jobs().push(job);
+            lock_running().insert(job_id.clone(), cancel_flag);
+        }
+
+        // Status is already terminal, but the worker is still registered.
+        let err =
+            tauri::async_runtime::block_on(import_await_terminal(job_id.clone(), 150)).unwrap_err();
+        assert!(
+            err.contains("shutting down"),
+            "a live worker must keep the caller waiting, got: {err}"
+        );
+
+        // The worker deregisters itself on its way out; only then may we quit.
+        lock_running().remove(&job_id);
+        let job = tauri::async_runtime::block_on(import_await_terminal(job_id.clone(), 2_000))
+            .expect("a terminal job with no live worker must resolve");
+        assert!(matches!(job.status, JobStatus::Cancelled));
+
+        lock_jobs().retain(|j| j.id != job_id);
+    }
+
+    #[test]
+    fn await_terminal_reports_an_unknown_job() {
+        let err =
+            tauri::async_runtime::block_on(import_await_terminal("no-such-job".to_string(), 50))
+                .unwrap_err();
+        assert!(err.contains("no-such-job"), "got: {err}");
+    }
 }

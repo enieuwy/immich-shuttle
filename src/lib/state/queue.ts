@@ -17,6 +17,7 @@ import {
   importStart,
 } from "$lib/api";
 import { errorsState } from "$lib/state/errors";
+import { historyState } from "$lib/state/history";
 import type { ImportJob, ImportOrganization } from "$lib/types";
 
 import { importOptionsState, isDateRangeInvalid, toImmichDateRange } from "$lib/state/import-options";
@@ -150,9 +151,15 @@ export function selectNewlyTerminal(prev: ImportJob[], next: ImportJob[]): Impor
   });
 }
 
-async function fireTerminalNotifications(prev: ImportJob[], next: ImportJob[]) {
+async function handleTerminalTransitions(prev: ImportJob[], next: ImportJob[]) {
   const newlyTerminal = selectNewlyTerminal(prev, next);
   if (newlyTerminal.length === 0) return;
+  // The backend's stricter checkpoint eligibility inputs are not present on
+  // ImportJob, so completed is the closest visible gate. A completed run that
+  // did not earn a checkpoint only causes a harmless unchanged re-read.
+  if (newlyTerminal.some((job) => job.status === "completed")) {
+    historyState.noteImportRecorded();
+  }
   try {
     if (!(await ensureNotifyPermission())) return;
     for (const job of newlyTerminal) {
@@ -171,8 +178,8 @@ async function fireTerminalNotifications(prev: ImportJob[], next: ImportJob[]) {
 // settle, so a slow earlier poll can resolve after a faster later one. Without
 // this, the earlier snapshot would win on completion order and regress the
 // store — a completed/cancelled job flips back to running, live counts and
-// current-file entries reappear, and fireTerminalNotifications re-fires the
-// already-shown completion/failure notification on the stale "correction".
+// current-file entries reappear, and handleTerminalTransitions repeats the
+// already-applied completion side effects on the stale "correction".
 const refreshes = createGeneration();
 
 async function refreshJobs() {
@@ -215,7 +222,7 @@ async function refreshJobs() {
         error: null,
       };
     });
-    void fireTerminalNotifications(prev, jobs);
+    void handleTerminalTransitions(prev, jobs);
   } catch (error) {
     if (!isCurrent()) return;
     errorsState.addError("Could not refresh import queue.");

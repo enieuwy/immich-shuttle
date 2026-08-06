@@ -150,6 +150,20 @@ export const importOptionsState = {
     state.update((s) => ({ ...s, dateFrom: null, dateTo: null }));
   },
   /**
+   * Clear the replay-restorable filters surfaced beside Start Import. Durable
+   * extension exclusions and the visible per-source "only new" mode must
+   * survive because neither is an invisible History leftover.
+   */
+  clearImportFilters() {
+    state.update((s) => ({
+      ...s,
+      dateFrom: null,
+      dateTo: null,
+      mediaType: "all",
+      includeExtensions: [],
+    }));
+  },
+  /**
    * Repopulate every option from a persisted import request (History "Import
    * again"). Mirrors the request-building in queueState.startImport in reverse.
    */

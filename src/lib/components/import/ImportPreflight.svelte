@@ -1,6 +1,7 @@
 <script lang="ts">
   import { ServerCog } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
+  import ActiveFilters from "./ActiveFilters.svelte";
   import { importForecast, type ImportForecast } from "$lib/api";
   import { activeProfile } from "$lib/state/profiles";
   import { sourceState } from "$lib/state/source";
@@ -85,6 +86,7 @@
 </script>
 
 <div class="flex min-w-0 items-center gap-2">
+  <ActiveFilters />
   <Button variant="outline" size="sm" disabled={!canForecast} onclick={checkServer}>
     <ServerCog class="size-4" />
     {forecasting ? "Checking…" : "Check server"}
