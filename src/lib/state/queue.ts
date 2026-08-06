@@ -21,6 +21,7 @@ import type { ImportJob, ImportOrganization } from "$lib/types";
 
 import { importOptionsState, isDateRangeInvalid, toImmichDateRange } from "$lib/state/import-options";
 import { albumsState } from "$lib/state/albums";
+import { createGeneration } from "$lib/state/generation";
 import { activeProfile, profilesState } from "$lib/state/profiles";
 import { sourceState } from "$lib/state/source";
 
@@ -165,9 +166,20 @@ async function fireTerminalNotifications(prev: ImportJob[], next: ImportJob[]) {
   }
 }
 
+// Guards refreshJobs commits against out-of-order IPC completion: the 2s poll
+// interval fires `void refreshJobs()` without waiting for the previous call to
+// settle, so a slow earlier poll can resolve after a faster later one. Without
+// this, the earlier snapshot would win on completion order and regress the
+// store — a completed/cancelled job flips back to running, live counts and
+// current-file entries reappear, and fireTerminalNotifications re-fires the
+// already-shown completion/failure notification on the stale "correction".
+const refreshes = createGeneration();
+
 async function refreshJobs() {
+  const isCurrent = refreshes.begin();
   try {
     const polled = await importListJobs();
+    if (!isCurrent()) return;
     const runningIds = new Set(polled.filter((j) => j.status === "running").map((j) => j.id));
     // Capture the pre-update jobs synchronously (no await before state.update, so
     // no listener can interleave) to diff progress and detect terminal transitions.
@@ -205,6 +217,7 @@ async function refreshJobs() {
     });
     void fireTerminalNotifications(prev, jobs);
   } catch (error) {
+    if (!isCurrent()) return;
     errorsState.addError("Could not refresh import queue.");
     state.update((s) => ({ ...s, error: error instanceof Error ? error.message : String(error) }));
   }
@@ -303,11 +316,18 @@ export const queueState = {
       throw new Error("The start date must be on or before the end date.");
     }
 
-
+    // Album state is scoped to a profile (loadedProfileId). Switching the
+    // active profile and hitting Start before the albums store reloads must
+    // not carry the old profile's selection across: an album id/name that
+    // only exists on the previous server would otherwise silently create a
+    // stray album there, or worse, upload into someone else's album. Gate on
+    // loadedProfileId rather than depending on a sibling clear-on-switch to
+    // have already run.
+    const albumsUsable = albums.loadedProfileId === profile.id;
     // immich-go assigns albums by name (--into-album), single album per run. A
     // device rule can supply the name directly; otherwise resolve it from the
     // first selected album id.
-    const albumIds = overrides?.albumIds ?? albums.selectedAlbumIds;
+    const albumIds = overrides?.albumIds ?? (albumsUsable ? albums.selectedAlbumIds : []);
     const intoAlbum =
       overrides?.intoAlbum !== undefined
         ? overrides.intoAlbum
@@ -374,40 +394,45 @@ export const queueState = {
     });
     await refreshJobs();
   },
+  // cancelImport/retry/dismiss/clearFinished/confirmWipe below already report
+  // their failure once via errorsState.addError before reaching here — the
+  // user has been told. Re-throwing on top would leave every fire-and-forget
+  // caller (`void queueState.retry(...)`, etc. — there is no global
+  // unhandledrejection handler in the webview) with an unhandled rejection for
+  // a failure already surfaced, which tells the user nothing new and only
+  // pollutes the console. startImport is the exception: its throws are
+  // validation errors ("Select a profile...") the caller must react to and are
+  // never routed through errorsState, so it keeps throwing.
   async cancelImport(jobId: string) {
     try {
       await importCancel(jobId);
       await refreshJobs();
-    } catch (error) {
+    } catch {
       errorsState.addError("Could not cancel import.");
-      throw error;
     }
   },
   async retry(jobId: string) {
     try {
       await importRetry(jobId);
       await refreshJobs();
-    } catch (error) {
+    } catch {
       errorsState.addError("Could not retry import.");
-      throw error;
     }
   },
   async dismiss(jobId: string) {
     try {
       const jobs = await importDismiss(jobId);
       state.update((s) => ({ ...s, jobs }));
-    } catch (error) {
+    } catch {
       errorsState.addError("Could not dismiss job.");
-      throw error;
     }
   },
   async clearFinished() {
     try {
       const jobs = await importClearFinished();
       state.update((s) => ({ ...s, jobs }));
-    } catch (error) {
+    } catch {
       errorsState.addError("Could not clear finished jobs.");
-      throw error;
     }
   },
   async confirmWipe(jobId: string, proceed: boolean) {
@@ -417,7 +442,6 @@ export const queueState = {
     } catch (error) {
       errorsState.addError("Could not complete wipe confirmation.");
       state.update((s) => ({ ...s, error: error instanceof Error ? error.message : String(error) }));
-      throw error;
     }
   },
 };

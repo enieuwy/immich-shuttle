@@ -204,6 +204,7 @@ pub fn run() {
             commands::import::import_forecast,
             commands::import::import_confirm_wipe,
             commands::import::import_cancel,
+            commands::import::import_await_terminal,
             commands::import::import_list_jobs,
             commands::import::import_retry,
             commands::import::import_dismiss,

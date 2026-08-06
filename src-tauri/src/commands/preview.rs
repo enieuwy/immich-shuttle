@@ -4,6 +4,20 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// Highest preview session token cancelled by the frontend.
 static PREVIEW_CANCEL: std::sync::atomic::AtomicU64 = AtomicU64::new(0);
 
+/// True once `preview_cancel` has been called for `token`'s session (or a
+/// later one); `token == 0` means "untracked" and is never cancelled.
+///
+/// Checked once per chunk in the async loop *and* again inside each spawned
+/// blocking worker immediately before its decode: a worker can sit queued on
+/// the blocking pool long enough for the frontend to cancel mid-chunk, and a
+/// RAW/video decode or external renderer call is too expensive to let run for
+/// a viewport the user already scrolled past (f8a1de7d). The per-worker check
+/// bounds stale work to at most one already-started decode instead of a whole
+/// queued chunk.
+pub(crate) fn preview_session_cancelled(token: u64) -> bool {
+    token != 0 && token <= PREVIEW_CANCEL.load(Relaxed)
+}
+
 /// Generate (or fetch cached) thumbnails for a batch of files. The frontend grid
 /// calls this lazily for the tiles entering the viewport. Work runs on blocking
 /// threads, bounded to a small pool so a large card can't saturate the runtime.
@@ -15,7 +29,7 @@ pub async fn preview_thumbnails(
     let mut results = Vec::with_capacity(paths.len());
 
     for chunk in paths.chunks(8) {
-        if token != 0 && token <= PREVIEW_CANCEL.load(Relaxed) {
+        if preview_session_cancelled(token) {
             break;
         }
         let handles: Vec<_> = chunk
@@ -24,6 +38,16 @@ pub async fn preview_thumbnails(
             .map(|path| {
                 let fallback_path = path.clone();
                 let handle = tauri::async_runtime::spawn_blocking(move || {
+                    // Re-check right before the decode, not just once per
+                    // chunk at spawn time: see `preview_session_cancelled`.
+                    if preview_session_cancelled(token) {
+                        return ThumbResult {
+                            path,
+                            data_url: None,
+                            width: 0,
+                            height: 0,
+                        };
+                    }
                     // Only read files under a folder the user selected as a
                     // source; reject arbitrary paths from the IPC boundary.
                     if crate::services::source_guard::is_within_approved(&path) {
@@ -83,7 +107,7 @@ pub async fn preview_dates(paths: Vec<String>, token: u64) -> Result<Vec<Capture
     let mut results = Vec::with_capacity(paths.len());
 
     for chunk in paths.chunks(16) {
-        if token != 0 && token <= PREVIEW_CANCEL.load(Relaxed) {
+        if preview_session_cancelled(token) {
             break;
         }
         let handles: Vec<_> = chunk
@@ -91,13 +115,23 @@ pub async fn preview_dates(paths: Vec<String>, token: u64) -> Result<Vec<Capture
             .cloned()
             .map(|path| {
                 let fallback_path = path.clone();
-                let handle = tauri::async_runtime::spawn_blocking(move || CaptureDate {
-                    captured_at: if crate::services::source_guard::is_within_approved(&path) {
-                        capture_date(&path)
-                    } else {
-                        None
-                    },
-                    path,
+                let handle = tauri::async_runtime::spawn_blocking(move || {
+                    // Re-check right before the EXIF/mtime read: see
+                    // `preview_session_cancelled`.
+                    if preview_session_cancelled(token) {
+                        return CaptureDate {
+                            path,
+                            captured_at: None,
+                        };
+                    }
+                    CaptureDate {
+                        captured_at: if crate::services::source_guard::is_within_approved(&path) {
+                            capture_date(&path)
+                        } else {
+                            None
+                        },
+                        path,
+                    }
                 });
                 (fallback_path, handle)
             })
@@ -204,8 +238,17 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 mod tests {
     use super::*;
 
+    /// `PREVIEW_CANCEL` is a process-global watermark, so the tests that move it
+    /// cannot run concurrently: one test's `preview_cancel(42)` makes another's
+    /// "a newer session is unaffected" assertion fail. Serialize them, recovering
+    /// from poisoning so one failure does not cascade into the rest.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn cancelled_preview_token_stops_before_starting_a_chunk() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         PREVIEW_CANCEL.store(0, Relaxed);
 
         tauri::async_runtime::block_on(preview_cancel(42)).unwrap();
@@ -216,6 +259,35 @@ mod tests {
         .unwrap();
 
         assert!(results.is_empty());
+        PREVIEW_CANCEL.store(0, Relaxed);
+    }
+
+    #[test]
+    fn preview_session_cancelled_tracks_the_high_watermark() {
+        // Exercises exactly the check `preview_thumbnails`'/`preview_dates`'
+        // blocking closures run immediately before their expensive work
+        // (f8a1de7d): once `preview_cancel` records a token, that token and
+        // every earlier session read as cancelled, but a newer session does
+        // not — and an untracked token 0 is never cancelled.
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        PREVIEW_CANCEL.store(0, Relaxed);
+        assert!(!preview_session_cancelled(5));
+
+        tauri::async_runtime::block_on(preview_cancel(5)).unwrap();
+
+        assert!(preview_session_cancelled(5), "the cancelled session itself");
+        assert!(
+            preview_session_cancelled(3),
+            "an earlier session is also stale"
+        );
+        assert!(
+            !preview_session_cancelled(6),
+            "a newer session is unaffected"
+        );
+        assert!(!preview_session_cancelled(0), "token 0 means untracked");
+
         PREVIEW_CANCEL.store(0, Relaxed);
     }
 

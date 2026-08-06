@@ -32,9 +32,13 @@ static HTTP_NO_REDIRECT: LazyLock<Client> = LazyLock::new(|| {
 use crate::models::album::{Album, AlbumShareLink, AlbumUser};
 use crate::models::tag::Tag;
 
-/// JSON API responses are expected to be small. Bound reads so a malicious or
-/// misconfigured endpoint cannot make the app buffer an unbounded response.
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Bound JSON reads so a malicious or misconfigured endpoint cannot make the app
+/// buffer an unbounded response. The ceiling has to clear the largest legitimate
+/// list this client fetches: `GET /albums` and `GET /users` return one object per
+/// row including a nested owner, roughly a kilobyte each, so a 1 MiB cap failed
+/// outright somewhere past a thousand albums. 16 MiB keeps the guard meaningful
+/// while putting the limit far beyond any real library.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 async fn response_bytes_limited(
     mut response: Response,

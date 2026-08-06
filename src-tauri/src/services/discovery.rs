@@ -105,27 +105,42 @@ pub async fn discover_immich_servers() -> Vec<String> {
         if Instant::now() >= deadline {
             break;
         }
-        let mut handles = Vec::with_capacity(chunk.len());
-        for (addr, url) in chunk {
+        // `JoinSet` (not bare `tokio::spawn`) so that dropping this future — the
+        // caller closes the profile dialog, switches screens, or kicks off a new
+        // scan — aborts every still-running probe in this chunk instead of
+        // leaking up to `SCAN_CONCURRENCY` detached TCP connects/HTTP requests
+        // that keep running to completion in the background.
+        let mut set = tokio::task::JoinSet::new();
+        for (index, (addr, url)) in chunk.iter().enumerate() {
             let addr = *addr;
             let url = url.clone();
-            handles.push(tokio::spawn(async move {
-                if tcp_open(addr).await
+            set.spawn(async move {
+                let found = if tcp_open(addr).await
                     && matches!(
                         timeout(PROBE_TIMEOUT, probe_is_immich(&url)).await,
                         Ok(true)
-                    )
-                {
+                    ) {
                     Some((addr.ip(), url))
                 } else {
                     None
-                }
-            }));
+                };
+                (index, found)
+            });
         }
-        // Await in submission order so the preferred port (listed first per host)
-        // is the one that claims the host in the dedupe set.
-        for handle in handles {
-            if let Ok(Some((ip, url))) = handle.await {
+        // `JoinSet::join_next` yields in completion order, not submission order,
+        // so collect every result first and sort by the submission index before
+        // folding into `found_hosts` — the preferred port (listed first per host
+        // by `host_targets`) must be the one that claims the host in the dedupe
+        // set, regardless of which probe happens to finish first.
+        let mut results = Vec::with_capacity(chunk.len());
+        while let Some(joined) = set.join_next().await {
+            if let Ok(result) = joined {
+                results.push(result);
+            }
+        }
+        results.sort_by_key(|(index, _)| *index);
+        for (_, found) in results {
+            if let Some((ip, url)) = found {
                 if found_hosts.insert(ip) {
                     confirmed.push(url);
                 }

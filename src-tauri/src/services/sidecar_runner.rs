@@ -40,6 +40,12 @@ pub struct UploadRequest {
     pub api_key: String,
     pub source_path: String,
     pub log_path: PathBuf,
+    /// Paths immich-go is actually invoked against for this run — the temp
+    /// staging directory for a hand-picked (staged) import, otherwise the
+    /// user's source paths. Threaded into `ProgressAccumulator` so run-log
+    /// `file=` values are only trusted (and tallied) when they resolve under
+    /// one of these roots; see `fs_path_from_file_attr` in stdout_parser.rs.
+    pub log_source_roots: Vec<String>,
     pub device_uuid: String,
     pub cancel_flag: Arc<AtomicBool>,
     pub stack_raw_jpeg: bool,
@@ -157,12 +163,12 @@ struct ProgressReader {
 }
 
 impl ProgressReader {
-    fn new(log_path: PathBuf) -> Self {
+    fn new(log_path: PathBuf, log_source_roots: Vec<String>) -> Self {
         Self {
             log_path,
             offset: 0,
             carry: Vec::new(),
-            acc: ProgressAccumulator::new(),
+            acc: ProgressAccumulator::with_source_paths(&log_source_roots),
         }
     }
 
@@ -395,7 +401,8 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
     // line-flushes through the pipe, so progress is polled from the run log
     // (append-only, written in real time) on a fixed cadence instead. The reader
     // parses only newly-appended bytes each tick.
-    let mut progress = ProgressReader::new(request.log_path.clone());
+    let mut progress =
+        ProgressReader::new(request.log_path.clone(), request.log_source_roots.clone());
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -472,6 +479,7 @@ mod tests {
             api_key: "secret".to_string(),
             source_path: "/src".to_string(),
             log_path: PathBuf::from("/logs/run.log"),
+            log_source_roots: vec!["/src".to_string()],
             device_uuid: "dev".to_string(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             stack_raw_jpeg: false,

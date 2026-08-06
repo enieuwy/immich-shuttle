@@ -148,9 +148,11 @@
                     variant="ghost"
                     size="sm"
                     class="ml-auto h-6 gap-1 px-2 text-xs"
+                    disabled={$historyState.replaying}
                     onclick={() => importAgain(record)}
                   >
-                    <RotateCcw class="size-3.5" /> Import again
+                    <RotateCcw class="size-3.5" />
+                    {$historyState.replayingRecordId === record.id ? "Importing…" : "Import again"}
                   </Button>
                 {/if}
               </div>

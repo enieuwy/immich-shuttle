@@ -125,7 +125,17 @@
     if (!newAlbumName.trim()) {
       return;
     }
-    await albumsState.createAlbum(newAlbumName.trim(), selectedShareUserIds, createPublicLink, shareRole);
+    // createAlbum no longer throws on a reported failure (it already toasted via
+    // errorsState) — an undefined return covers that, the single-flight guard,
+    // and a profile switch racing the create. Any of those keeps the dialog
+    // open with the form intact so the user can see what happened and retry.
+    const created = await albumsState.createAlbum(
+      newAlbumName.trim(),
+      selectedShareUserIds,
+      createPublicLink,
+      shareRole,
+    );
+    if (!created) return;
     newAlbumName = "";
     selectedShareUserIds = [];
     shareRole = "viewer";
@@ -446,7 +456,9 @@
           <span class="text-sm font-medium leading-none text-foreground">Create public link</span>
         </label>
 
-        <Button onclick={createAlbum} class="w-full">Create album</Button>
+        <Button onclick={createAlbum} class="w-full" disabled={$albumsState.creating}>
+          {$albumsState.creating ? "Creating…" : "Create album"}
+        </Button>
       </div>
     </DialogContent>
   </Dialog>

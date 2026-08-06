@@ -49,6 +49,14 @@ export const selectionState = {
     });
   },
 
+  /** Drop every selected path not present in `paths`; used when the set of
+   *  scannable files shrinks (e.g. a source is removed) so a hidden
+   *  selection can never reference a file outside the current sources. */
+  retainPaths(paths: Iterable<string>): void {
+    const keep = new Set(paths);
+    state.update((s) => ({ selected: new Set([...s.selected].filter((p) => keep.has(p))) }));
+  },
+
   /** Toggle each path within `paths` — i.e. invert selection over a subset
    *  (the currently visible/filtered files), leaving the rest untouched. */
   invert(paths: string[]): void {

@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 
+import * as api from "$lib/api";
+import { errorsState } from "$lib/state/errors";
+import type { Profile } from "$lib/types";
+
 vi.mock("$lib/api", () => ({
   profilesList: vi.fn(async () => [
     {
@@ -27,7 +31,7 @@ vi.mock("$lib/api", () => ({
   })),
 }));
 
-import { activeProfile, profilesState } from "./profiles";
+import { activeProfile, getProfilesSnapshot, profilesState } from "./profiles";
 
 describe("profilesState", () => {
   it("loads profiles and sets first active profile", async () => {
@@ -64,5 +68,78 @@ describe("profilesState", () => {
     });
     await profilesState.deleteProfile("only");
     expect(get(activeProfile)?.id).not.toBe("only");
+  });
+
+  it("does not resurrect a profile deleted while an older load is still in flight", async () => {
+    await profilesState.saveProfile({
+      id: "del-me",
+      server_url: "https://del.example.com",
+      display_name: "Delete Me",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+
+    // Gate this load so it resolves AFTER the delete below, simulating a read
+    // issued before the mutation that completes after it.
+    const gate = Promise.withResolvers<Profile[]>();
+    vi.mocked(api.profilesList).mockReturnValueOnce(gate.promise);
+    const stale = profilesState.loadProfiles();
+
+    await profilesState.deleteProfile("del-me");
+
+    // Stale response still contains the now-deleted profile — it must not win.
+    gate.resolve([
+      {
+        id: "del-me",
+        display_name: "Delete Me",
+        server_url: "https://del.example.com",
+        lan_server_url: null,
+        wan_server_url: null,
+      },
+    ]);
+    await stale;
+
+    expect(getProfilesSnapshot().profiles.some((p) => p.id === "del-me")).toBe(false);
+  });
+
+  it("does not drop a profile saved while an older load is still in flight, nor move active off it", async () => {
+    const gate = Promise.withResolvers<Profile[]>();
+    vi.mocked(api.profilesList).mockReturnValueOnce(gate.promise);
+    const stale = profilesState.loadProfiles();
+
+    const saved = await profilesState.saveProfile({
+      id: "save-me",
+      server_url: "https://save.example.com",
+      display_name: "Save Me",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+
+    // Stale response predates the save — it must not erase it or the active id.
+    gate.resolve([
+      {
+        id: "other",
+        display_name: "Other",
+        server_url: "https://other.example.com",
+        lan_server_url: null,
+        wan_server_url: null,
+      },
+    ]);
+    await stale;
+
+    const snapshot = getProfilesSnapshot();
+    expect(snapshot.profiles.some((p) => p.id === saved.id)).toBe(true);
+    expect(snapshot.activeProfileId).toBe(saved.id);
+  });
+
+  it("reports a failed load through errorsState and resolves instead of rejecting", async () => {
+    vi.mocked(api.profilesList).mockRejectedValueOnce(new Error("network down"));
+
+    await expect(profilesState.loadProfiles()).resolves.toBeUndefined();
+
+    expect(get(errorsState).some((e) => e.message === "Could not load profiles.")).toBe(true);
+    expect(getProfilesSnapshot().error).toBe("network down");
   });
 });

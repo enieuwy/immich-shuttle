@@ -142,6 +142,13 @@ export interface ScanSummary {
 
 /** Payload of each `scan-progress` event: an incremental batch plus cumulative totals. */
 export interface ScanProgress {
+  /**
+   * Which scan produced this batch. The event channel is shared across every
+   * scan, and cancellation is not an emit barrier, so a batch already in flight
+   * when the next scan starts is delivered to the new listener too. Consumers
+   * must drop any batch whose id is not their own.
+   */
+  scan_id: string;
   files: MediaFile[];
   photo_count: number;
   video_count: number;

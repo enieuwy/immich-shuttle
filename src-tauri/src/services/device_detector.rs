@@ -1,4 +1,10 @@
-use std::{path::Path, sync::mpsc, thread, time::Duration};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{mpsc, LazyLock, Mutex},
+    thread,
+    time::Duration,
+};
 
 use sysinfo::Disks;
 use tauri::{AppHandle, Emitter};
@@ -20,12 +26,69 @@ fn run_probe_with_timeout(
     receiver.recv_timeout(timeout).unwrap_or(false)
 }
 
+/// Mount paths with a probe thread currently running. Keyed so that a mount whose
+/// filesystem stat never returns (sleeping USB drive, dead SMB/NFS mount) can own at most
+/// one probe thread for the lifetime of the process, instead of accumulating a new
+/// permanently-blocked thread on every 2s `start_polling` tick.
+static IN_FLIGHT_PROBES: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Clears `key` from `IN_FLIGHT_PROBES` once the probe thread that registered it returns
+/// (normally or via panic). Moved into the probe thread's closure so cleanup happens
+/// whenever that thread actually finishes, however long that takes — not when the caller's
+/// `recv_timeout` gives up on it.
+struct InFlightProbeGuard {
+    key: String,
+}
+
+impl Drop for InFlightProbeGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT_PROBES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+    }
+}
+
+/// Runs `probe` for `key` through `run_probe_with_timeout`, unless a probe for `key` is
+/// already outstanding — in which case this returns `false` immediately without spawning a
+/// thread. A mount that hasn't answered a filesystem stat within `timeout` isn't a usable
+/// card, so "no DCIM" is the correct fail-safe answer here and it's exactly what a timed-out
+/// probe already returns. A mount that keeps answering is probed again on every call once
+/// its previous probe thread has cleared the in-flight entry.
+fn probe_mount_if_not_in_flight(
+    key: &str,
+    probe: impl FnOnce() -> bool + Send + 'static,
+    timeout: Duration,
+) -> bool {
+    let mut in_flight = IN_FLIGHT_PROBES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !in_flight.insert(key.to_string()) {
+        return false;
+    }
+    drop(in_flight);
+
+    let guard = InFlightProbeGuard {
+        key: key.to_string(),
+    };
+    run_probe_with_timeout(
+        move || {
+            let _guard = guard;
+            probe()
+        },
+        timeout,
+    )
+}
+
 fn has_dcim(mount: &str) -> bool {
     let dcim_path = Path::new(mount).join("DCIM");
 
-    // A filesystem stat can hang on an unavailable network or removable mount.
-    // Its JoinHandle is intentionally dropped so stalled probes cannot delay other devices.
-    run_probe_with_timeout(move || dcim_path.is_dir(), DCIM_PROBE_TIMEOUT)
+    // At most one probe thread is ever outstanding per mount: if a probe for this mount is
+    // already in flight we report "no DCIM" immediately instead of stacking another thread,
+    // so a permanently hung mount (sleeping USB drive, dead SMB/NFS mount) costs one thread
+    // total rather than one per poll.
+    probe_mount_if_not_in_flight(mount, move || dcim_path.is_dir(), DCIM_PROBE_TIMEOUT)
 }
 fn should_include_mount(path: &str, removable: bool) -> bool {
     if removable {
@@ -98,6 +161,10 @@ pub fn start_polling(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use std::time::Instant;
 
     #[test]
@@ -113,5 +180,57 @@ mod tests {
 
         assert!(!result);
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn stalled_probe_suppresses_further_probes_of_the_same_mount() {
+        // A probe that increments `spawn_count` before blocking on `release_rx` lets us
+        // observe exactly how many probe threads were actually started, independent of how
+        // many times `probe_mount_if_not_in_flight` is called.
+        fn make_counting_probe(
+            spawn_count: Arc<AtomicUsize>,
+            release_rx: Arc<Mutex<mpsc::Receiver<()>>>,
+        ) -> impl FnOnce() -> bool {
+            move || {
+                spawn_count.fetch_add(1, Ordering::SeqCst);
+                let _ = release_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv();
+                true
+            }
+        }
+
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let key = "test-mount-stalled-probe";
+
+        // First call spawns a probe thread that blocks on `release_rx`; the 10ms timeout
+        // elapses long before it can answer, so the caller sees the fail-safe `false`.
+        let first = probe_mount_if_not_in_flight(
+            key,
+            make_counting_probe(Arc::clone(&spawn_count), Arc::clone(&release_rx)),
+            Duration::from_millis(10),
+        );
+        assert!(!first);
+
+        // Give the spawned thread time to register itself as in-flight before probing again.
+        thread::sleep(Duration::from_millis(50));
+
+        // Second call while the first probe is still outstanding must return the same
+        // fail-safe answer without spawning another worker thread.
+        let second = probe_mount_if_not_in_flight(
+            key,
+            make_counting_probe(Arc::clone(&spawn_count), Arc::clone(&release_rx)),
+            Duration::from_millis(10),
+        );
+        assert!(!second);
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
+
+        // Release the stalled probe so its thread exits and clears the in-flight entry —
+        // otherwise it leaks a permanently blocked thread into the rest of the suite.
+        let _ = release_tx.send(());
+        thread::sleep(Duration::from_millis(50));
     }
 }

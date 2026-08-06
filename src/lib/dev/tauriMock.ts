@@ -79,8 +79,11 @@ function handle(cmd: string, args: InvokeArgs): unknown {
       const sr = fixtures.scanResultForScenario(scenario);
       // Mirror the real streamed scan: emit the files as a `scan-progress`
       // batch (the UI accumulates the grid from events), then return the
-      // terminal summary the awaited command resolves with.
+      // terminal summary the awaited command resolves with. The batch must echo
+      // the caller's `scanId` — the store drops any event stamped with someone
+      // else's scan, so an unstamped batch renders an empty grid.
       emit("scan-progress", {
+        scan_id: (args?.scanId as string) ?? "",
         files: sr.files,
         photo_count: sr.photo_count,
         video_count: sr.video_count,

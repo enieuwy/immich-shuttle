@@ -47,6 +47,7 @@ import { queueState, selectNewlyTerminal } from "./queue";
 import { profilesState } from "./profiles";
 import { sourceState } from "./source";
 import { albumsState } from "./albums";
+import { errorsState } from "./errors";
 import { importOptionsState } from "./import-options";
 import { get } from "svelte/store";
 import type { ImportJob } from "$lib/types";
@@ -383,6 +384,43 @@ describe("queueState", () => {
     });
   });
 
+  it("does not import into another profile's album selection", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await albumsState.loadAlbums();
+    albumsState.selectAlbum("a1");
+
+    // Switch profiles: albumsState may synchronously clear on the switch (a
+    // sibling concern) or may not have reloaded yet — either way
+    // loadedProfileId no longer equals the new profile's id, so this is the
+    // hard gate startImport must enforce regardless of that timing.
+    await profilesState.saveProfile({
+      id: "p2",
+      display_name: "Family",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p2");
+
+    await queueState.startImport();
+
+    const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
+    expect(payload?.album_ids).toEqual([]);
+    expect(payload?.into_album).toBeNull();
+
+    profilesState.setActiveProfile("p1");
+  });
+
   it("does not revive a terminal job when a late progress event arrives", async () => {
     const completed: ImportJob = {
       id: "job-completed",
@@ -438,6 +476,57 @@ describe("queueState", () => {
     await Promise.resolve();
 
     expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+
+  it("out-of-order refresh: a newer poll snapshot wins over a stale, later-resolving older poll", async () => {
+    const older = Promise.withResolvers<ImportJob[]>();
+    const newer = Promise.withResolvers<ImportJob[]>();
+    vi.mocked(api.importListJobs).mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
+
+    const runningStale: ImportJob = {
+      id: "job-race",
+      status: "running",
+      progress: { total: 4, uploaded: 1, duplicates: 0, errors: 0 },
+      awaiting_wipe_confirmation: false,
+      pending_wipe_count: 0,
+      file_errors: [],
+      profile_id: "p1",
+    };
+    const completedFresh: ImportJob = {
+      id: "job-race",
+      status: "completed",
+      progress: { total: 4, uploaded: 4, duplicates: 0, errors: 0 },
+      error: null,
+      summary: "Imported 4 items.",
+      awaiting_wipe_confirmation: false,
+      pending_wipe_count: 0,
+      file_errors: [],
+      profile_id: "p1",
+    };
+
+    // The older poll (issued first) stalls; the newer poll (issued second)
+    // resolves first, as a slow IPC round-trip can cause in practice.
+    const stale = queueState.loadJobs();
+    const fresh = queueState.loadJobs();
+
+    newer.resolve([completedFresh]);
+    await fresh;
+    expect(get(queueState).jobs).toEqual([completedFresh]);
+
+    // The stale response finally arrives — without the generation guard this
+    // would regress the completed job back to running.
+    older.resolve([runningStale]);
+    await stale;
+
+    expect(get(queueState).jobs).toEqual([completedFresh]);
+  });
+
+  it("a failing cancelImport reports through errorsState and resolves rather than rejecting", async () => {
+    vi.mocked(api.importCancel).mockRejectedValueOnce(new Error("network down"));
+
+    await expect(queueState.cancelImport("job-x")).resolves.toBeUndefined();
+
+    expect(get(errorsState).some((e) => e.message === "Could not cancel import.")).toBe(true);
   });
 });
 

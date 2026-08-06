@@ -33,14 +33,24 @@ pub struct RunProgress {
 /// line. immich-go's console handler writes attribute values UNQUOTED (spaces
 /// and all), so a value runs from after `key=` until the next known attribute
 /// key or end of line.
+///
+/// Both the `key` marker itself and every `next_keys` marker are located by
+/// their RIGHTMOST occurrence on the line (`rfind`), not the first. immich-go
+/// appends attributes strictly after the value they follow, so the genuine
+/// marker for any key is always the LAST occurrence of ` <key>=` on the line —
+/// an earlier occurrence can only be a key-like substring embedded inside a
+/// preceding value (e.g. a filename legitimately containing ` error=` or
+/// ` reason=` on APFS/HFS+/ext4). Cutting at the first occurrence truncates
+/// such a value mid-path; cutting at the last keeps it whole and still strips
+/// only the real trailing attribute.
 fn attr_value(line: &str, key: &str, next_keys: &[&str]) -> Option<String> {
     let needle = format!(" {key}=");
-    let pos = line.find(&needle)?;
+    let pos = line.rfind(&needle)?;
     let rest = &line[pos + needle.len()..];
     let mut end = rest.len();
     for next in next_keys {
         let marker = format!(" {next}=");
-        if let Some(p) = rest.find(&marker) {
+        if let Some(p) = rest.rfind(&marker) {
             if p < end {
                 end = p;
             }
@@ -71,17 +81,20 @@ fn error_message(line: &str) -> Option<String> {
 /// immich-go (v0.32.0) logs files as `<fsRoot>:<name>` — e.g.
 /// `/Volumes/CANON:DCIM/IMG_0001.JPG` — where `fsRoot` is the source path passed
 /// to it and `name` is the path within. Match the known roots first because a
-/// POSIX source path may itself contain a colon. Without source roots, retain
-/// the legacy separator heuristic; on Windows it skips a leading drive colon.
+/// POSIX source path may itself contain a colon.
 ///
-/// Returns `None` when source roots are known but the value matches none of
-/// them. The run log is not a trusted channel: console-slog writes attribute
-/// values unescaped, so a filename containing a newline on untrusted media can
-/// forge additional log records with an arbitrary `file=`. A value that does not
-/// carry a known `<fsRoot>:` prefix did not come from the scan, so it is not a
-/// real asset path and must not be collected as a wipe candidate.
+/// Returns `None` whenever the value does not carry a known `<fsRoot>:`
+/// prefix — including when no source roots are configured at all. The run log
+/// is not a trusted channel: console-slog writes attribute values unescaped,
+/// so a filename containing a newline on untrusted media can forge additional
+/// log records with an arbitrary `file=`. There is no safe fallback heuristic
+/// here: a value that does not resolve against a known invocation root did not
+/// come from the scan, so it must never be tallied as an upload/duplicate or
+/// collected as a wipe candidate. Callers MUST always supply the roots
+/// immich-go was actually invoked against (see `UploadRequest::log_source_roots`)
+/// so a staged import's temp-dir roots are still recognized.
 fn fs_path_from_file_attr(file: &str, source_paths: &[String]) -> Option<String> {
-    if let Some((root, name)) = source_paths
+    let (root, name) = source_paths
         .iter()
         .filter_map(|root| {
             file.strip_prefix(root)
@@ -89,36 +102,9 @@ fn fs_path_from_file_attr(file: &str, source_paths: &[String]) -> Option<String>
                 .filter(|name| !name.is_empty())
                 .map(|name| (root, name))
         })
-        .max_by_key(|(root, _)| root.len())
-    {
-        let separator = if root.ends_with(['/', '\\']) { "" } else { "/" };
-        return Some(format!("{root}{separator}{name}"));
-    }
-
-    // A staged (selected) import runs immich-go against a temp symlink dir, so
-    // its logged roots legitimately differ from the user's source paths. Those
-    // runs discard the parsed paths (the originals are wiped instead), so the
-    // strict branch only needs to hold when roots are actually comparable.
-    if !source_paths.is_empty() {
-        return None;
-    }
-
-    let search_from = if is_windows_drive_prefix(file) { 2 } else { 0 };
-    if let Some(rel) = file.get(search_from..).and_then(|s| s.find(':')) {
-        let idx = search_from + rel;
-        let root = &file[..idx];
-        let name = &file[idx + 1..];
-        if !root.is_empty() && !name.is_empty() {
-            return Some(format!("{root}/{name}"));
-        }
-    }
-    Some(file.to_string())
-}
-
-/// Whether `s` begins with a Windows drive prefix like `C:\` or `C:/`.
-fn is_windows_drive_prefix(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+        .max_by_key(|(root, _)| root.len())?;
+    let separator = if root.ends_with(['/', '\\']) { "" } else { "/" };
+    Some(format!("{root}{separator}{name}"))
 }
 
 /// The message of a console-slog INFO line (`YYYY-MM-DD HH:MM:SS INF <msg...>`),
@@ -179,10 +165,6 @@ pub struct ProgressAccumulator {
 }
 
 impl ProgressAccumulator {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn with_source_paths(source_paths: &[String]) -> Self {
         Self {
             source_paths: source_paths.to_vec(),
@@ -261,23 +243,26 @@ impl ProgressAccumulator {
         };
         if message.starts_with("uploaded successfully") {
             if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
-                // Dedupe on the logged value, not the resolved path: the counters
-                // must stay correct even for a run whose paths do not resolve
-                // (a staged import logs the temp dir, not the source root).
-                if self.seen_paths.insert(file.clone()) {
-                    self.uploaded = self.uploaded.saturating_add(1);
-                    // Only a path that resolves under a known root may become a
-                    // wipe candidate; see fs_path_from_file_attr.
-                    if let Some(path) = fs_path_from_file_attr(&file, &self.source_paths) {
+                // Tallying and dedup both require resolution now: an
+                // unresolvable `file=` did not come from the scan (it may be a
+                // forged record — a filename containing a newline can inject an
+                // extra log line, see fs_path_from_file_attr), so it must never
+                // inflate `uploaded` or the checkpoint-eligible "landed"
+                // signal derived from it. Dedupe on the resolved path (not the
+                // raw logged value) so two differently-spelled but
+                // equivalent-after-resolution values still collapse to one.
+                if let Some(path) = fs_path_from_file_attr(&file, &self.source_paths) {
+                    if self.seen_paths.insert(path.clone()) {
+                        self.uploaded = self.uploaded.saturating_add(1);
                         self.completed_paths.push(path);
                     }
                 }
             }
         } else if message.starts_with("server has duplicate") {
-            self.duplicates = self.duplicates.saturating_add(1);
             if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
-                if self.seen_paths.insert(file.clone()) {
-                    if let Some(path) = fs_path_from_file_attr(&file, &self.source_paths) {
+                if let Some(path) = fs_path_from_file_attr(&file, &self.source_paths) {
+                    if self.seen_paths.insert(path.clone()) {
+                        self.duplicates = self.duplicates.saturating_add(1);
                         self.completed_paths.push(path);
                     }
                 }
@@ -366,7 +351,7 @@ mod tests {
 
     #[test]
     fn counts_events_not_summary_report() {
-        let p = parse_run_progress(LOG, &[]).progress;
+        let p = parse_run_progress(LOG, &["Untitled".to_string()]).progress;
         // 2 discovered image + 1 discovered video event lines (NOT the indented
         // "discovered image : 193" summary line).
         assert_eq!(p.total, 3);
@@ -382,7 +367,10 @@ mod tests {
         // Duplicates already on the server are safe-to-wipe candidates too, so
         // they join the completed paths (in log order: the duplicate line comes
         // before the two uploads) while `uploaded` stays a separate count.
-        let run = parse_run_progress(LOG, &[]);
+        // "Untitled" is the fsRoot the fixture log was actually captured
+        // against; the accumulator only resolves (and tallies) under known
+        // invocation roots.
+        let run = parse_run_progress(LOG, &["Untitled".to_string()]);
         assert_eq!(
             run.completed_paths,
             vec![
@@ -430,19 +418,41 @@ mod tests {
     }
 
     #[test]
-    fn handles_paths_with_spaces() {
+    fn resolves_path_with_spaces_against_known_root() {
+        let root = "/Volumes/My Card";
         let log =
             "2026-06-24 16:10:05 INF uploaded successfully file=/Volumes/My Card:DCIM/VID 7.MP4";
-        let run = parse_run_progress(log, &[]);
+        let run = parse_run_progress(log, &[root.to_string()]);
         assert_eq!(run.completed_paths, vec!["/Volumes/My Card/DCIM/VID 7.MP4"]);
     }
 
+    /// Without a matching source root, `fs_path_from_file_attr` cannot verify a
+    /// `<fsRoot>:` prefix against anything, so nothing resolves. The old
+    /// permissive separator heuristic (guess a root by splitting on the first
+    /// `:` when no roots are configured) is gone; since the fix gates
+    /// uploaded/duplicate tallies on resolution, an unresolvable value must
+    /// not count either.
     #[test]
-    fn deduplicates_repeated_uploaded_paths() {
+    fn no_roots_resolve_nothing_and_tally_nothing() {
+        let log = "2026-06-24 16:10:00 INF uploaded successfully file=Card:IMG_0001.JPG\n\
+2026-06-24 16:10:09 INF uploaded successfully file=Card:IMG_0001.JPG\n\
+2026-06-24 16:10:10 INF server has duplicate file=/Volumes/My Card:DCIM/VID 7.MP4";
+        let run = parse_run_progress(log, &[]);
+        assert!(run.completed_paths.is_empty());
+        assert_eq!(run.progress.uploaded, 0);
+        assert_eq!(run.progress.duplicates, 0);
+    }
+
+    #[test]
+    fn dedupe_keys_on_resolved_path_not_raw_value() {
+        // Two identical logged events for the same file must still count once.
+        // Dedup happens AFTER resolution now (keyed on the resolved path), not
+        // on the raw, attacker-influenceable `file=` text.
+        let root = "Card";
         let log = "2026-06-24 16:10:00 INF uploaded successfully file=Card:IMG_0001.JPG\n\
 2026-06-24 16:10:09 INF uploaded successfully file=Card:IMG_0001.JPG";
-        let run = parse_run_progress(log, &[]);
-        assert_eq!(run.completed_paths.len(), 1);
+        let run = parse_run_progress(log, &[root.to_string()]);
+        assert_eq!(run.completed_paths, vec!["Card/IMG_0001.JPG"]);
         assert_eq!(run.progress.uploaded, 1);
     }
 
@@ -451,7 +461,7 @@ mod tests {
     #[test]
     fn parses_per_file_server_error() {
         let log = "2026-06-22 14:30:01 ERR server error file=/Volumes/CANON:DCIM/IMG_0001.JPG error=Internal Server Error (500)";
-        let errors = parse_error_log(log, &[]);
+        let errors = parse_error_log(log, &["/Volumes/CANON".to_string()]);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].file, "/Volumes/CANON/DCIM/IMG_0001.JPG");
         assert_eq!(errors[0].reason, "Internal Server Error (500)");
@@ -468,10 +478,34 @@ mod tests {
     #[test]
     fn parses_path_with_spaces_and_trailing_attr() {
         let log = "2026-06-22 14:30:05 ERR incomplete processing file=/Volumes/My Card:DCIM/VID 7.MP4 error=asset never reached final state discovered_at=2026-06-22T14:29:00Z";
-        let errors = parse_error_log(log, &[]);
+        let errors = parse_error_log(log, &["/Volumes/My Card".to_string()]);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].file, "/Volumes/My Card/DCIM/VID 7.MP4");
         assert_eq!(errors[0].reason, "asset never reached final state");
+    }
+
+    /// A real filename may legally contain " error=" (values are unquoted and
+    /// run to the next attribute marker). The genuine trailing `error=`
+    /// attribute is always the LAST such marker on the line, so the embedded
+    /// copy inside the path must survive and only the true reason is stripped.
+    #[test]
+    fn attr_value_keeps_key_like_substring_embedded_in_filename() {
+        let log = "2026-06-24 16:10:30 ERR server error file=/Volumes/CARD:DCIM/photo error=inside.jpg error=Internal Server Error (500)";
+        let errors = parse_error_log(log, &["/Volumes/CARD".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].file, "/Volumes/CARD/DCIM/photo error=inside.jpg");
+        assert_eq!(errors[0].reason, "Internal Server Error (500)");
+    }
+
+    /// No embedded key-like substring: the rightmost-marker rule must still
+    /// land on the same (only) occurrence as before the fix.
+    #[test]
+    fn attr_value_unchanged_for_ordinary_lines() {
+        let log = "2026-06-22 14:30:01 ERR server error file=/Volumes/CANON:DCIM/IMG_0001.JPG error=Internal Server Error (500)";
+        let errors = parse_error_log(log, &["/Volumes/CANON".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].file, "/Volumes/CANON/DCIM/IMG_0001.JPG");
+        assert_eq!(errors[0].reason, "Internal Server Error (500)");
     }
 
     /// Aggregate scan errors stay out of the per-file error list and count (that
@@ -489,17 +523,19 @@ mod tests {
 
     /// immich-go's console-slog handler writes `file=` values unescaped, so a
     /// filename or directory containing a newline on untrusted media forges a
-    /// complete extra log record. Such a value cannot carry a known `<root>:`
-    /// prefix, so it must never become a wipe candidate — deletion candidates come
-    /// from the scanned source, not from arbitrary text in the log.
+    /// complete extra log record. Such a record's `file=` cannot carry a known
+    /// `<root>:` prefix, so it must resolve to `None` — and therefore must
+    /// neither inflate the `uploaded` tally (which gates the checkpoint-
+    /// eligible "landed" signal downstream) nor become a wipe candidate.
     #[test]
-    fn forged_log_records_do_not_become_wipe_candidates() {
+    fn forged_log_records_do_not_inflate_uploaded_tally() {
         let root = "/Volumes/CARD";
-        // The attacker-controlled directory name ends with a newline, so line two
-        // is a syntactically perfect "uploaded" record for an unrelated path.
+        // The attacker-controlled directory name ends with a newline, so line
+        // two is a syntactically perfect "uploaded" record for a path outside
+        // any known root.
         let log =
             "2026-06-24 16:10:00 INF uploaded successfully file=/Volumes/CARD:DCIM/real.jpg\n\
-2026-06-24 16:10:00 INF uploaded successfully file=/Users/victim/Pictures/target.jpg";
+2026-06-24 16:10:00 INF uploaded successfully file=/etc/outside.jpg";
         let run = parse_run_progress(log, &[root.to_string()]);
 
         assert_eq!(
@@ -508,24 +544,30 @@ mod tests {
             "only the path under the scanned root may be deletable"
         );
         assert_eq!(
-            run.progress.uploaded, 2,
-            "progress still reflects both logged events"
+            run.progress.uploaded, 1,
+            "the injected record must not inflate the tally that gates the \
+             checkpoint-eligible \"landed\" signal"
         );
     }
 
-    /// A staged (selected) import points immich-go at a temp symlink dir, so its
-    /// logged root legitimately differs from the user's source paths. Those runs
-    /// wipe the originals instead, but their progress counters must stay correct.
+    /// A staged (hand-picked) import points immich-go at a temp staging dir, so
+    /// its logged root is the staging dir, not the user's original source
+    /// paths. The caller MUST supply the actual invocation root
+    /// (`UploadRequest::log_source_roots`) for these events to resolve at all.
     #[test]
-    fn unresolvable_paths_still_count_toward_progress() {
+    fn staged_import_resolves_against_staging_root() {
+        let staging_root = "/tmp/immich-shuttle-stage-1";
         let log = "2026-06-24 16:10:00 INF uploaded successfully file=/tmp/immich-shuttle-stage-1:IMG_0001.JPG\n\
 2026-06-24 16:10:01 INF server has duplicate file=/tmp/immich-shuttle-stage-1:IMG_0002.JPG";
-        let run = parse_run_progress(log, &["/Volumes/CARD".to_string()]);
+        let run = parse_run_progress(log, &[staging_root.to_string()]);
         assert_eq!(run.progress.uploaded, 1);
         assert_eq!(run.progress.duplicates, 1);
-        assert!(
-            run.completed_paths.is_empty(),
-            "staged paths resolve to no source root and are supplied separately"
+        assert_eq!(
+            run.completed_paths,
+            vec![
+                "/tmp/immich-shuttle-stage-1/IMG_0001.JPG",
+                "/tmp/immich-shuttle-stage-1/IMG_0002.JPG",
+            ]
         );
     }
 
@@ -560,10 +602,11 @@ mod tests {
 
     #[test]
     fn incremental_chunks_match_full_parse() {
-        let full = parse_run_progress(LOG, &[]);
+        let roots = vec!["Untitled".to_string()];
+        let full = parse_run_progress(LOG, &roots);
         // Feed the log one byte at a time (each chunk splits lines arbitrarily);
         // the running snapshot must equal a whole-log parse.
-        let mut acc = ProgressAccumulator::new();
+        let mut acc = ProgressAccumulator::with_source_paths(&roots);
         let mut buf = [0u8; 4];
         for ch in LOG.chars() {
             acc.push_chunk(ch.encode_utf8(&mut buf));
@@ -581,7 +624,7 @@ mod tests {
     fn finish_flushes_trailing_line_without_newline() {
         // The final "uploaded successfully" line has no trailing '\n'; it must
         // only be counted after finish(), not while still buffered.
-        let mut acc = ProgressAccumulator::new();
+        let mut acc = ProgressAccumulator::with_source_paths(&["Card".to_string()]);
         acc.push_chunk("2026-06-24 16:10:21 INF uploaded successfully file=Card:IMG_0001.JPG");
         assert_eq!(acc.snapshot().progress.uploaded, 0);
         acc.finish();

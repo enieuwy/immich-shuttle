@@ -57,6 +57,12 @@ describe("selectionState", () => {
     expect(selectionState.paths().sort()).toEqual(["/a.jpg", "/c.jpg"]);
   });
 
+  it("retainPaths keeps only paths present in the given set", () => {
+    selectionState.selectOnly(["/a.jpg", "/b.jpg", "/c.jpg"]);
+    selectionState.retainPaths(["/b.jpg", "/c.jpg", "/not-selected.jpg"]);
+    expect(selectionState.paths().sort()).toEqual(["/b.jpg", "/c.jpg"]);
+  });
+
   it("invert toggles each path in the subset, leaving others untouched", () => {
     selectionState.selectOnly(["/a.jpg", "/keep.jpg"]);
     // visible subset = a, b, c -> a was selected (deselect), b & c become selected

@@ -216,16 +216,26 @@ fn prune_ql_scratch_dirs_older_than(dir: &Path, max_age: Duration) {
 }
 
 fn cache_key(path: &Path, max: u32) -> String {
-    let mtime = fs::metadata(path)
-        .ok()
+    // One `metadata()` call derives both mtime and size: cache entries are
+    // documented as keyed by path+mtime+size (see module docs), and a second
+    // stat here would risk racing a concurrent write between the two reads.
+    let metadata = fs::metadata(path).ok();
+    let mtime = metadata
+        .as_ref()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    // A file replaced in place while keeping its mtime (restore from backup,
+    // coarse filesystem timestamp resolution, `cp -p`) must still miss the old
+    // cache entry, so the byte length is part of the key too.
+    let size = metadata.map(|m| m.len()).unwrap_or(0);
     let mut hasher = Sha1::new();
     hasher.update(path.to_string_lossy().as_bytes());
     hasher.update(b":");
     hasher.update(mtime.to_le_bytes());
+    hasher.update(b":");
+    hasher.update(size.to_le_bytes());
     hasher.update(b":");
     hasher.update(max.to_le_bytes());
     format!("{:x}", hasher.finalize())
@@ -305,7 +315,16 @@ pub fn thumbnail(path_str: &str, max: u32) -> ThumbResult {
     // Fully read the cache file before allowing post-write pruning to remove it.
     let result = file
         .as_deref()
-        .and_then(|file| to_result(path_str, file).ok());
+        .and_then(|file| match to_result(path_str, file) {
+            Ok(r) => Some(r),
+            // A legacy truncated entry (written before atomic publish, or from a
+            // process that crashed mid-write) must not be served as a "hit"
+            // forever; delete it so the next request regenerates it cleanly.
+            Err(_) => {
+                let _ = fs::remove_file(file);
+                None
+            }
+        });
     drop(cache_files);
     if wrote_cache && file.is_some() {
         prune_cache_after_write(&cache);
@@ -372,6 +391,30 @@ fn generate(path: &Path, max: u32, jpg: &Path, png: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Bounds the buffer `generate_with_shell` allocates for the bitmap a
+/// third-party shell thumbnail handler hands back. `IShellItemImageFactory`
+/// is only *asked* for `max`x`max`; a handler that ignores the requested
+/// `SIZE` and returns a full-resolution frame would otherwise drive an
+/// unbounded `vec![0u8; w*h*4]` on any of the eight concurrent preview
+/// workers. Returns `None` for a non-positive dimension, a dimension over
+/// `MAX_THUMBNAIL_DECODE_DIMENSION`, or a byte count that overflows or
+/// exceeds `MAX_THUMBNAIL_DECODE_BYTES`.
+#[cfg(windows)]
+fn dib_buffer_len(w: i32, h: i32) -> Option<usize> {
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let (w, h) = (w as u32, h as u32);
+    if w > MAX_THUMBNAIL_DECODE_DIMENSION || h > MAX_THUMBNAIL_DECODE_DIMENSION {
+        return None;
+    }
+    let len = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    if len as u64 > MAX_THUMBNAIL_DECODE_BYTES {
+        return None;
+    }
+    Some(len)
+}
+
 /// Windows-native fallback: ask the Shell thumbnail provider for a bitmap and
 /// re-encode it to JPEG. `IShellItemImageFactory` delegates to whatever thumbnail
 /// handler is registered for the file type, so this covers video (Media
@@ -416,11 +459,17 @@ fn generate_with_shell(src: &Path, max: u32, out: &Path) -> bool {
                 std::mem::size_of::<BITMAP>() as i32,
                 Some(&mut info as *mut _ as *mut c_void),
             );
-            if got == 0 || info.bmWidth <= 0 || info.bmHeight <= 0 {
+            if got == 0 {
                 let _ = DeleteObject(HGDIOBJ(hbitmap.0));
                 return Ok(false);
             }
             let (w, h) = (info.bmWidth, info.bmHeight);
+            // A misbehaving handler that ignores `SIZE` must not blow the
+            // allocation below open; bail before touching the bitmap further.
+            let Some(buf_len) = dib_buffer_len(w, h) else {
+                let _ = DeleteObject(HGDIOBJ(hbitmap.0));
+                return Ok(false);
+            };
 
             // Pull the pixels as a 32-bit top-down DIB (negative height).
             let mut bmi = BITMAPINFO {
@@ -435,7 +484,7 @@ fn generate_with_shell(src: &Path, max: u32, out: &Path) -> bool {
                 },
                 ..Default::default()
             };
-            let mut buf = vec![0u8; w as usize * h as usize * 4];
+            let mut buf = vec![0u8; buf_len];
             let hdc = GetDC(None);
             let scanned = GetDIBits(
                 hdc,
@@ -461,9 +510,21 @@ fn generate_with_shell(src: &Path, max: u32, out: &Path) -> bool {
                 }
             }
             let thumb = image::DynamicImage::ImageRgb8(rgb).thumbnail(max, max);
-            Ok(thumb
-                .save_with_format(out, image::ImageFormat::Jpeg)
-                .is_ok())
+
+            // Encode to a process-unique temp sibling and rename onto `out` only
+            // on success, so a concurrent reader of `out` never observes a
+            // partially-encoded JPEG (dc066bc5).
+            let Some(tmp) = temporary_output_path(out, "shell") else {
+                return Ok(false);
+            };
+            let published = thumb
+                .save_with_format(&tmp, image::ImageFormat::Jpeg)
+                .is_ok()
+                && promote_temporary_output(&tmp, out);
+            if !published {
+                let _ = fs::remove_file(&tmp);
+            }
+            Ok(published)
         };
 
         let result = render().unwrap_or(false);
@@ -501,8 +562,9 @@ fn command_succeeds_within_timeout(command: &mut Command) -> bool {
     }
 }
 /// Build a unique sibling path so an incomplete render is never observable at
-/// the cache path.
-#[cfg(any(target_os = "macos", test))]
+/// the cache path. Used by every backend now (dc066bc5): two concurrent
+/// preview workers that miss the same cache key must never race to encode
+/// into `out` directly, or one can observe the other's half-written file.
 fn temporary_output_path(out: &Path, kind: &str) -> Option<PathBuf> {
     Some(out.parent()?.join(format!(
         ".{}-{kind}-{}",
@@ -515,7 +577,6 @@ fn temporary_output_path(out: &Path, kind: &str) -> Option<PathBuf> {
 ///
 /// The copy fallback also uses a sibling temporary path so a failed copy cannot
 /// poison `out`; neither failure path removes an existing cache entry.
-#[cfg(any(target_os = "macos", test))]
 fn promote_temporary_output(tmp: &Path, out: &Path) -> bool {
     match fs::rename(tmp, out) {
         Ok(()) => out.is_file(),
@@ -657,7 +718,19 @@ fn generate_with_image(src: &Path, max: u32, out: &Path) -> bool {
     let thumb = oriented.thumbnail(max, max);
     // JPEG has no alpha channel; flatten to RGB before encoding.
     let rgb = image::DynamicImage::ImageRgb8(thumb.to_rgb8());
-    rgb.save_with_format(out, image::ImageFormat::Jpeg).is_ok()
+
+    // Encode into a process-unique temp sibling and rename onto `out` only on
+    // success, so a concurrent cache-miss on the same key never reads a
+    // half-written JPEG (dc066bc5).
+    let Some(tmp) = temporary_output_path(out, "image") else {
+        return false;
+    };
+    let published = rgb.save_with_format(&tmp, image::ImageFormat::Jpeg).is_ok()
+        && promote_temporary_output(&tmp, out);
+    if !published {
+        let _ = fs::remove_file(&tmp);
+    }
+    published
 }
 
 /// Scan `src` for embedded JPEG headers using a small rolling buffer, so we
@@ -782,7 +855,13 @@ fn generate_with_raw_preview(src: &Path, max: u32, out: &Path) -> bool {
     }
     candidates.sort_unstable_by(|(left, _), (right, _)| right.cmp(left));
 
-    let _ = fs::remove_file(out);
+    // Encode each attempt into a process-unique temp sibling and only rename
+    // onto `out` on success, so a concurrent cache-miss on the same key never
+    // reads a half-written JPEG, and a failed attempt never disturbs an
+    // existing cache entry (dc066bc5).
+    let Some(tmp) = temporary_output_path(out, "raw") else {
+        return false;
+    };
     for (_, off) in candidates {
         // Read the chosen stream up to the next embedded marker (or EOF).
         // Trailing raw sensor bytes are harmless: the JPEG decoder stops at EOI.
@@ -808,10 +887,12 @@ fn generate_with_raw_preview(src: &Path, max: u32, out: &Path) -> bool {
         let thumb = apply_orientation(src, decoded).thumbnail(max, max);
         // JPEG has no alpha channel; flatten to RGB before encoding.
         let rgb = image::DynamicImage::ImageRgb8(thumb.to_rgb8());
-        if rgb.save_with_format(out, image::ImageFormat::Jpeg).is_ok() {
+        if rgb.save_with_format(&tmp, image::ImageFormat::Jpeg).is_ok()
+            && promote_temporary_output(&tmp, out)
+        {
             return true;
         }
-        let _ = fs::remove_file(out);
+        let _ = fs::remove_file(&tmp);
     }
     false
 }
@@ -841,6 +922,12 @@ fn apply_orientation(src: &Path, img: image::DynamicImage) -> image::DynamicImag
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// `thumbnail` reads and writes the one real cache directory and prunes it on
+    /// every write, so two tests exercising it in parallel can evict each other's
+    /// just-published entry. Serialize the tests that go through the full cache
+    /// path, recovering from poisoning so one failure does not cascade.
+    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn renders_png_via_image_backend() {
@@ -872,6 +959,9 @@ mod tests {
 
     #[test]
     fn missing_file_is_placeholder() {
+        let _guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let r = thumbnail("/no/such/file.jpg", 64);
         assert!(r.data_url.is_none());
         assert_eq!(r.width, 0);
@@ -886,6 +976,9 @@ mod tests {
     #[test]
     fn thumbnail_produces_data_url_for_png() {
         // Full path: macOS uses sips, other platforms use the image backend.
+        let _guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let src = concat!(env!("CARGO_MANIFEST_DIR"), "/icons/128x128.png");
         let r = thumbnail(src, 64);
         assert!(r.data_url.is_some(), "expected a thumbnail data url");
@@ -1084,5 +1177,86 @@ mod tests {
         assert_eq!(fs::read(&out).unwrap(), b"completed by another renderer");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dib_buffer_len_bounds_allocation() {
+        assert_eq!(dib_buffer_len(256, 256), Some(256 * 256 * 4));
+        assert_eq!(dib_buffer_len(0, 10), None);
+        assert_eq!(dib_buffer_len(100_000, 100_000), None);
+        assert_eq!(dib_buffer_len(i32::MAX, i32::MAX), None);
+    }
+
+    #[test]
+    fn cache_key_changes_when_only_size_changes() {
+        // A file replaced in place while keeping its mtime (restore from
+        // backup, `cp -p`, coarse filesystem timestamp resolution) must miss
+        // the previous file's cache entry, so size has to be part of the key.
+        // The mtime is pinned to the same instant for both writes so real
+        // nanosecond mtime resolution can't accidentally mask the bug this
+        // guards against (the key would also change if mtime moved).
+        let path = std::env::temp_dir().join(format!("immich_shuttle_key_{}", Uuid::new_v4()));
+        let fixed_mtime = std::time::SystemTime::now();
+
+        fs::write(&path, vec![0u8; 16]).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(fixed_mtime)
+            .unwrap();
+        let key_small = cache_key(&path, 64);
+
+        fs::write(&path, vec![0u8; 32]).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(fixed_mtime)
+            .unwrap();
+        let key_big = cache_key(&path, 64);
+
+        let _ = fs::remove_file(&path);
+        assert_ne!(
+            key_small, key_big,
+            "cache_key must change when only file size changes"
+        );
+    }
+
+    #[test]
+    fn truncated_cache_entry_self_heals() {
+        // Seed a cache entry that can't be decoded (crash mid-write, or a
+        // pre-atomic-publish leftover from before dc066bc5). `thumbnail` must
+        // never serve it as a permanent "hit": the request that finds it
+        // returns a placeholder and deletes the bad file, so the *next*
+        // request finds the slot free and regenerates a real thumbnail.
+        let _guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let src =
+            std::env::temp_dir().join(format!("immich_shuttle_heal_src_{}.jpg", Uuid::new_v4()));
+        fs::write(&src, jpeg_of(32, 32)).unwrap();
+
+        let cache = cache_dir().unwrap();
+        let key = cache_key(&src, MAX_PX);
+        let jpg = cache.join(format!("{key}.jpg"));
+        fs::write(&jpg, b"not a real jpeg").unwrap();
+
+        let first = thumbnail(src.to_str().unwrap(), MAX_PX);
+        assert!(
+            first.data_url.is_none(),
+            "an undecodable cache entry must never be served as a hit"
+        );
+        assert!(
+            !jpg.exists(),
+            "the corrupt cache entry must be deleted, not left to poison later requests"
+        );
+
+        let second = thumbnail(src.to_str().unwrap(), MAX_PX);
+        assert!(
+            second.data_url.is_some(),
+            "the freed cache slot should regenerate a real thumbnail"
+        );
+        assert!(second.width > 0 && second.height > 0);
+
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&jpg);
     }
 }

@@ -558,6 +558,14 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             Some(dir) => vec![dir.path().to_string_lossy().to_string()],
             None => source_paths.clone(),
         };
+        // The paths immich-go is actually invoked against: the temp staging dir
+        // for a staged (hand-picked) import, otherwise the user's source paths.
+        // Cloned here (before the run loop below consumes `upload_paths`) so both
+        // the live log parser (via `UploadRequest.log_source_roots`) and the
+        // final authoritative parse agree on what the process actually saw —
+        // `source_paths` alone would miss every `file=` record under a staging
+        // symlink dir and silently zero out uploaded/duplicate counts.
+        let invocation_roots = upload_paths.clone();
         // Resolve the reachable endpoint inside the task: the LAN/WAN probe can
         // take up to a few seconds, so keep it off the IPC path that returns the
         // job id to the frontend.
@@ -568,6 +576,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             api_key: api_key_clone,
             source_path: upload_paths[0].clone(),
             log_path,
+            log_source_roots: invocation_roots.clone(),
             device_uuid,
             cancel_flag: cancel_flag.clone(),
             stack_raw_jpeg,
@@ -626,15 +635,20 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let log_contents = std::fs::read_to_string(&request.log_path).unwrap_or_default();
         let file_errors =
             crate::services::stdout_parser::parse_error_log(&log_contents, &source_paths);
-        let run = crate::services::stdout_parser::parse_run_progress(&log_contents, &source_paths);
+        let run =
+            crate::services::stdout_parser::parse_run_progress(&log_contents, &invocation_roots);
         // parse_run_progress counts every distinct errored file (uncapped);
         // file_errors is capped at MAX_FILE_ERRORS for the UI payload. Keep the
         // true count so the final tally never undercounts a mass-failure run.
         let progress = run.progress;
-        // For a staged (selected) import the log's paths point at the temp
-        // symlink dir, which is cleaned up below — so wipe must target the user's
-        // selected originals instead. SHA-1 verify_uploaded still gates deletion
-        // to files the server actually holds, so unuploaded picks are kept safe.
+        // parse_run_progress above resolves `file=` records against
+        // invocation_roots (the staging dir for a staged import, matching what
+        // immich-go actually saw), so uploaded/duplicate counts aren't silently
+        // dropped. Wipe eligibility is a separate, stricter question: for a
+        // staged import the log's paths still point at the temp symlink dir
+        // cleaned up below, so wipe must target the user's selected originals
+        // instead. SHA-1 verify_uploaded still gates deletion to files the
+        // server actually holds, so unuploaded picks are kept safe.
         let completed_asset_paths = if staged_import {
             // Already validated under the source roots at admission.
             select_files.clone()
@@ -1127,7 +1141,6 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
         job.pending_wipe_count = 0;
     }
     set_job(job.clone())?;
-
     let _ = logs::append_log(
         "app.log",
         &format!(
@@ -1143,6 +1156,7 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
 pub async fn scan_sources_stream(
     app: tauri::AppHandle,
     paths: Vec<String>,
+    scan_id: String,
 ) -> Result<ScanSummary, String> {
     if paths.is_empty() {
         return Err("At least one path is required".to_string());
@@ -1217,6 +1231,7 @@ pub async fn scan_sources_stream(
                         }
                     }
                     let payload = ScanProgress {
+                        scan_id: scan_id.clone(),
                         files: survivors,
                         photo_count: summary.photo_count,
                         video_count: summary.video_count,
@@ -1343,6 +1358,47 @@ pub async fn import_cancel(job_id: String) -> Result<(), String> {
         pending.remove(&job_id);
     }
     set_job(job)
+}
+
+/// Wait for a job to reach a terminal status AND for its worker task to
+/// actually exit, then return the final job.
+///
+/// A terminal *status* is not the same thing as a terminal *worker*.
+/// `import_cancel` writes `Cancelled` the instant it is asked to stop, while
+/// the `import_start` task spawned for that job keeps running: it can still
+/// be mid-upload with the sidecar, staging or cleaning temp files, or
+/// blocked on the final log read and history write. `RUNNING_IMPORTS` is
+/// cleared only by the worker itself on its way out, so a job id still
+/// present there — regardless of what `job.status` says — means the process
+/// has not finished shutting down. Quitting the app in that window can kill
+/// the sidecar mid-upload and skip the staging/log cleanup that runs after
+/// it, leaving temp artifacts and a half-uploaded run behind. This command
+/// gives a close handler something real to wait on instead of guessing with
+/// a fixed timer: it does not return until both conditions hold, so the
+/// caller can safely treat `Ok` as "the worker is gone, it is safe to exit."
+///
+/// This is a shutdown path, not a hot loop, so a coarse 100ms poll is fine —
+/// there is no cheaper event to wait on since the worker's exit is only
+/// observable via `RUNNING_IMPORTS`.
+#[tauri::command]
+pub async fn import_await_terminal(job_id: String, timeout_ms: u64) -> Result<ImportJob, String> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let job = get_job(&job_id)?;
+        let worker_alive = RUNNING_IMPORTS
+            .lock()
+            .map_err(|_| "Could not lock running imports state".to_string())?
+            .contains_key(&job_id);
+        if is_terminal(&job.status) && !worker_alive {
+            return Ok(job);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Timed out waiting for import {job_id} to finish shutting down; the import worker is still shutting down"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tauri::command]

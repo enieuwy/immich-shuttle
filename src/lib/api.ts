@@ -85,6 +85,17 @@ export function importCancel(jobId: string): Promise<void> {
   return invokeCommand<void>("import_cancel", { jobId });
 }
 
+/**
+ * Block until `jobId` is terminal AND its backend worker has actually exited.
+ * A terminal status is published by `import_cancel` while the worker is still
+ * winding down (resolving a server, staging/cleaning files, waiting for the
+ * sidecar to die), so quitting on status alone can kill a live upload mid-write.
+ * Rejects if the worker is still shutting down when `timeoutMs` elapses.
+ */
+export function importAwaitTerminal(jobId: string, timeoutMs: number): Promise<ImportJob> {
+  return invokeCommand<ImportJob>("import_await_terminal", { jobId, timeoutMs });
+}
+
 export function importConfirmWipe(jobId: string, confirm: boolean): Promise<ImportJob> {
   return invokeCommand<ImportJob>("import_confirm_wipe", { jobId, confirm });
 }
@@ -137,8 +148,8 @@ export function getRecentLogs(): Promise<string> {
   return invokeCommand<string>("get_recent_logs");
 }
 
-export function scanSourcesStream(paths: string[]): Promise<ScanSummary> {
-  return invokeCommand<ScanSummary>("scan_sources_stream", { paths });
+export function scanSourcesStream(paths: string[], scanId: string): Promise<ScanSummary> {
+  return invokeCommand<ScanSummary>("scan_sources_stream", { paths, scanId });
 }
 
 export function scanCancel(): Promise<void> {

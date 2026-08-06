@@ -4,6 +4,8 @@ import { listen } from "@tauri-apps/api/event";
 
 import { devicesListRemovable, scanCancel, scanSourcesStream } from "$lib/api";
 import { errorsState } from "$lib/state/errors";
+import { createGeneration } from "$lib/state/generation";
+import { selectionState } from "$lib/state/selection";
 import type { RemovableDevice, ScanProgress, ScanResult } from "$lib/types";
 
 type SourceState = {
@@ -32,6 +34,13 @@ const state = writable<SourceState>(initialState);
 // overwrite the state produced by a later action (lost-update race).
 let scanGeneration = 0;
 
+// Guards overlapping loadDevices() calls (e.g. rapid device-changed events)
+// the same way scanGeneration guards scans: without it, a slow refresh that
+// started before a newer mount/eject snapshot can commit after it and
+// regress the picker -- and auto-import, which reads this list -- to stale
+// device state.
+const deviceLoads = createGeneration();
+
 function emptyScanResult(): ScanResult {
   return {
     files: [],
@@ -42,8 +51,20 @@ function emptyScanResult(): ScanResult {
   };
 }
 
-async function scanSelectedSources(paths: string[]): Promise<void> {
+async function scanSelectedSources(
+  paths: string[],
+  options: { reconcileSelectionAfter?: boolean } = {},
+): Promise<void> {
   const gen = ++scanGeneration;
+  // Unique per invocation and handed to the backend, which stamps it onto
+  // every scan-progress event it emits for this scan. The backend checks
+  // cancellation before `app.emit`, not before the emit lands, so a batch
+  // already in flight when we cancel can still arrive after this function's
+  // listener is registered; filtering on scan_id rejects it by provenance.
+  // scanGeneration below is a *different* guard: it protects against a scan
+  // of OURS being superseded by a later one of ours (e.g. a second
+  // selectSources call) whose result should win instead. Both are required.
+  const scanId = crypto.randomUUID();
   // Keep the potentially large file list outside reactive state until the
   // terminal summary arrives. Each progress event only updates scalar totals.
   const files: ScanResult["files"] = [];
@@ -58,6 +79,7 @@ async function scanSelectedSources(paths: string[]): Promise<void> {
 
   try {
     unlisten = await listen<ScanProgress>("scan-progress", (event) => {
+      if (event.payload.scan_id !== scanId) return;
       if (gen !== scanGeneration) return;
 
       const progress = event.payload;
@@ -76,7 +98,7 @@ async function scanSelectedSources(paths: string[]): Promise<void> {
 
     if (gen !== scanGeneration) return;
 
-    const summary = await scanSourcesStream(paths);
+    const summary = await scanSourcesStream(paths, scanId);
     if (gen !== scanGeneration) return;
 
     state.update((s) => ({
@@ -90,8 +112,19 @@ async function scanSelectedSources(paths: string[]): Promise<void> {
       },
       scanning: false,
     }));
+
+    if (options.reconcileSelectionAfter) {
+      // Source removal narrowed the set of scannable files; drop any hidden
+      // selection outside it or the backend's validate_selected_under_sources
+      // rejects Start Import with a confusing error instead of importing the
+      // remaining sources. Gated by the generation check above, so a
+      // superseded rescan never reconciles against a stale file list.
+      selectionState.retainPaths(files.map((file) => file.path));
+    }
   } catch (error) {
     if (gen !== scanGeneration) return;
+    // Already surfaced via addError + state.error below; selectSources/
+    // removePath have no decision to make on scan failure, so don't rethrow.
     errorsState.addError("Could not scan selected source.");
     state.update((s) => ({
       ...s,
@@ -106,11 +139,19 @@ async function scanSelectedSources(paths: string[]): Promise<void> {
 export const sourceState = {
   subscribe: state.subscribe,
   async loadDevices() {
+    const isCurrent = deviceLoads.begin();
     state.update((s) => ({ ...s, loadingDevices: true, error: null }));
     try {
       const detectedDevices = await devicesListRemovable();
+      // Overlapping device-changed events can start refreshes out of order;
+      // only the newest one may commit, or a slow refresh regresses the
+      // picker (and auto-import) to a stale device list.
+      if (!isCurrent()) return;
       state.update((s) => ({ ...s, detectedDevices, loadingDevices: false }));
     } catch (error) {
+      if (!isCurrent()) return;
+      // Already surfaced via addError + state.error below; the device-changed
+      // listener has no decision to make on a failed refresh.
       errorsState.addError("Could not load removable devices.");
       state.update((s) => ({
         ...s,
@@ -141,8 +182,17 @@ export const sourceState = {
       }
       return { ...s, selectedPaths: remaining };
     });
-    if (remaining.length === 0) return;
-    await scanSelectedSources(remaining);
+    if (remaining.length === 0) {
+      // No sources left means no scannable files at all -- any hidden
+      // selection would point at nothing importable.
+      selectionState.clear();
+      return;
+    }
+    // Reconcile once the rescan resolves and the new file list is known
+    // (guarded internally against a superseded rescan), not here against the
+    // old list -- reconciling now against the pre-rescan list could drop a
+    // path that's still valid.
+    await scanSelectedSources(remaining, { reconcileSelectionAfter: true });
   },
   async cancelScan() {
     try {

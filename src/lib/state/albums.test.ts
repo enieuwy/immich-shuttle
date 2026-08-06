@@ -31,6 +31,7 @@ vi.mock("$lib/api", () => ({
 }));
 
 import * as api from "$lib/api";
+import { errorsState } from "./errors";
 import { profilesState } from "./profiles";
 import { albumsState } from "./albums";
 
@@ -165,7 +166,11 @@ describe("albumsState", () => {
     // orphaned server-side, so createAlbum resolves and still registers/selects
     // it locally instead of throwing.
     const created = await albumsState.createAlbum("Holiday", ["u1"], false);
-    expect(created.id).toBe("a2");
+    // createAlbum resolves undefined only when it abandons the commit (reported
+    // failure, superseded profile, or a create already in flight); a share
+    // failure is none of those, so the album must still come back.
+    expect(created).toBeDefined();
+    expect(created?.id).toBe("a2");
     expect(get(albumsState).availableAlbums.some((a) => a.id === "a2")).toBe(true);
     expect(get(albumsState).selectedAlbumIds).toEqual(["a2"]);
   });
@@ -231,5 +236,102 @@ describe("albumsState", () => {
     await albumsState.createAlbum("Private", [], false);
     expect(vi.mocked(api.albumShareLink)).not.toHaveBeenCalled();
     expect(get(albumsState).shareLinkUrl).toBeNull();
+  });
+
+  it("does not add or select an album whose create resolves after the active profile changed", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    await profilesState.saveProfile({
+      id: "p2",
+      display_name: "Other",
+      server_url: "https://other.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+
+    const { promise, resolve } = Promise.withResolvers<{
+      id: string;
+      album_name: string;
+      shared_with: never[];
+    }>();
+    vi.mocked(api.albumCreate).mockReturnValueOnce(promise);
+
+    const beforeCount = get(albumsState).availableAlbums.length;
+    const pending = albumsState.createAlbum("Race", [], false);
+    // Profile switches away while the create is still in flight — the
+    // eventual resolution must not publish server-A's album into server-B's
+    // (now active) view.
+    profilesState.setActiveProfile("p2");
+    resolve({ id: "a-race", album_name: "Race", shared_with: [] });
+    const created = await pending;
+
+    expect(created).toBeUndefined();
+    expect(get(albumsState).availableAlbums).toHaveLength(beforeCount);
+    expect(get(albumsState).availableAlbums.some((a) => a.id === "a-race")).toBe(false);
+    expect(get(albumsState).selectedAlbumIds).not.toContain("a-race");
+  });
+
+  it("issues exactly one albumCreate call for two back-to-back creates", async () => {
+    profilesState.setActiveProfile("p1");
+    vi.mocked(api.albumCreate).mockClear();
+
+    const { promise, resolve } = Promise.withResolvers<{
+      id: string;
+      album_name: string;
+      shared_with: never[];
+    }>();
+    vi.mocked(api.albumCreate).mockReturnValueOnce(promise);
+
+    const first = albumsState.createAlbum("First", [], false);
+    const second = albumsState.createAlbum("Second", [], false);
+    expect(get(albumsState).creating).toBe(true);
+
+    resolve({ id: "a-single", album_name: "First", shared_with: [] });
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+
+    expect(vi.mocked(api.albumCreate)).toHaveBeenCalledTimes(1);
+    expect(firstResult?.id).toBe("a-single");
+    expect(secondResult).toBeUndefined();
+    expect(get(albumsState).creating).toBe(false);
+  });
+
+  it("resolves (does not reject) and clears creating after a reported albumCreate failure", async () => {
+    profilesState.setActiveProfile("p1");
+    vi.mocked(api.albumCreate).mockRejectedValueOnce(new Error("boom"));
+    const addError = vi.spyOn(errorsState, "addError");
+
+    await expect(albumsState.createAlbum("Boom", [], false)).resolves.toBeUndefined();
+
+    expect(addError).toHaveBeenCalledWith("Could not create album.");
+    expect(get(albumsState).creating).toBe(false);
+    addError.mockRestore();
+  });
+
+  it("clears availableAlbums, selectedAlbumIds, and loadedProfileId on a profile switch", async () => {
+    profilesState.setActiveProfile("p1");
+    await albumsState.loadAlbums();
+    albumsState.selectAlbum("a1");
+    expect(get(albumsState).availableAlbums.length).toBeGreaterThan(0);
+    expect(get(albumsState).selectedAlbumIds).toContain("a1");
+    expect(get(albumsState).loadedProfileId).toBe("p1");
+
+    // A real id change (not a no-op re-emission of the same profile) must
+    // clear server-A's view immediately rather than waiting out the 150ms
+    // debounce on the next load.
+    profilesState.setActiveProfile("p2");
+
+    const s = get(albumsState);
+    expect(s.availableAlbums).toEqual([]);
+    expect(s.availableUsers).toEqual([]);
+    expect(s.selectedAlbumIds).toEqual([]);
+    expect(s.loadedProfileId).toBeNull();
   });
 });
