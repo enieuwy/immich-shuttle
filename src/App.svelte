@@ -27,6 +27,7 @@
   import type { Profile } from "$lib/types";
   import { importAwaitTerminal, importCancel } from "$lib/api";
   import { queueState } from "$lib/state/queue";
+  import { runImportShutdown, SHUTDOWN_INCOMPLETE_MESSAGE } from "$lib/state/shutdown";
   import { selectionState } from "$lib/state/selection";
   import { sourceState } from "$lib/state/source";
   import { previewState } from "$lib/state/preview";
@@ -166,6 +167,61 @@
     void queueState.loadJobs();
     queueState.startPolling();
 
+    // NOTE: this guards WINDOW closes only (red button, window.close()).
+    // Application-menu quit (Cmd-Q on macOS) bypasses it entirely and kills the
+    // process mid-upload -- see immich-shuttle finding for the reproduction.
+    // `finish` is a parameter so that fix can reuse this sequence unchanged.
+    const requestShutdown = (finish: () => Promise<unknown>): boolean => {
+      const pendingStarts = [...pendingImportStarts];
+      const runningJobIds = $queueState.jobs
+        .filter((job) => job.status === "running")
+        .map((job) => job.id);
+      if (
+        runningJobIds.length === 0 &&
+        pendingStarts.length === 0 &&
+        shutdownPendingJobIds.size === 0
+      ) {
+        return false;
+      }
+      if (
+        !window.confirm(
+          "An import is in progress. Quit now and cancel the running import?",
+        )
+      ) {
+        return true;
+      }
+      cancellingForClose = true;
+
+      void (async () => {
+        try {
+          const outcome = await runImportShutdown({
+            pendingStarts,
+            runningJobIds,
+            currentRunningJobIds: () =>
+              $queueState.jobs
+                .filter((job) => job.status === "running")
+                .map((job) => job.id),
+            retainedJobIds: shutdownPendingJobIds,
+            cancelImport: importCancel,
+            awaitTerminal: importAwaitTerminal,
+          });
+          if (outcome.kind === "incomplete") {
+            importError = outcome.message;
+            return;
+          }
+
+          allowCloseAfterCancel = true;
+          await finish();
+        } catch {
+          allowCloseAfterCancel = false;
+          importError = SHUTDOWN_INCOMPLETE_MESSAGE;
+        } finally {
+          cancellingForClose = false;
+        }
+      })();
+      return true;
+    };
+
     void getCurrentWindow()
       .onCloseRequested((event) => {
         if (allowCloseAfterCancel) {
@@ -175,87 +231,9 @@
           event.preventDefault();
           return;
         }
-
-        const pendingStarts = [...pendingImportStarts];
-        const runningJobIds = $queueState.jobs
-          .filter((job) => job.status === "running")
-          .map((job) => job.id);
-        if (
-          runningJobIds.length === 0 &&
-          pendingStarts.length === 0 &&
-          shutdownPendingJobIds.size === 0
-        ) {
-          return;
+        if (requestShutdown(() => getCurrentWindow().close())) {
+          event.preventDefault();
         }
-        event.preventDefault();
-        if (
-          !window.confirm(
-            "An import is in progress. Quit now and cancel the running import?",
-          )
-        ) {
-          return;
-        }
-        cancellingForClose = true;
-
-        void (async () => {
-          try {
-            // A pending start has no job id to cancel until startImport's
-            // post-admission refresh commits it to the queue snapshot.
-            await Promise.allSettled(pendingStarts);
-            const jobIdsToCancel = new Set(runningJobIds);
-            for (const job of $queueState.jobs) {
-              if (job.status === "running") jobIdsToCancel.add(job.id);
-            }
-            for (const jobId of jobIdsToCancel) shutdownPendingJobIds.add(jobId);
-            const cancellationResults = await Promise.allSettled(
-              [...jobIdsToCancel].map((jobId) => importCancel(jobId)),
-            );
-            const jobIdsToAwait = [...shutdownPendingJobIds];
-            const terminalResults = await Promise.allSettled(
-              jobIdsToAwait.map((jobId) => importAwaitTerminal(jobId, 30_000)),
-            );
-            // A cancel rejecting because the job already reached a terminal
-            // status is not a shutdown-safety failure -- it means the import
-            // finished on its own (e.g. during the confirm() prompt above,
-            // which blocks the JS thread while runningJobIds was snapshotted
-            // from a queue store that only the 2s poll refreshes). That case
-            // is exactly what importAwaitTerminal re-verifies for every id in
-            // jobIdsToAwait, a superset of the cancelled set, so it's safe to
-            // ignore here. Any OTHER cancel rejection (lock failure, unknown
-            // job) means cancellation may not have taken effect and must
-            // still block the close.
-            const fatalCancellationFailure = cancellationResults.some(
-              (result) =>
-                result.status === "rejected" &&
-                !(
-                  result.reason instanceof Error &&
-                  result.reason.message.includes("Cannot cancel a terminal import")
-                ),
-            );
-            const shutdownIncomplete =
-              fatalCancellationFailure ||
-              terminalResults.some((result) => result.status === "rejected");
-            if (shutdownIncomplete) {
-              importError =
-                "The import is still shutting down. Keep this window open and retry quitting.";
-              return;
-            }
-
-            allowCloseAfterCancel = true;
-            // getCurrentWindow().close() tears down this webview once it
-            // resolves -- the app is quitting, and no future onCloseRequested
-            // can fire to consult shutdownPendingJobIds again, so clearing it
-            // here would be dead code (and was: unreachable in practice).
-            await getCurrentWindow().close();
-          } catch {
-            allowCloseAfterCancel = false;
-            importError =
-              "The import is still shutting down. Keep this window open and retry quitting.";
-          } finally {
-            cancellingForClose = false;
-          }
-        })();
-
       })
       .then((fn) => {
         // Drop the handler if the component unmounted before registration
