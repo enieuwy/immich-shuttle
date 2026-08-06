@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::Path;
 
 use crate::models::job::{FileError, JobProgress};
 
@@ -27,6 +28,12 @@ pub struct RunProgress {
     /// A source immich-go could not enumerate shows up here and nowhere else, so
     /// this is what tells a "nothing was even read" run apart from a clean one.
     pub scan_errors: u32,
+    /// Number of `uploaded successfully` / `server has duplicate` events whose
+    /// `file=` value failed to resolve against any invocation root. Resolution
+    /// is now mandatory for a line to be tallied at all (see
+    /// `fs_path_from_file_attr`), so a parse miss would otherwise silently
+    /// zero the count instead of surfacing as an anomaly.
+    pub unresolved_file_events: u32,
 }
 
 /// Extract the value of a space-delimited `key=` attribute from a console-slog
@@ -76,35 +83,90 @@ fn error_message(line: &str) -> Option<String> {
     }
 }
 
+/// Whether `s` begins with a Windows drive prefix like `C:\` or `C:/`.
+fn is_windows_drive_prefix(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// Join a matched invocation root with the `name` portion of a `file=` value.
+/// Shared by both resolution branches of `fs_path_from_file_attr` below.
+fn join_root(root: &str, name: &str) -> String {
+    let separator = if root.ends_with(['/', '\\']) { "" } else { "/" };
+    format!("{root}{separator}{name}")
+}
+
 /// Convert immich-go's logged `file=` value into a real local filesystem path.
 ///
-/// immich-go (v0.32.0) logs files as `<fsRoot>:<name>` — e.g.
-/// `/Volumes/CANON:DCIM/IMG_0001.JPG` — where `fsRoot` is the source path passed
-/// to it and `name` is the path within. Match the known roots first because a
-/// POSIX source path may itself contain a colon.
+/// immich-go (v0.32.0) logs files as `<fsRoot>:<name>`, but `fsRoot` is not
+/// reliably the full invocation path. Empirically (verified against a live
+/// server run: `/tmp/igo-verify` produced `file=igo-verify:DCIM/IMG_0001.JPG`),
+/// when immich-go is invoked with an absolute source directory it logs only
+/// that directory's BASENAME — never the full path. Some other invocation
+/// shape or platform may still log the full path (e.g.
+/// `/Volumes/CANON:DCIM/IMG_0001.JPG`), so both spellings are accepted, most
+/// specific first:
 ///
-/// Returns `None` whenever the value does not carry a known `<fsRoot>:`
-/// prefix — including when no source roots are configured at all. The run log
-/// is not a trusted channel: console-slog writes attribute values unescaped,
-/// so a filename containing a newline on untrusted media can forge additional
-/// log records with an arbitrary `file=`. There is no safe fallback heuristic
-/// here: a value that does not resolve against a known invocation root did not
-/// come from the scan, so it must never be tallied as an upload/duplicate or
-/// collected as a wipe candidate. Callers MUST always supply the roots
-/// immich-go was actually invoked against (see `UploadRequest::log_source_roots`)
-/// so a staged import's temp-dir roots are still recognized.
+/// 1. Full path: `file.strip_prefix(root)` then a `:` separator. On multiple
+///    matches the longest root wins.
+/// 2. Basename: the fsRoot segment — up to the first `:`, skipping a leading
+///    Windows drive prefix like `C:\` (the full-path branch above already
+///    owns that shape; skipping it here just keeps the split from landing on
+///    the drive letter's own colon) — compared against each root's final
+///    path component (`Path::file_name`).
+///
+/// Two selected source roots can share a basename (e.g. `/a/DCIM` and
+/// `/b/DCIM`; nothing dedupes the invocation roots by basename). If the
+/// basename branch matches more than one root, resolution refuses to guess
+/// and returns `None` — putting another card's file into the delete-
+/// candidate set would be worse than dropping the tally for one line.
+///
+/// Returns `None` whenever the value resolves against no known root at all
+/// (including when no source roots are configured) or against more than one
+/// root by basename. The run log is not a trusted channel: console-slog
+/// writes attribute values unescaped, so a filename containing a newline on
+/// untrusted media can forge additional log records with an arbitrary
+/// `file=`. There is no safe fallback heuristic here: a value that resolves
+/// against no known invocation root must never be tallied as an
+/// upload/duplicate or collected as a wipe candidate. Callers MUST always
+/// supply the roots immich-go was actually invoked against (see
+/// `UploadRequest::log_source_roots`) so a staged import's temp-dir roots are
+/// still recognized.
 fn fs_path_from_file_attr(file: &str, source_paths: &[String]) -> Option<String> {
-    let (root, name) = source_paths
+    // 1. Full-path prefix, longest root wins.
+    if let Some((root, name)) = source_paths
         .iter()
         .filter_map(|root| {
-            file.strip_prefix(root)
+            file.strip_prefix(root.as_str())
                 .and_then(|rest| rest.strip_prefix(':'))
                 .filter(|name| !name.is_empty())
-                .map(|name| (root, name))
+                .map(|name| (root.as_str(), name))
         })
-        .max_by_key(|(root, _)| root.len())?;
-    let separator = if root.ends_with(['/', '\\']) { "" } else { "/" };
-    Some(format!("{root}{separator}{name}"))
+        .max_by_key(|(root, _)| root.len())
+    {
+        return Some(join_root(root, name));
+    }
+
+    // 2. Basename fallback (see doc comment above for why this exists).
+    let search_from = if is_windows_drive_prefix(file) { 2 } else { 0 };
+    let colon = search_from + file.get(search_from..)?.find(':')?;
+    let (fs_root, name) = (&file[..colon], &file[colon + 1..]);
+    if fs_root.is_empty() || name.is_empty() {
+        return None;
+    }
+    let mut matches = source_paths.iter().filter(|root| {
+        Path::new(root.as_str())
+            .file_name()
+            .and_then(|f| f.to_str())
+            == Some(fs_root)
+    });
+    let root = matches.next()?;
+    if matches.next().is_some() {
+        // Ambiguous: more than one selected root has this basename. See doc
+        // comment — guessing could delete another card's file.
+        return None;
+    }
+    Some(join_root(root, name))
 }
 
 /// The message of a console-slog INFO line (`YYYY-MM-DD HH:MM:SS INF <msg...>`),
@@ -159,6 +221,12 @@ pub struct ProgressAccumulator {
     errors: u32,
     /// Aggregate error events with no `file=` (e.g. an unreadable source root).
     scan_errors: u32,
+    /// Non-empty `file=` values on `uploaded successfully` / `server has
+    /// duplicate` lines that failed to resolve against any invocation root.
+    /// Resolution is now mandatory for a line to be tallied at all, so a
+    /// parse miss would otherwise silently zero the count instead of
+    /// surfacing as an anomaly worth logging.
+    unresolved_file_events: u32,
     /// A trailing line not yet terminated by '\n'; reparsed once its rest arrives.
     pending: String,
     source_paths: Vec<String>,
@@ -212,6 +280,7 @@ impl ProgressAccumulator {
             progress,
             completed_paths: self.completed_paths.clone(),
             scan_errors: self.scan_errors,
+            unresolved_file_events: self.unresolved_file_events,
         }
     }
 
@@ -242,7 +311,9 @@ impl ProgressAccumulator {
             return;
         };
         if message.starts_with("uploaded successfully") {
-            if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
+            if let Some(file) = attr_value(line, "file", &["error", "reason", "discovered_at"])
+                .filter(|f| !f.is_empty())
+            {
                 // Tallying and dedup both require resolution now: an
                 // unresolvable `file=` did not come from the scan (it may be a
                 // forged record — a filename containing a newline can inject an
@@ -251,19 +322,31 @@ impl ProgressAccumulator {
                 // signal derived from it. Dedupe on the resolved path (not the
                 // raw logged value) so two differently-spelled but
                 // equivalent-after-resolution values still collapse to one.
-                if let Some(path) = fs_path_from_file_attr(&file, &self.source_paths) {
-                    if self.seen_paths.insert(path.clone()) {
-                        self.uploaded = self.uploaded.saturating_add(1);
-                        self.completed_paths.push(path);
+                match fs_path_from_file_attr(&file, &self.source_paths) {
+                    Some(path) => {
+                        if self.seen_paths.insert(path.clone()) {
+                            self.uploaded = self.uploaded.saturating_add(1);
+                            self.completed_paths.push(path);
+                        }
+                    }
+                    None => {
+                        self.unresolved_file_events = self.unresolved_file_events.saturating_add(1);
                     }
                 }
             }
         } else if message.starts_with("server has duplicate") {
-            if let Some(file) = attr_value(line, "file", &[]).filter(|f| !f.is_empty()) {
-                if let Some(path) = fs_path_from_file_attr(&file, &self.source_paths) {
-                    if self.seen_paths.insert(path.clone()) {
-                        self.duplicates = self.duplicates.saturating_add(1);
-                        self.completed_paths.push(path);
+            if let Some(file) = attr_value(line, "file", &["error", "reason", "discovered_at"])
+                .filter(|f| !f.is_empty())
+            {
+                match fs_path_from_file_attr(&file, &self.source_paths) {
+                    Some(path) => {
+                        if self.seen_paths.insert(path.clone()) {
+                            self.duplicates = self.duplicates.saturating_add(1);
+                            self.completed_paths.push(path);
+                        }
+                    }
+                    None => {
+                        self.unresolved_file_events = self.unresolved_file_events.saturating_add(1);
                     }
                 }
             }
@@ -351,7 +434,7 @@ mod tests {
 
     #[test]
     fn counts_events_not_summary_report() {
-        let p = parse_run_progress(LOG, &["Untitled".to_string()]).progress;
+        let p = parse_run_progress(LOG, &["/Volumes/Untitled".to_string()]).progress;
         // 2 discovered image + 1 discovered video event lines (NOT the indented
         // "discovered image : 193" summary line).
         assert_eq!(p.total, 3);
@@ -367,16 +450,17 @@ mod tests {
         // Duplicates already on the server are safe-to-wipe candidates too, so
         // they join the completed paths (in log order: the duplicate line comes
         // before the two uploads) while `uploaded` stays a separate count.
-        // "Untitled" is the fsRoot the fixture log was actually captured
-        // against; the accumulator only resolves (and tallies) under known
-        // invocation roots.
-        let run = parse_run_progress(LOG, &["Untitled".to_string()]);
+        // The fixture log spells its fsRoot as the bare basename "Untitled"
+        // (matching what immich-go actually logs); the invocation root is the
+        // absolute path production actually passes, resolved via the basename
+        // branch of `fs_path_from_file_attr`.
+        let run = parse_run_progress(LOG, &["/Volumes/Untitled".to_string()]);
         assert_eq!(
             run.completed_paths,
             vec![
-                "Untitled/DCIM/100MSDCF/DSC08936.ARW",
-                "Untitled/DCIM/100MSDCF/DSC09008.ARW",
-                "Untitled/DCIM/100MSDCF/DSC09009.ARW",
+                "/Volumes/Untitled/DCIM/100MSDCF/DSC08936.ARW",
+                "/Volumes/Untitled/DCIM/100MSDCF/DSC09008.ARW",
+                "/Volumes/Untitled/DCIM/100MSDCF/DSC09009.ARW",
             ]
         );
         assert_eq!(run.progress.uploaded, 2);
@@ -602,7 +686,7 @@ mod tests {
 
     #[test]
     fn incremental_chunks_match_full_parse() {
-        let roots = vec!["Untitled".to_string()];
+        let roots = vec!["/Volumes/Untitled".to_string()];
         let full = parse_run_progress(LOG, &roots);
         // Feed the log one byte at a time (each chunk splits lines arbitrarily);
         // the running snapshot must equal a whole-log parse.
@@ -639,5 +723,88 @@ mod tests {
         assert!(!is_error_line(line));
         assert_eq!(info_line_message(line), None);
         assert_eq!(parse_run_progress(line, &[]).progress.errors, 0);
+    }
+
+    // ---- basename fsRoot resolution (the P0 regression) ----
+
+    /// The exact `file=` value captured from a live-server run of the bundled
+    /// immich-go binary (v0.32.0) invoked against `/tmp/igo-verify`: immich-go
+    /// logs the invocation root's BASENAME, not the full path it was actually
+    /// given. Before the basename branch existed, `fs_path_from_file_attr`
+    /// returned `None` for every real import, because production always
+    /// passes full absolute paths as source roots while the fixture-only
+    /// "Untitled" tests matched by coincidence. This test fails against the
+    /// pre-fix code (full-path-prefix matching only).
+    #[test]
+    fn resolves_basename_fsroot_against_absolute_invocation_root() {
+        let log = "2026-08-06 12:14:10 INF uploaded successfully file=igo-verify:DCIM/100MSDCF/IMG_0001.JPG";
+        let run = parse_run_progress(log, &["/tmp/igo-verify".to_string()]);
+        assert_eq!(run.progress.uploaded, 1);
+        assert_eq!(
+            run.completed_paths,
+            vec!["/tmp/igo-verify/DCIM/100MSDCF/IMG_0001.JPG"]
+        );
+    }
+
+    /// Two selected sources can share a basename (e.g. two different cards
+    /// each mounted with a directory named `DCIM`); nothing dedupes the
+    /// invocation roots by basename. Resolving to either would risk putting
+    /// one card's file into another card's delete-candidate set, so the
+    /// basename branch must refuse to guess and resolve to nothing.
+    #[test]
+    fn ambiguous_basename_resolves_to_nothing() {
+        let roots = vec!["/a/DCIM".to_string(), "/b/DCIM".to_string()];
+        let log = "2026-06-24 16:10:00 INF uploaded successfully file=DCIM:IMG_0001.JPG";
+        let run = parse_run_progress(log, &roots);
+        assert!(run.completed_paths.is_empty());
+        assert_eq!(run.progress.uploaded, 0);
+        assert_eq!(run.unresolved_file_events, 1);
+    }
+
+    /// `/etc/outside.jpg` carries no `:` at all, so the basename branch must
+    /// not accidentally treat any substring of it as a matching fsRoot; it
+    /// must still resolve to nothing, exactly like the full-path branch.
+    #[test]
+    fn basename_branch_does_not_let_forged_records_through() {
+        let run = parse_run_progress(
+            "2026-06-24 16:10:00 INF uploaded successfully file=/etc/outside.jpg",
+            &["/Volumes/CARD".to_string()],
+        );
+        assert!(run.completed_paths.is_empty());
+        assert_eq!(run.progress.uploaded, 0);
+    }
+
+    // ---- INF `file=` terminator list (was previously unterminated) ----
+
+    /// Before the fix, the INF branches passed an empty terminator list to
+    /// `attr_value`, so a `file=` value ran to end of line and swallowed any
+    /// trailing attribute verbatim into the resolved path. Passing the same
+    /// terminator list the ERR branch already used cuts the value at the
+    /// real trailing attribute instead.
+    #[test]
+    fn uploaded_line_file_value_terminates_before_trailing_attr() {
+        let log = "2026-06-24 16:10:21 INF uploaded successfully file=/Volumes/CARD:DCIM/IMG_0001.JPG error=unexpected";
+        let run = parse_run_progress(log, &["/Volumes/CARD".to_string()]);
+        assert_eq!(run.progress.uploaded, 1);
+        assert_eq!(run.completed_paths, vec!["/Volumes/CARD/DCIM/IMG_0001.JPG"]);
+    }
+
+    // ---- unresolved_file_events ----
+
+    /// Resolution is now mandatory for a line to be tallied at all, so a
+    /// parse miss (e.g. a future immich-go format drift) must not silently
+    /// vanish — it has to survive onto the `RunProgress` snapshot, which is
+    /// what `import_start` logs as an anomaly.
+    #[test]
+    fn unresolved_file_events_counts_non_resolving_records() {
+        let mut acc = ProgressAccumulator::with_source_paths(&["/Volumes/OtherCard".to_string()]);
+        acc.push_chunk(
+            "2026-06-24 16:10:00 INF uploaded successfully file=Untracked:DCIM/IMG_0001.JPG\n\
+2026-06-24 16:10:01 INF server has duplicate file=Untracked:DCIM/IMG_0002.JPG\n",
+        );
+        let run = acc.snapshot();
+        assert_eq!(run.unresolved_file_events, 2);
+        assert_eq!(run.progress.uploaded, 0);
+        assert_eq!(run.progress.duplicates, 0);
     }
 }

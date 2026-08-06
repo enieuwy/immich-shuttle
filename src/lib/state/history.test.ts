@@ -44,6 +44,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 import * as api from "$lib/api";
 import type { Album, ImportInput, ImportRecord } from "$lib/types";
 import { profilesState, activeProfile } from "./profiles";
+import { albumsState } from "./albums";
 import { sourceState } from "./source";
 import { errorsState } from "./errors";
 import { historyState, replayImport } from "./history";
@@ -162,5 +163,43 @@ describe("replayImport", () => {
 
     const errors = get(errorsState);
     expect(errors.some((e) => /album/i.test(e.message))).toBe(true);
+  });
+
+  it("abandons the album selection if the active profile changes while albums are loading", async () => {
+    await saveProfile("p1", "https://one.example.com");
+    await saveProfile("p2", "https://two.example.com");
+
+    const gate = Promise.withResolvers<Album[]>();
+    vi.mocked(api.albumsList).mockReturnValueOnce(gate.promise);
+
+    const record = importRecord("r1", {
+      profile_id: "p1",
+      source_paths: ["/a"],
+      album_ids: ["stale-album"],
+    });
+
+    const replay = replayImport(record);
+
+    // Simulate the user switching profiles via ProfileSelector while
+    // replayImport is suspended awaiting p1's albums -- the real component
+    // stays interactive for the whole replay.
+    profilesState.setActiveProfile("p2");
+
+    // Resolves with an album that only makes sense for p1; if the profile
+    // check were missing (or only re-checked a dead generation counter, as
+    // before this fix), this id would land in p2's selectedAlbumIds.
+    gate.resolve([{ id: "stale-album", album_name: "Stale", shared_with: [] }]);
+
+    const outcome = await replay;
+
+    expect(outcome).toBe("staged");
+    expect(get(activeProfile)?.id).toBe("p2");
+    expect(get(albumsState).selectedAlbumIds).not.toContain("stale-album");
+    expect(get(albumsState).selectedAlbumIds).toEqual([]);
+    expect(get(historyState).replaying).toBe(false);
+    expect(get(historyState).replayingRecordId).toBeNull();
+
+    const errors = get(errorsState);
+    expect(errors.some((e) => /profile changed/i.test(e.message))).toBe(true);
   });
 });

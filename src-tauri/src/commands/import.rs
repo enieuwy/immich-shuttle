@@ -33,6 +33,11 @@ static JOB_INPUTS: LazyLock<Mutex<HashMap<String, ImportInput>>> =
 
 const MAX_RETAINED_TERMINAL_JOBS: usize = 500;
 const SCAN_DEADLINE: Duration = Duration::from_secs(60 * 60);
+/// Ceiling for `import_await_terminal`'s IPC-supplied `timeout_ms`. Ample
+/// above the 30_000ms production ever passes; exists only so an untrusted
+/// huge value can't push `Instant::now() + Duration::from_millis(..)` past
+/// `Instant`'s `Add` overflow panic.
+const MAX_AWAIT_TERMINAL_TIMEOUT_MS: u64 = 600_000;
 
 static IMPORT_START_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static ACTIVE_SCAN: LazyLock<Mutex<Option<Arc<AtomicBool>>>> = LazyLock::new(|| Mutex::new(None));
@@ -298,8 +303,13 @@ fn validate_selected_under_sources(
 /// candidates. It matters because `file=` values in the run log are
 /// attacker-influenced: console-slog writes attribute values unescaped, so a
 /// filename or directory containing a newline on untrusted media can forge a
-/// whole `INF uploaded successfully file=/somewhere/else` record. Such a path
-/// cannot be under a source root, so it dies here.
+/// whole `INF uploaded successfully file=/somewhere/else` record. This only
+/// rules out a forged path outside every source root — a forged record that
+/// instead names a different, real file already sitting under the SAME root
+/// survives untouched. The damage from that case is bounded downstream, not
+/// here: `verify_uploaded` still requires a live SHA-1 match against the
+/// server before a file is queued, `wipe_files` moves originals to Trash
+/// rather than unlinking them, and the user must still confirm the wipe.
 fn retain_paths_under_sources(paths: Vec<String>, source_paths: &[String]) -> (Vec<String>, usize) {
     let roots: Vec<PathBuf> = source_paths
         .iter()
@@ -343,10 +353,12 @@ struct RunOutcome {
 /// passed to immich-go, and media added afterwards with an older capture date
 /// falls below it and is never offered again. So it requires positive evidence
 /// that this run actually processed the source — at least one landed asset and no
-/// aggregate scan error. A zero-asset run (empty card, or filters that excluded
-/// everything) is still `Completed`, because nothing went wrong; it just has not
-/// earned the right to raise the floor. Erring this way costs a re-scan that
-/// server-side dedupe makes harmless; erring the other way loses photos.
+/// aggregate scan error — and that evidence must have survived containment (see
+/// `completed_paths_len` below): a forged log entry naming a file that does not
+/// exist on disk cannot supply it. A zero-asset run (empty card, or filters that
+/// excluded everything) is still `Completed`, because nothing went wrong; it just
+/// has not earned the right to raise the floor. Erring this way costs a re-scan
+/// that server-side dedupe makes harmless; erring the other way loses photos.
 fn classify_completed_run(
     uploaded: u32,
     duplicates: u32,
@@ -364,8 +376,23 @@ fn classify_completed_run(
         JobStatus::Completed
     };
     let wipe_eligible = !failed && !keep_files && completed_paths_len > 0;
-    let checkpoint_eligible =
-        !failed && landed && file_errors_len == 0 && !exit_nonzero && scan_errors == 0;
+    // `landed` alone is not sufficient evidence for the checkpoint: it is read
+    // straight off the immich-go log's uploaded/duplicate tallies, and those are
+    // resolved against an invocation root by string matching only — no
+    // filesystem check. A record forged under a root (see
+    // `retain_paths_under_sources`) can inflate `landed` without ever
+    // surviving containment. `completed_paths_len` is exactly the count that
+    // did survive containment (via `retain_paths_under_sources`, or via
+    // `validate_selected_under_sources` at admission for a staged import — see
+    // the call site), so require it here too. `landed` keeps its existing role
+    // in `failed` above unchanged, so ordinary run status is unaffected; only
+    // the stricter checkpoint gate gains this extra requirement.
+    let checkpoint_eligible = !failed
+        && landed
+        && completed_paths_len > 0
+        && file_errors_len == 0
+        && !exit_nonzero
+        && scan_errors == 0;
     RunOutcome {
         status,
         wipe_eligible,
@@ -637,6 +664,21 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             crate::services::stdout_parser::parse_error_log(&log_contents, &source_paths);
         let run =
             crate::services::stdout_parser::parse_run_progress(&log_contents, &invocation_roots);
+        // A non-zero count here means some `file=` records in the run log did
+        // not resolve against any invocation root. Resolution is now mandatory
+        // for the uploaded/duplicate tallies and the checkpoint gate (see
+        // `classify_completed_run`), so an immich-go log-format drift would
+        // otherwise silently zero every count with no signal anywhere; log it
+        // so drift shows up as a named anomaly instead.
+        if run.unresolved_file_events > 0 {
+            let _ = logs::append_log(
+                "app.log",
+                &format!(
+                    "import_unresolved_file_events job_id={job_id_clone} count={}",
+                    run.unresolved_file_events
+                ),
+            );
+        }
         // parse_run_progress counts every distinct errored file (uncapped);
         // file_errors is capped at MAX_FILE_ERRORS for the UI payload. Keep the
         // true count so the final tally never undercounts a mass-failure run.
@@ -650,7 +692,16 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // instead. SHA-1 verify_uploaded still gates deletion to files the
         // server actually holds, so unuploaded picks are kept safe.
         let completed_asset_paths = if staged_import {
-            // Already validated under the source roots at admission.
+            // Already validated under the source roots at admission, by
+            // `validate_selected_under_sources` — which canonicalizes each
+            // entry and so requires it to exist, the same containment
+            // guarantee `retain_paths_under_sources` gives the non-staged
+            // branch below, just established before the run instead of after.
+            // A staged import therefore has no log-derived contained paths at
+            // all (the log only ever saw the temp staging dir), but this
+            // pre-run validation already supplies equivalent evidence, so
+            // `completed_asset_paths.len()` can stand in for it below as
+            // `classify_completed_run`'s contained-path count.
             select_files.clone()
         } else {
             // Re-contain what the log claims was uploaded: these paths become
@@ -899,10 +950,13 @@ pub async fn import_forecast(
 ) -> Result<wipe::ForecastResult, String> {
     // Same path scope the preview commands enforce. This command opens and
     // SHA-1s every path the renderer names, then sends those hashes and the
-    // absolute paths to the configured server, so a renderer that is compromised
-    // or simply buggy must not be able to aim it outside the folders the user
-    // chose as sources. `scan_sources_stream` records that scope; anything else
-    // is rejected rather than probed.
+    // absolute paths to the configured server. The approved-root set is
+    // recorded from paths the renderer itself supplies to `scan_sources_stream`,
+    // so a compromised renderer can self-authorize any path — this guard does
+    // not defend against that. What it does catch is path confusion (a stale
+    // or mistyped `source_paths` argument that no longer matches what was
+    // actually scanned) and previewing anything that was never scanned in the
+    // first place.
     for path in &source_paths {
         if !source_guard::is_within_approved(path) {
             return Err(format!(
@@ -1382,6 +1436,11 @@ pub async fn import_cancel(job_id: String) -> Result<(), String> {
 /// observable via `RUNNING_IMPORTS`.
 #[tauri::command]
 pub async fn import_await_terminal(job_id: String, timeout_ms: u64) -> Result<ImportJob, String> {
+    // `timeout_ms` arrives over IPC and must not be trusted to be in range:
+    // `Instant`'s `Add` panics on overflow, and this runs before `get_job`, so
+    // an untrusted huge value would panic the command task for any job id
+    // instead of surfacing as an error. Production only ever passes 30_000.
+    let timeout_ms = timeout_ms.min(MAX_AWAIT_TERMINAL_TIMEOUT_MS);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         let job = get_job(&job_id)?;
@@ -1592,6 +1651,24 @@ mod tests {
         assert!(!o.wipe_eligible);
     }
 
+    #[test]
+    fn tallies_without_contained_paths_do_not_earn_the_checkpoint() {
+        // FORGED-CHECKPOINT: uploaded/duplicates are resolved against
+        // invocation roots by string matching alone, with no filesystem
+        // check, so a forged `file=` record spelled under a root but naming a
+        // file that never existed can inflate these tallies without ever
+        // surviving `retain_paths_under_sources` (which canonicalizes and so
+        // requires the file to actually exist). completed_paths_len is that
+        // survived-containment count, so it must gate the checkpoint too.
+        let o = classify_completed_run(5, 0, false, 0, false, 0, 0);
+        assert!(!is_failed(&o), "uploads landed, so this is not a failure");
+        assert!(!o.wipe_eligible, "nothing survived containment to delete");
+        assert!(
+            !o.checkpoint_eligible,
+            "a tally with no contained-path evidence must not raise the date floor"
+        );
+    }
+
     /// An empty card, or filters that excluded every file, is not an error — but it
     /// is no evidence the source was imported either. Advancing the checkpoint here
     /// would set a date floor of "now" and permanently hide any media added later
@@ -1689,6 +1766,41 @@ mod tests {
         std::fs::remove_dir_all(&unapproved).unwrap();
     }
 
+    /// Isolates the `select_files` branch of the approved-scope guard, which
+    /// `import_forecast_refuses_sources_outside_the_approved_scope` above does
+    /// not exercise (it passes `select_files: None`). Passing zero
+    /// `source_paths` skips the `source_paths` loop entirely — that loop
+    /// checks the process-global `APPROVED_ROOTS`, which is also mutated by
+    /// `source_guard`'s own tests, so asserting it would pass is
+    /// order-dependent. `validate_selected_under_sources` instead checks
+    /// `select_files` against the `source_paths` parameter directly, so this
+    /// negative case needs none of that global state.
+    #[test]
+    fn import_forecast_refuses_selected_files_outside_the_approved_scope() {
+        let unapproved =
+            std::env::temp_dir().join(format!("immich-shuttle-select-outside-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&unapproved).unwrap();
+        let outside_file = unapproved.join("photo.jpg");
+        std::fs::write(&outside_file, b"x").unwrap();
+
+        let err = tauri::async_runtime::block_on(import_forecast(
+            "no-such-profile".to_string(),
+            Vec::new(),
+            Some(vec![outside_file.to_string_lossy().into_owned()]),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ))
+        .unwrap_err();
+
+        assert!(
+            err.contains("outside the chosen source folders"),
+            "expected a select_files-scope rejection, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&unapproved).unwrap();
+    }
+
     /// The whole point of `import_await_terminal`: a terminal STATUS is not a
     /// terminal WORKER. `import_cancel` publishes `Cancelled` immediately while
     /// the worker is still resolving a server, cleaning staging, or waiting for
@@ -1741,6 +1853,22 @@ mod tests {
         let err =
             tauri::async_runtime::block_on(import_await_terminal("no-such-job".to_string(), 50))
                 .unwrap_err();
+        assert!(err.contains("no-such-job"), "got: {err}");
+    }
+
+    #[test]
+    fn await_terminal_clamps_a_huge_timeout_instead_of_panicking() {
+        // AWAIT-TERMINAL-PANIC: `Instant::now() + Duration::from_millis(timeout_ms)`
+        // panics on overflow, and this ran before `get_job` — so a renderer
+        // passing a large u64 over IPC panicked the command task for any job
+        // id. Assert the clamp lands before that add, not that the wait
+        // actually elapses: the unknown job id makes get_job fail on the very
+        // first loop iteration, so this returns almost instantly either way.
+        let err = tauri::async_runtime::block_on(import_await_terminal(
+            "no-such-job".to_string(),
+            u64::MAX,
+        ))
+        .unwrap_err();
         assert!(err.contains("no-such-job"), "got: {err}");
     }
 }

@@ -26,7 +26,7 @@ use std::{
     io::{Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
-    time::UNIX_EPOCH,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(target_os = "macos")]
@@ -313,18 +313,29 @@ pub fn thumbnail(path_str: &str, max: u32) -> ThumbResult {
     };
 
     // Fully read the cache file before allowing post-write pruning to remove it.
-    let result = file
-        .as_deref()
-        .and_then(|file| match to_result(path_str, file) {
+    let result = file.as_deref().and_then(|file| {
+        // Snapshot (mtime, len) before decoding so the self-heal delete below
+        // can tell whether `file` is still the entry that failed to decode.
+        // Without this, the delete races an atomic publish: it is
+        // unsynchronized (unlike pruning, which goes through
+        // `IN_FLIGHT_CACHE_FILES` / `CACHE_PRUNE_LOCK`), so two overlapping
+        // readers of the same corrupt entry could otherwise have one delete
+        // a good file a third worker published in the gap.
+        let identity_before = cache_file_identity(file);
+        match to_result(path_str, file) {
             Ok(r) => Some(r),
             // A legacy truncated entry (written before atomic publish, or from a
             // process that crashed mid-write) must not be served as a "hit"
-            // forever; delete it so the next request regenerates it cleanly.
+            // forever; delete it so the next request regenerates it cleanly --
+            // but only if it's still the same file we failed to decode.
             Err(_) => {
-                let _ = fs::remove_file(file);
+                if cache_file_identity(file) == identity_before {
+                    let _ = fs::remove_file(file);
+                }
                 None
             }
-        });
+        }
+    });
     drop(cache_files);
     if wrote_cache && file.is_some() {
         prune_cache_after_write(&cache);
@@ -348,6 +359,16 @@ fn to_result(path_str: &str, file: &Path) -> Result<ThumbResult, String> {
         width,
         height,
     })
+}
+
+/// Cheap identity of a cache file for detecting whether it was replaced
+/// in place between two stats: (mtime, length). Used by `thumbnail()` to
+/// confirm a decode-failed entry is still the one it read before deleting
+/// it, so a slow failing reader cannot unlink a good file a faster
+/// concurrent writer atomically published in the meantime.
+fn cache_file_identity(file: &Path) -> Option<(SystemTime, u64)> {
+    let meta = fs::metadata(file).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 /// Try the available backends in order; return the produced cache file, if any.

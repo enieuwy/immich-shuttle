@@ -1,10 +1,14 @@
-//! Owner-only atomic replacement for the app's persisted JSON stores.
+//! Atomic replacement for the app's persisted JSON stores, hardened against
+//! other local users where the platform supports it.
 //!
 //! `config.json` holds every profile's LAN/WAN endpoints and `store.json` holds
-//! the full import history including local source paths — the same class of data
-//! the logs directory is already kept owner-only for (see `logs::logs_dir`).
-//! Both used to go out through a plain `fs::write`, i.e. world-readable on a
-//! shared machine, and each carried its own copy of the temp-file dance.
+//! the full import history including local source paths -- the same class of
+//! data the logs directory is already kept owner-only for on Unix (see
+//! `logs::logs_dir`). Both used to go out through a plain `fs::write`, i.e.
+//! group/world-readable on a shared Unix machine, and each carried its own copy
+//! of the temp-file dance. The 0600/0700 permission hardening added here is
+//! `#[cfg(unix)]` only; on Windows the only access control is the per-user
+//! app-data ACL Windows already applies, unchanged from before.
 
 use std::{
     fs,
@@ -18,7 +22,7 @@ use std::{
 /// process off these files.
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Write `contents` to `path` atomically and readable only by the owner.
+/// Write `contents` to `path` atomically.
 ///
 /// The temp file is created in the destination's own directory so the rename
 /// stays on one filesystem, under a name unique to this process and call.
@@ -26,6 +30,18 @@ static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 /// Windows (`MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`), so there is no
 /// direct-write fallback: when the rename fails the previous contents survive
 /// intact, which is strictly better than a half-written store.
+///
+/// Owner-only file and directory modes (0600 / 0700) are applied `#[cfg(unix)]`
+/// only -- Windows has no POSIX mode bits, so this relies on the per-user ACL
+/// Windows already applies to the app's data directory instead. Note also that
+/// the 0700 chmod on the parent directory runs unconditionally on every save,
+/// so a deliberate group-access or setgid bit a user set on that directory is
+/// silently cleared on the next call.
+///
+/// After the rename, the parent directory is fsynced (`#[cfg(unix)]`) so the
+/// new directory entry itself survives an unclean shutdown -- without this, a
+/// crash right after a successful rename can revert to the pre-rename entry
+/// even though this function already returned `Ok`, silently losing the save.
 pub fn write_atomic_private(path: &Path, contents: &str) -> Result<(), String> {
     let dir = path
         .parent()
@@ -65,6 +81,15 @@ pub fn write_atomic_private(path: &Path, contents: &str) -> Result<(), String> {
     if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("Could not persist {}: {err}", path.display()));
+    }
+    // Fsync the parent directory so the rename's directory-entry update is
+    // itself durable; the file's own fsync above only protects its bytes.
+    // No Windows equivalent: NTFS has no directory-fsync primitive, and
+    // `fs::rename` on Windows already goes through `MoveFileEx`, which
+    // journals the metadata update itself.
+    #[cfg(unix)]
+    if let Err(err) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+        return Err(format!("Could not sync directory {}: {err}", dir.display()));
     }
     Ok(())
 }

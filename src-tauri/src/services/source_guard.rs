@@ -16,19 +16,20 @@ use std::{
 };
 
 static APPROVED_ROOTS: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-const MAX_APPROVED_ROOTS: usize = 256;
 
 /// Record user-selected source roots as authorized for later path-scoped reads.
 ///
-/// The current selection is ALWAYS fully authorized — it is never truncated,
-/// even if it exceeds `MAX_APPROVED_ROOTS` (rejecting a just-selected root would
-/// make its scanned media fail `is_within_approved`). The cap only bounds
-/// cross-session growth by evicting the oldest roots that are NOT part of this
-/// selection. Canonicalization runs before the lock so a slow filesystem cannot
-/// stall concurrent `is_within_approved` checks. A panic elsewhere must not
-/// wedge the guard: the root list is a plain `Vec<PathBuf>` with no invariant a
-/// panic could break mid-update, so a poisoned lock is recovered rather than
-/// treated as permanent denial (which would blank previews for the session).
+/// The approved scope is always exactly the current selection: the only
+/// production caller pairs this with `reset_roots()` immediately beforehand
+/// (`reset_roots(); record_roots(&paths);`), so `roots` holds nothing else by
+/// the time this returns. There is no cross-session accumulation to bound, so
+/// unlike some caches here this list is never evicted -- just replaced whole
+/// by the next reset+record pair. Canonicalization runs before the lock so a
+/// slow filesystem cannot stall concurrent `is_within_approved` checks. A
+/// panic elsewhere must not wedge the guard: the root list is a plain
+/// `Vec<PathBuf>` with no invariant a panic could break mid-update, so a
+/// poisoned lock is recovered rather than treated as permanent denial (which
+/// would blank previews for the session).
 pub fn record_roots(paths: &[String]) {
     let batch: Vec<PathBuf> = paths
         .iter()
@@ -40,16 +41,6 @@ pub fn record_roots(paths: &[String]) {
     for canon in &batch {
         if !roots.contains(canon) {
             roots.push(canon.clone());
-        }
-    }
-    // Evict the oldest roots that are not in the current selection until back
-    // under the soft cap; stop if everything left belongs to this selection.
-    while roots.len() > MAX_APPROVED_ROOTS {
-        match roots.iter().position(|r| !batch.contains(r)) {
-            Some(idx) => {
-                roots.remove(idx);
-            }
-            None => break,
         }
     }
 }

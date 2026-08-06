@@ -214,8 +214,26 @@
             const terminalResults = await Promise.allSettled(
               jobIdsToAwait.map((jobId) => importAwaitTerminal(jobId, 30_000)),
             );
+            // A cancel rejecting because the job already reached a terminal
+            // status is not a shutdown-safety failure -- it means the import
+            // finished on its own (e.g. during the confirm() prompt above,
+            // which blocks the JS thread while runningJobIds was snapshotted
+            // from a queue store that only the 2s poll refreshes). That case
+            // is exactly what importAwaitTerminal re-verifies for every id in
+            // jobIdsToAwait, a superset of the cancelled set, so it's safe to
+            // ignore here. Any OTHER cancel rejection (lock failure, unknown
+            // job) means cancellation may not have taken effect and must
+            // still block the close.
+            const fatalCancellationFailure = cancellationResults.some(
+              (result) =>
+                result.status === "rejected" &&
+                !(
+                  result.reason instanceof Error &&
+                  result.reason.message.includes("Cannot cancel a terminal import")
+                ),
+            );
             const shutdownIncomplete =
-              cancellationResults.some((result) => result.status === "rejected") ||
+              fatalCancellationFailure ||
               terminalResults.some((result) => result.status === "rejected");
             if (shutdownIncomplete) {
               importError =
@@ -224,8 +242,11 @@
             }
 
             allowCloseAfterCancel = true;
+            // getCurrentWindow().close() tears down this webview once it
+            // resolves -- the app is quitting, and no future onCloseRequested
+            // can fire to consult shutdownPendingJobIds again, so clearing it
+            // here would be dead code (and was: unreachable in practice).
             await getCurrentWindow().close();
-            for (const jobId of jobIdsToAwait) shutdownPendingJobIds.delete(jobId);
           } catch {
             allowCloseAfterCancel = false;
             importError =

@@ -98,11 +98,6 @@ export const historyState = {
 
 export type ReplayOutcome = "staged" | "no-request" | "profile-missing" | "busy";
 
-// Guards a replay's later shared-store mutations from committing after a
-// newer replay has started -- defense in depth alongside the `replaying`
-// single-flight flag below (see replayImport).
-const replays = createGeneration();
-
 /**
  * Stage a past import for review ("Import again"): restore the profile, album,
  * options, and source from the record's persisted request, then let the user
@@ -122,10 +117,17 @@ export async function replayImport(record: ImportRecord): Promise<ReplayOutcome>
   const request = record.request;
   if (!request) return "no-request";
 
-  // Every "Import again" button stays enabled while a replay runs (that's the
-  // whole point of the `replaying` flag), so two rapid clicks -- same row or a
-  // different one -- would otherwise interleave writes to the shared profile/
-  // album/source/selection stores and stage a hybrid of two records.
+  // Single-flight: this check runs synchronously, before any await, so no
+  // second call through THIS function can ever start while one is already in
+  // flight -- there is no window for a bypass. (An earlier `replays`
+  // generation counter existed alongside this flag to guard the same
+  // second-call race and was therefore dead code -- unreachable, since the
+  // flag already forecloses the only path that would supersede it -- and has
+  // been removed. The real hazard this function has to defend against is
+  // NOT a second replayImport call; it's the active profile changing out
+  // from under an in-flight one via ProfileSelector, which is a plain UI
+  // control that stays interactive for the whole replay and never goes
+  // through this function at all. See abandonIfProfileChanged below.)
   if (get(state).replaying) return "busy";
 
   // History outlives profiles; a deleted profile would leave activeProfile null
@@ -134,12 +136,27 @@ export async function replayImport(record: ImportRecord): Promise<ReplayOutcome>
     return "profile-missing";
   }
 
-  // Claimed even though `replaying` above already makes a second call through
-  // THIS function impossible: a caller that bypasses the flag (or a future
-  // refactor that does) must still be unable to commit a half-superseded
-  // staging over a newer one. Re-checked after every await below.
-  const isCurrent = replays.begin();
   state.update((s) => ({ ...s, replaying: true, replayingRecordId: record.id }));
+
+  // loadAlbums below can take several seconds (up to 6 retries against an
+  // unreachable server), and ProfileSelector stays interactive the whole
+  // time. If the user switches profiles mid-replay, activeProfile.subscribe
+  // (albums.ts) clears albumsState and the NEW profile's own AlbumSelector
+  // effect repopulates it -- so by the time an await below resumes,
+  // `albumsState.loadedProfileId` can match the ACTIVE (new) profile again
+  // while `albums.availableAlbums`/`selectedAlbumIds` are the new profile's.
+  // Resolving `request.album_ids[0]` against that and calling selectAlbum
+  // would write the REPLAYED (old) profile's raw album id in as though it
+  // belonged to the new profile, and queueState.startImport's own
+  // `loadedProfileId === profile.id` gate would then wave it straight
+  // through. Checked after every await below, not just once.
+  const abandonIfProfileChanged = () => {
+    if (get(profilesState).activeProfileId === request.profile_id) return false;
+    errorsState.addError(
+      "Import again was abandoned: the active profile changed before it finished loading.",
+    );
+    return true;
+  };
 
   try {
     profilesState.setActiveProfile(request.profile_id);
@@ -154,7 +171,7 @@ export async function replayImport(record: ImportRecord): Promise<ReplayOutcome>
     // device-rule direct name, with empty album_ids); match whichever is
     // present so the run doesn't silently fall back to the library.
     await albumsState.loadAlbums();
-    if (!isCurrent()) return "staged";
+    if (abandonIfProfileChanged()) return "staged";
 
     const albums = get(albumsState);
     if (albums.error || albums.missingApiKey) {
@@ -177,7 +194,7 @@ export async function replayImport(record: ImportRecord): Promise<ReplayOutcome>
       if (targetId) albumsState.selectAlbum(targetId);
     }
 
-    if (!isCurrent()) return "staged";
+    if (abandonIfProfileChanged()) return "staged";
     // selectSources reports its own failures via errorsState (source.ts) and
     // never rejects, so nothing further to check here.
     await sourceState.selectSources(request.source_paths);
@@ -192,11 +209,6 @@ export async function replayImport(record: ImportRecord): Promise<ReplayOutcome>
     errorsState.addError(`Couldn't fully restore this import: ${message}`);
     return "staged";
   } finally {
-    // Only clear the flag while still the current generation: if somehow
-    // superseded (a bypass of the single-flight guard above), a newer replay
-    // owns the flag now and will clear it itself when it finishes.
-    if (isCurrent()) {
-      state.update((s) => ({ ...s, replaying: false, replayingRecordId: null }));
-    }
+    state.update((s) => ({ ...s, replaying: false, replayingRecordId: null }));
   }
 }
