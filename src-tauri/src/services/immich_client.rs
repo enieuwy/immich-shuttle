@@ -527,35 +527,61 @@ impl ImmichClient {
         })
     }
 
-    /// Checks which of the given (id, sha1-hex-checksum) items already exist on
-    /// the server. Returns the set of `id`s the server reports as duplicates,
-    /// i.e. assets it already holds. Used to verify uploads before wiping the
-    /// local source files.
+    /// Checks which of `checksums` the server already holds, returning the
+    /// POSITIONS within the slice that it reports as duplicates.
+    ///
+    /// The wire `id` is only a correlation handle — the server echoes it back so
+    /// each result can be paired with the row that produced it, and nothing else
+    /// reads it. It is therefore the request index, never the file's path. A path
+    /// would ship the user's account name, volume labels, and directory layout to
+    /// whatever endpoint the active profile resolves to (including the WAN
+    /// failover target), which is strictly more than uploading the photo itself
+    /// discloses: immich-go identifies an asset as `<filename>-<size>` and sends
+    /// no directory structure at all.
     pub async fn bulk_upload_check(
         &self,
-        items: &[(String, String)],
-    ) -> Result<std::collections::HashSet<String>, String> {
-        let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for chunk in items.chunks(500) {
-            let assets: Vec<Value> = chunk
-                .iter()
-                .map(|(id, checksum)| json!({ "id": id, "checksum": checksum }))
-                .collect();
+        checksums: &[String],
+    ) -> Result<std::collections::HashSet<usize>, String> {
+        let mut present: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (chunk_index, chunk) in checksums.chunks(BULK_UPLOAD_CHECK_CHUNK).enumerate() {
+            let offset = chunk_index * BULK_UPLOAD_CHECK_CHUNK;
             let value = self
                 .request_json(
                     Method::POST,
                     &["assets", "bulk-upload-check"],
-                    Some(json!({ "assets": assets })),
+                    Some(bulk_upload_check_payload(offset, chunk)),
                 )
                 .await?;
             let results = value
                 .get("results")
                 .and_then(|r| r.as_array())
                 .ok_or_else(|| "bulk-upload-check returned no results".to_string())?;
-            present.extend(duplicates_from_results(results));
+            // An id we cannot parse is one we never issued, so ignore it. Failing
+            // to recognise a duplicate only means a file is treated as NOT on the
+            // server, which keeps the original — the safe direction.
+            present.extend(
+                duplicates_from_results(results)
+                    .iter()
+                    .filter_map(|id| id.parse::<usize>().ok()),
+            );
         }
         Ok(present)
     }
+}
+
+/// Immich rejects very large batches, so checks are chunked.
+const BULK_UPLOAD_CHECK_CHUNK: usize = 500;
+
+/// Builds one bulk-upload-check request body. Split out so the wire shape can be
+/// asserted without a live server — specifically that it carries nothing but an
+/// index and a checksum.
+fn bulk_upload_check_payload(offset: usize, chunk: &[String]) -> Value {
+    let assets: Vec<Value> = chunk
+        .iter()
+        .enumerate()
+        .map(|(i, checksum)| json!({ "id": (offset + i).to_string(), "checksum": checksum }))
+        .collect();
+    json!({ "assets": assets })
 }
 
 /// Asset ids the server reports as already-present duplicates. An asset counts
@@ -767,6 +793,48 @@ mod tests {
         ];
         // Only the duplicate-reason reject is treated as present on the server.
         assert_eq!(duplicates_from_results(&results), vec!["a".to_string()]);
+    }
+
+    /// The bulk-upload-check id is a correlation handle, not an identifier the
+    /// server is entitled to. Uploading a photo tells the server its filename and
+    /// size; nothing about this duplicate check requires also handing over the
+    /// account name, the volume label, or the folder tree the photo came from.
+    #[test]
+    fn bulk_upload_check_body_carries_no_local_path() {
+        use super::bulk_upload_check_payload;
+
+        let checksums = vec![
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string(),
+            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string(),
+        ];
+        let body = bulk_upload_check_payload(0, &checksums).to_string();
+
+        for leak in [
+            "/Users/",
+            "/Volumes/",
+            "C:\\",
+            "DCIM",
+            "Pictures",
+            ".JPG",
+            "IMG_",
+        ] {
+            assert!(!body.contains(leak), "request body leaked {leak}: {body}");
+        }
+        assert_eq!(
+            body,
+            r#"{"assets":[{"checksum":"da39a3ee5e6b4b0d3255bfef95601890afd80709","id":"0"},{"checksum":"aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d","id":"1"}]}"#
+        );
+    }
+
+    /// Chunk boundaries must keep producing request-wide positions, or the second
+    /// batch's results would be paired back to the first batch's files — on the
+    /// wipe path, deleting an original whose upload was never confirmed.
+    #[test]
+    fn bulk_upload_check_ids_are_request_wide_positions() {
+        use super::bulk_upload_check_payload;
+
+        let body = bulk_upload_check_payload(500, &["sum".to_string()]);
+        assert_eq!(body["assets"][0]["id"], "500");
     }
 
     #[test]

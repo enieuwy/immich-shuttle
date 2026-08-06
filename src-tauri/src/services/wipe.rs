@@ -259,11 +259,14 @@ pub async fn verify_uploaded(
     }
 
     let client = ImmichClient::new(server_url, api_key);
-    let present = client.bulk_upload_check(&to_check).await?;
+    // Only the checksums leave the machine; the paths stay here and are paired
+    // back up by position.
+    let checksums: Vec<String> = to_check.iter().map(|(_, sum)| sum.clone()).collect();
+    let present = client.bulk_upload_check(&checksums).await?;
 
     let mut confirmed: Vec<VerifiedFile> = Vec::new();
-    for ((path, _), identity) in to_check.into_iter().zip(identities) {
-        if present.contains(&path) {
+    for (index, ((path, _), identity)) in to_check.into_iter().zip(identities).enumerate() {
+        if present.contains(&index) {
             confirmed.push(VerifiedFile { path, identity });
         } else {
             unverified.push(path);
@@ -325,9 +328,10 @@ pub async fn forecast_upload(
     }
 
     let client = ImmichClient::new(server_url, api_key);
-    let present = client.bulk_upload_check(&to_check).await?;
+    let checksums: Vec<String> = to_check.iter().map(|(_, sum)| sum.clone()).collect();
+    let present = client.bulk_upload_check(&checksums).await?;
 
-    let (new, already_present) = partition_present(&to_check, &present);
+    let (new, already_present) = partition_present(to_check.len(), &present);
 
     Ok(ForecastResult {
         new,
@@ -337,15 +341,14 @@ pub async fn forecast_upload(
     })
 }
 
-/// Partitions checked (path, checksum) items into (new, already_present) by the
-/// set of ids the server reports it already holds. Pure so the count logic is
-/// unit-tested without a live server.
-fn partition_present(
-    to_check: &[(String, String)],
-    present: &std::collections::HashSet<String>,
-) -> (usize, usize) {
-    let already_present = to_check.iter().filter(|(p, _)| present.contains(p)).count();
-    (to_check.len() - already_present, already_present)
+/// Splits `total` checked files into (new, already_present) from the positions
+/// the server reported as duplicates. Positions outside the request are ignored:
+/// a malformed response must not be able to inflate "already on the server",
+/// which would understate what the import is about to upload and, on the wipe
+/// path, overstate what is safe to delete.
+fn partition_present(total: usize, present: &std::collections::HashSet<usize>) -> (usize, usize) {
+    let already_present = present.iter().filter(|index| **index < total).count();
+    (total.saturating_sub(already_present), already_present)
 }
 
 #[cfg(test)]
@@ -500,17 +503,21 @@ mod tests {
 
     #[test]
     fn partition_present_splits_new_and_already_present() {
-        let to_check = vec![
-            ("/a.jpg".to_string(), "sum-a".to_string()),
-            ("/b.jpg".to_string(), "sum-b".to_string()),
-            ("/c.jpg".to_string(), "sum-c".to_string()),
-        ];
-        let present: std::collections::HashSet<String> =
-            ["/b.jpg".to_string(), "/c.jpg".to_string()]
-                .into_iter()
-                .collect();
-        let (new, already_present) = partition_present(&to_check, &present);
+        // Positions 1 and 2 of a three-file check came back as duplicates.
+        let present: std::collections::HashSet<usize> = [1, 2].into_iter().collect();
+        let (new, already_present) = partition_present(3, &present);
         assert_eq!(new, 1);
         assert_eq!(already_present, 2);
+    }
+
+    /// A server echoing an id we never issued must not be able to shrink the
+    /// "to upload" count, and on the wipe path must not add a file to the
+    /// safe-to-delete set that was never confirmed.
+    #[test]
+    fn partition_present_ignores_positions_outside_the_request() {
+        let present: std::collections::HashSet<usize> = [0, 7, 99].into_iter().collect();
+        let (new, already_present) = partition_present(2, &present);
+        assert_eq!(already_present, 1);
+        assert_eq!(new, 1);
     }
 }
