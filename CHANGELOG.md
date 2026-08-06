@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Import
+- **"Check server" and Start Import now agree.** With a hand-picked preview selection, the preflight was still applying the coarse type/extension filters that the import itself drops, so it could report far fewer files — or zero — than the run would actually upload. The forecast now mirrors the import's scope exactly.
+- **Durable exclude extensions no longer veto a hand-picked file.** "Always exclude extensions" is hygiene for unattended scans; the preview grid never filters by extension, so a selection really can contain an excluded file. Selecting a file now imports it.
+- **A duplicate-only re-run no longer sits at 0%.** Live progress counts processed files (uploaded plus server-side duplicates), so re-importing a card the server already holds completes the bar instead of appearing stalled for the whole run.
+- **"Clear finished" keeps imports awaiting wipe confirmation.** Clearing used to drop their pending-wipe payload, stranding verified-uploaded originals on the card with no way back to the prompt.
+- **A capped forecast says so.** Above 5000 candidates the server check only compares the first batch; the result now reads "at least N · partial scan" instead of presenting a lower bound as an exact count.
+
+### UI
+- **Queue keeps updating while the History tab is open.** Switching tabs unmounted the queue panel, which stopped the app-wide poll — freezing import progress, the footer, and the quit-time "an import is running" guard until you switched back.
+- **Rotated RAW files preview the right way up.** Thumbnails built from a RAW file's embedded JPEG preview now apply EXIF orientation, matching the full-decode path.
+- **Previews survive a webview reload.** Preview session tokens are seeded from the wall clock, so they can no longer restart below the backend's cancellation watermark and blank the grid.
+- **A panic elsewhere no longer disables previews.** The source-scope guard recovers from a poisoned lock instead of failing every thumbnail and capture-date request for the rest of the session.
+
+### Safety
+- **The server preflight is scoped to your chosen sources.** `import_forecast` took raw paths from the UI and opened and hashed each one without the source-root check that the preview and import commands already enforce — the last unguarded path-taking command. It now refuses anything outside the folders you selected.
+- **Dropped the unused shell-execute grant.** The webview was granted permission to launch the immich-go sidecar with an arbitrary environment and working directory, though only the Rust side ever launches it. The capability and the unused `@tauri-apps/plugin-shell` dependency are gone.
+- **Profiles and history are written owner-only and atomically.** Both stores now go through one hardened write (unique temp file, fsync, atomic rename, mode 0600) instead of a shared temp name with a non-atomic fallback and default permissions — matching the hardening the logs directory already had. `config.json` holds your LAN/WAN endpoints and `store.json` your full import history including local paths.
+
 ## v0.6.0 - 2026-08-05
 
 ### UI

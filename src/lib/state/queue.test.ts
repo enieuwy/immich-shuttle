@@ -196,12 +196,15 @@ describe("queueState", () => {
     await sourceState.selectSources(["/Volumes/SD/DCIM"]);
 
     // Coarse filters set (as History replay would), but a hand-picked selection
-    // is provided: the selection must win, and type/date/include must NOT also
-    // filter it, or picked files would be silently dropped.
+    // is provided: the selection must win, and type/date/include/exclude must
+    // NOT also filter it, or picked files would be silently dropped. The preview
+    // grid never filters by extension, so a selection really can hold a file the
+    // durable excludes would otherwise veto.
     importOptionsState.setMediaType("image");
     importOptionsState.setDateFrom("2026-01-01");
     importOptionsState.setDateTo("2026-01-31");
     importOptionsState.setIncludeExtensions([".mp4"]);
+    importOptionsState.setExcludeExtensions([".mov"]);
     importOptionsState.setOnlyNewSinceLastImport(true);
 
     await queueState.startImport({ selectFiles: ["/Volumes/SD/DCIM/a.mov"] });
@@ -210,9 +213,11 @@ describe("queueState", () => {
     expect(payload?.include_type).toBeNull();
     expect(payload?.date_range).toBeNull();
     expect(payload?.include_extensions).toEqual([]);
+    expect(payload?.exclude_extensions).toEqual([]);
 
     importOptionsState.setMediaType("all");
     importOptionsState.setIncludeExtensions([]);
+    importOptionsState.setExcludeExtensions([]);
     importOptionsState.setOnlyNewSinceLastImport(false);
     importOptionsState.clearDateRange();
   });

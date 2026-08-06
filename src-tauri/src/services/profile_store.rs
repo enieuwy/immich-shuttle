@@ -1,10 +1,7 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        LazyLock, Mutex,
-    },
+    sync::{LazyLock, Mutex},
 };
 
 use dirs::config_dir;
@@ -13,8 +10,6 @@ use serde::{Deserialize, Serialize};
 use crate::models::profile::Profile;
 
 static CONFIG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Acquires the process-local config transaction lock.
 ///
@@ -75,20 +70,9 @@ pub fn save_config(config: &AppConfig) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "Could not resolve config directory".to_string())?;
     fs::create_dir_all(parent).map_err(|e| format!("Could not create config directory: {e}"))?;
-    let tmp = path.with_extension(format!(
-        "json.{}.{}.tmp",
-        std::process::id(),
-        NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
-    ));
     let content = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Could not serialize config: {e}"))?;
-    fs::write(&tmp, content).map_err(|e| format!("Could not write temp config: {e}"))?;
-    if let Err(err) = fs::rename(&tmp, &path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("Could not persist config: {err}"));
-    }
-
-    Ok(())
+    crate::services::private_file::write_atomic_private(&path, &content)
 }
 
 pub fn list_profiles() -> Result<Vec<Profile>, String> {

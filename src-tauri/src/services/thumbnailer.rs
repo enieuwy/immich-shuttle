@@ -802,7 +802,10 @@ fn generate_with_raw_preview(src: &Path, max: u32, out: &Path) -> bool {
         let Some(decoded) = decode_jpeg_preview(&bytes) else {
             continue;
         };
-        let thumb = decoded.thumbnail(max, max);
+        // The embedded preview inherits the sensor's readout orientation, so
+        // rotate it the same way the full-decode path does; without this a
+        // portrait RAW previews sideways.
+        let thumb = apply_orientation(src, decoded).thumbnail(max, max);
         // JPEG has no alpha channel; flatten to RGB before encoding.
         let rgb = image::DynamicImage::ImageRgb8(thumb.to_rgb8());
         if rgb.save_with_format(out, image::ImageFormat::Jpeg).is_ok() {

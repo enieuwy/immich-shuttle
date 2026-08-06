@@ -40,6 +40,18 @@ test('importing scenario shows running queue progress', async ({ page }) => {
   await captureScenario(page, 'importing');
 });
 
+// A re-import of a card the server already holds uploads nothing: every file
+// comes back as a duplicate. Progress counts processed work, not just uploads,
+// so the bar must complete instead of reading 0% for the entire run.
+test('a duplicate-only import reports full progress', async ({ page }) => {
+  await page.goto('/?scenario=importing');
+
+  // `.last()` picks the job's own card over the panel that wraps every card.
+  const job = page.locator('div.bg-card').filter({ hasText: 'job-dup0' }).last();
+  await expect(job.getByText('100%')).toBeVisible();
+  await expect(job.getByText('Uploaded 0/10')).toBeVisible();
+});
+
 test('wipe scenario shows pending wipe confirmation', async ({ page }) => {
   await page.goto('/?scenario=wipe');
 

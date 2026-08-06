@@ -241,6 +241,20 @@ export function jobsForScenario(scenario: Scenario): ImportJob[] {
           file_errors: [],
           profile_id: "p-home",
         },
+        {
+          // Re-running a card the server already holds: every file resolves as a
+          // duplicate and nothing uploads. The bar tracks processed work, so this
+          // must read 100% rather than sitting at 0% for the whole run.
+          id: "job-dup0only",
+          status: "running",
+          progress: { total: 10, uploaded: 0, duplicates: 10, errors: 0 },
+          error: null,
+          summary: null,
+          awaiting_wipe_confirmation: false,
+          pending_wipe_count: 0,
+          file_errors: [],
+          profile_id: "p-home",
+        },
         completedJob,
       ];
     case "wipe":

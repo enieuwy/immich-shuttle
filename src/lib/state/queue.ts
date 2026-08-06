@@ -316,10 +316,12 @@ export const queueState = {
           : null;
 
     // An explicit preview selection IS the import: the user hand-picked exact
-    // files, so coarse type/date/extension filters must not silently drop any
-    // of them. Those filters apply only on the no-preview (fast) path and to
-    // History replays (which clear the selection). Durable excludes are hygiene
-    // and always apply.
+    // files, so no coarse filter may silently drop one. Type, date, include-
+    // and exclude-extension filters therefore all apply only on the no-preview
+    // (fast) path and to History replays, which clear the selection. Durable
+    // excludes are hygiene for unattended scans, not a veto over a ticked file
+    // — the preview grid never filters by extension, so a selection genuinely
+    // can contain one.
     const selectFiles = overrides?.selectFiles ?? null;
     const hasSelection = !!selectFiles && selectFiles.length > 0;
 
@@ -368,7 +370,7 @@ export const queueState = {
             ? "VIDEO"
             : null,
       include_extensions: hasSelection ? [] : options.includeExtensions,
-      exclude_extensions: options.excludeExtensions,
+      exclude_extensions: hasSelection ? [] : options.excludeExtensions,
     });
     await refreshJobs();
   },

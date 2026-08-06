@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import { Inbox, X, AlertTriangle, FileWarning, RotateCcw, Trash2, ExternalLink } from "@lucide/svelte";
 
   import { queueState } from "$lib/state/queue";
@@ -25,12 +24,6 @@
   const sortedJobs = $derived(
     [...$queueState.jobs].sort((a, b) => (statusRank[a.status] ?? 9) - (statusRank[b.status] ?? 9)),
   );
-
-  onMount(() => {
-    void queueState.loadJobs();
-    queueState.startPolling();
-    return () => queueState.stopPolling();
-  });
 
   async function cancelJob(jobId: string) {
     actionError = "";
@@ -125,8 +118,9 @@
     {:else}
       <div class="flex flex-col gap-2" role="status" aria-live="polite">
         {#each sortedJobs as job (job.id)}
+          {@const processed = job.progress.uploaded + job.progress.duplicates}
           {@const pct = job.progress.total
-            ? Math.round((job.progress.uploaded / job.progress.total) * 100)
+            ? Math.min(100, Math.round((processed / job.progress.total) * 100))
             : 0}
           {@const rate = $queueState.rates[job.id]}
           <div class="flex flex-col gap-2 rounded-lg border border-border bg-card p-3">

@@ -4,6 +4,7 @@ pub mod immich_client;
 pub mod keychain;
 pub mod logs;
 pub mod media_scanner;
+pub mod private_file;
 pub mod profile_store;
 pub mod sidecar_runner;
 pub mod source_guard;

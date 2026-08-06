@@ -19,7 +19,7 @@ use crate::{
     services::{
         keychain, logs, media_scanner, profile_store,
         sidecar_runner::{run_upload, UploadRequest},
-        staging, url_resolver, wipe,
+        source_guard, staging, url_resolver, wipe,
     },
 };
 
@@ -883,6 +883,23 @@ pub async fn import_forecast(
     include_extensions: Vec<String>,
     exclude_extensions: Vec<String>,
 ) -> Result<wipe::ForecastResult, String> {
+    // Same path scope the preview commands enforce. This command opens and
+    // SHA-1s every path the renderer names, then sends those hashes and the
+    // absolute paths to the configured server, so a renderer that is compromised
+    // or simply buggy must not be able to aim it outside the folders the user
+    // chose as sources. `scan_sources_stream` records that scope; anything else
+    // is rejected rather than probed.
+    for path in &source_paths {
+        if !source_guard::is_within_approved(path) {
+            return Err(format!(
+                "Source is outside the chosen source folders: {path}"
+            ));
+        }
+    }
+    if let Some(files) = select_files.as_deref() {
+        validate_selected_under_sources(files, &source_paths)?;
+    }
+
     let profile = profile_store::get_profile(&profile_id)?;
     let api_key = keychain::get_api_key(&profile_id)?
         .ok_or_else(|| format!("No API key found for profile: {profile_id}"))?;
@@ -1376,6 +1393,20 @@ pub async fn import_dismiss(job_id: String) -> Result<Vec<ImportJob>, String> {
     import_list_jobs().await
 }
 
+/// Whether "Clear finished" may drop this job.
+///
+/// A job still awaiting wipe confirmation is not finished from the user's point
+/// of view. Removing it also drops its `PENDING_WIPE` payload, which is the only
+/// handle on the verified-uploaded originals — the sources then stay on the card
+/// with no way to reach the confirmation prompt again.
+fn is_clearable(job: &ImportJob) -> bool {
+    !job.awaiting_wipe_confirmation
+        && matches!(
+            &job.status,
+            JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled
+        )
+}
+
 #[tauri::command]
 pub async fn import_clear_finished() -> Result<Vec<ImportJob>, String> {
     let removed_ids: Vec<String> = {
@@ -1384,15 +1415,10 @@ pub async fn import_clear_finished() -> Result<Vec<ImportJob>, String> {
             .map_err(|_| "Could not lock import job state".to_string())?;
         let removed: Vec<String> = jobs
             .iter()
-            .filter(|j| {
-                matches!(
-                    &j.status,
-                    JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled
-                )
-            })
-            .map(|j| j.id.clone())
+            .filter(|job| is_clearable(job))
+            .map(|job| job.id.clone())
             .collect();
-        jobs.retain(|j| matches!(&j.status, JobStatus::Running | JobStatus::Pending));
+        jobs.retain(|job| !is_clearable(job));
         removed
     };
     if let Ok(mut inputs) = JOB_INPUTS.lock() {
@@ -1548,5 +1574,62 @@ mod tests {
         assert!(!is_failed(&o));
         assert!(o.wipe_eligible);
         assert!(o.checkpoint_eligible);
+    }
+
+    fn terminal_job(id: &str, awaiting_wipe_confirmation: bool) -> ImportJob {
+        ImportJob {
+            id: id.to_string(),
+            status: JobStatus::Completed,
+            progress: JobProgress::default(),
+            error: None,
+            summary: None,
+            awaiting_wipe_confirmation,
+            pending_wipe_count: if awaiting_wipe_confirmation { 3 } else { 0 },
+            file_errors: Vec::new(),
+            profile_id: "p1".to_string(),
+            album_id: None,
+        }
+    }
+
+    /// "Clear finished" must not silently discard the wipe prompt: dropping the
+    /// job drops its PENDING_WIPE payload, stranding verified-uploaded originals
+    /// on the card with no way back to the confirmation.
+    #[test]
+    fn clear_finished_keeps_jobs_awaiting_wipe_confirmation() {
+        assert!(is_clearable(&terminal_job("done", false)));
+        assert!(!is_clearable(&terminal_job("awaiting", true)));
+
+        let mut pending = terminal_job("cancelled-awaiting", true);
+        pending.status = JobStatus::Cancelled;
+        assert!(!is_clearable(&pending));
+    }
+
+    /// The renderer hands `import_forecast` raw paths and the command opens and
+    /// hashes every one of them, so it must refuse anything the user never chose
+    /// as a source — the same scope `preview_thumbnails` and `import_start`
+    /// enforce. The bogus profile id proves the check runs before any profile,
+    /// keychain, or filesystem work.
+    #[test]
+    fn import_forecast_refuses_sources_outside_the_approved_scope() {
+        let unapproved =
+            std::env::temp_dir().join(format!("immich-shuttle-unapproved-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&unapproved).unwrap();
+
+        let err = tauri::async_runtime::block_on(import_forecast(
+            "no-such-profile".to_string(),
+            vec![unapproved.to_string_lossy().into_owned()],
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        ))
+        .unwrap_err();
+
+        assert!(
+            err.contains("outside the chosen source folders"),
+            "expected a source-scope rejection, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&unapproved).unwrap();
     }
 }

@@ -25,15 +25,18 @@ const MAX_APPROVED_ROOTS: usize = 256;
 /// make its scanned media fail `is_within_approved`). The cap only bounds
 /// cross-session growth by evicting the oldest roots that are NOT part of this
 /// selection. Canonicalization runs before the lock so a slow filesystem cannot
-/// stall concurrent `is_within_approved` checks.
+/// stall concurrent `is_within_approved` checks. A panic elsewhere must not
+/// wedge the guard: the root list is a plain `Vec<PathBuf>` with no invariant a
+/// panic could break mid-update, so a poisoned lock is recovered rather than
+/// treated as permanent denial (which would blank previews for the session).
 pub fn record_roots(paths: &[String]) {
     let batch: Vec<PathBuf> = paths
         .iter()
         .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p)))
         .collect();
-    let Ok(mut roots) = APPROVED_ROOTS.lock() else {
-        return;
-    };
+    let mut roots = APPROVED_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for canon in &batch {
         if !roots.contains(canon) {
             roots.push(canon.clone());
@@ -55,9 +58,10 @@ pub fn record_roots(paths: &[String]) {
 ///
 /// Callers must record the newly selected roots after resetting the prior scope.
 pub fn reset_roots() {
-    if let Ok(mut roots) = APPROVED_ROOTS.lock() {
-        roots.clear();
-    }
+    let mut roots = APPROVED_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    roots.clear();
 }
 
 /// Whether `path` canonicalizes to a location nested under a recorded source
@@ -66,10 +70,10 @@ pub fn is_within_approved(path: &str) -> bool {
     let Ok(canon) = std::fs::canonicalize(path) else {
         return false;
     };
-    match APPROVED_ROOTS.lock() {
-        Ok(roots) => roots.iter().any(|root| canon.starts_with(root)),
-        Err(_) => false,
-    }
+    let roots = APPROVED_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    roots.iter().any(|root| canon.starts_with(root))
 }
 
 #[cfg(test)]

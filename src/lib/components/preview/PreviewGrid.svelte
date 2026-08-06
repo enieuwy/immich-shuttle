@@ -1,5 +1,11 @@
 <script module lang="ts">
-  let previewTokenSeq = 0;
+  // The backend cancels every preview token <= the highest one it has been
+  // asked to cancel, and that watermark lives for the whole Tauri process. This
+  // counter lives only for the JS module, so a renderer reload would restart it
+  // at 1 and every new session would be born already-cancelled — a permanently
+  // blank grid until it climbed back past the old watermark. Seed from the wall
+  // clock so tokens stay monotonic across reloads within one process.
+  let previewTokenSeq = Date.now();
 
   function nextPreviewToken(): number {
     return ++previewTokenSeq;

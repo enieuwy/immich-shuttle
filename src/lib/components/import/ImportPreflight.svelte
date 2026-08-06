@@ -17,12 +17,17 @@
   const canForecast = $derived(
     !!$activeProfile && $sourceState.selectedPaths.length > 0 && !forecasting,
   );
-  // The forecast can't cheaply replicate EXIF date filtering, so flag it whenever
-  // a date/only-new filter would change the real import from the count.
+  // An explicit preview selection *is* the import: queueState.startImport drops
+  // the coarse type/extension/date filters so they can't discard a ticked file,
+  // so the forecast must drop them too or Check server and Start Import
+  // disagree. Without a selection the forecast still can't cheaply replicate
+  // EXIF date filtering, so flag that case as approximate.
+  const hasSelection = $derived($selectionState.selected.size > 0);
   const forecastCaveat = $derived(
-    $importOptionsState.onlyNewSinceLastImport ||
-      !!$importOptionsState.dateFrom ||
-      !!$importOptionsState.dateTo,
+    !hasSelection &&
+      ($importOptionsState.onlyNewSinceLastImport ||
+        !!$importOptionsState.dateFrom ||
+        !!$importOptionsState.dateTo),
   );
 
   // Invalidate any shown/in-flight forecast when its inputs change, so stale
@@ -56,12 +61,18 @@
         profile.id,
         sourcePaths,
         selection.length > 0 ? selection : null,
-        {
-          includeType:
-            options.mediaType === "image" ? "IMAGE" : options.mediaType === "video" ? "VIDEO" : null,
-          includeExtensions: options.includeExtensions,
-          excludeExtensions: options.excludeExtensions,
-        },
+        selection.length > 0
+          ? { includeType: null, includeExtensions: [], excludeExtensions: [] }
+          : {
+              includeType:
+                options.mediaType === "image"
+                  ? "IMAGE"
+                  : options.mediaType === "video"
+                    ? "VIDEO"
+                    : null,
+              includeExtensions: options.includeExtensions,
+              excludeExtensions: options.excludeExtensions,
+            },
       );
       if (token === forecastToken) forecast = result;
     } catch (error) {
@@ -82,10 +93,13 @@
     <span class="truncate text-xs text-destructive" title={forecastError}>{forecastError}</span>
   {:else if forecast}
     <span class="flex min-w-0 items-center gap-2 text-xs">
-      <span class="text-foreground"><span class="font-semibold text-primary tabular-nums">{forecast.new}</span> to upload</span>
+      <span class="text-foreground">{#if forecast.truncated}at least&nbsp;{/if}<span class="font-semibold text-primary tabular-nums">{forecast.new}</span> to upload</span>
       <span class="text-muted-foreground"><span class="font-semibold text-foreground tabular-nums">{forecast.already_present}</span> already on server</span>
       {#if forecast.unreadable > 0}
         <span class="text-muted-foreground"><span class="font-semibold text-foreground tabular-nums">{forecast.unreadable}</span> unreadable</span>
+      {/if}
+      {#if forecast.truncated}
+        <span class="text-muted-foreground" title="Too many files to check them all — only the first batch was compared against the server. The real total is higher.">·  partial scan</span>
       {/if}
       {#if forecastCaveat}
         <span class="text-muted-foreground" title="Estimate ignores the active date filter — the import may upload fewer.">·  approx</span>

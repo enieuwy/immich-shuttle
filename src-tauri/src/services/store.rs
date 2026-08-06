@@ -58,17 +58,9 @@ fn load(app: &tauri::AppHandle) -> Result<StoreData, String> {
 
 fn save(app: &tauri::AppHandle, data: &StoreData) -> Result<(), String> {
     let path = store_path(app)?;
-    let tmp = path.with_extension("json.tmp");
     let content = serde_json::to_string_pretty(data)
         .map_err(|e| format!("Could not serialize store: {e}"))?;
-    fs::write(&tmp, &content).map_err(|e| format!("Could not write temp store: {e}"))?;
-    if fs::rename(&tmp, &path).is_err() {
-        let fallback =
-            fs::write(&path, content).map_err(|e| format!("Could not persist store: {e}"));
-        let _ = fs::remove_file(&tmp);
-        fallback?;
-    }
-    Ok(())
+    crate::services::private_file::write_atomic_private(&path, &content)
 }
 
 /// Append a run to history, advancing the incremental checkpoint only when the
