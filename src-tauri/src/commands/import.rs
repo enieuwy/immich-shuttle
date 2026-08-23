@@ -28,6 +28,10 @@ static PENDING_WIPE: LazyLock<Mutex<HashMap<String, PendingWipe>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static RUNNING_IMPORTS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Marks the post-run finalization phase that `RUNNING_IMPORTS` deliberately
+/// does not cover. `import_await_terminal` must observe this set as clear too.
+static FINALIZING_IMPORTS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 static JOB_INPUTS: LazyLock<Mutex<HashMap<String, ImportInput>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -132,7 +136,10 @@ fn has_active_import() -> Result<bool, String> {
 }
 
 fn evict_old_terminal_jobs(jobs: &mut Vec<ImportJob>) -> Vec<String> {
-    let terminal_count = jobs.iter().filter(|job| is_terminal(&job.status)).count();
+    // The 500-job cap bounds only clearable terminal jobs. Unanswered wipe
+    // prompts are bounded by what the user has not answered, and evicting one
+    // would strand verified-uploaded originals with no way back to the prompt.
+    let terminal_count = jobs.iter().filter(|job| is_clearable(job)).count();
     let excess = terminal_count.saturating_sub(MAX_RETAINED_TERMINAL_JOBS);
     if excess == 0 {
         return Vec::new();
@@ -140,7 +147,7 @@ fn evict_old_terminal_jobs(jobs: &mut Vec<ImportJob>) -> Vec<String> {
 
     let evicted: HashSet<String> = jobs
         .iter()
-        .filter(|job| is_terminal(&job.status))
+        .filter(|job| is_clearable(job))
         .take(excess)
         .map(|job| job.id.clone())
         .collect();
@@ -534,7 +541,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                     if cancel_flag.load(Ordering::Relaxed) {
                         return;
                     }
-                    let _ = set_job(ImportJob {
+                    // `finalize_job` preserves a cancellation published while
+                    // staging reported its failure.
+                    let _ = finalize_job(ImportJob {
                         id: job_id_clone.clone(),
                         status: JobStatus::Failed,
                         progress: JobProgress {
@@ -557,7 +566,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                     if let Ok(mut running) = RUNNING_IMPORTS.lock() {
                         running.remove(&job_id_clone);
                     }
-                    let _ = set_job(ImportJob {
+                    // A staging task that fails to join must not revive a
+                    // cancelled run as `Failed`, so use `finalize_job`.
+                    let _ = finalize_job(ImportJob {
                         id: job_id_clone.clone(),
                         status: JobStatus::Failed,
                         progress: JobProgress {
@@ -651,6 +662,11 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             .await;
         }
 
+        // Keep post-run work visible after the run leaves `RUNNING_IMPORTS`, so
+        // shutdown waits for log parsing and history persistence.
+        if let Ok(mut finalizing) = FINALIZING_IMPORTS.lock() {
+            finalizing.insert(job_id_clone.clone());
+        }
         if let Ok(mut running) = RUNNING_IMPORTS.lock() {
             running.remove(&job_id_clone);
         }
@@ -924,6 +940,11 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 None => warning.to_string(),
             });
             let _ = set_job(job_with_warning);
+        }
+        // Finalization is complete only after the history write and warning
+        // update above, so shutdown may now observe both maps as clear.
+        if let Ok(mut finalizing) = FINALIZING_IMPORTS.lock() {
+            finalizing.remove(&job_id_clone);
         }
     });
 
@@ -1215,9 +1236,10 @@ pub async fn scan_sources_stream(
     if paths.is_empty() {
         return Err("At least one path is required".to_string());
     }
-    // The full selection defines the approved-root scope for this scan.
-    crate::services::source_guard::reset_roots();
-    crate::services::source_guard::record_roots(&paths);
+    // The full selection defines the approved-root scope for this scan. Swap
+    // it atomically so a concurrent path-scoped read never observes an empty
+    // scope between clearing and recording the selected roots.
+    crate::services::source_guard::replace_roots(&paths);
 
     let cancellation = Arc::new(AtomicBool::new(false));
     let previous = {
@@ -1414,26 +1436,24 @@ pub async fn import_cancel(job_id: String) -> Result<(), String> {
     set_job(job)
 }
 
-/// Wait for a job to reach a terminal status AND for its worker task to
-/// actually exit, then return the final job.
+/// Wait for a job to reach a terminal status, for its run to exit, and for
+/// post-run finalization to finish, then return the final job.
 ///
 /// A terminal *status* is not the same thing as a terminal *worker*.
 /// `import_cancel` writes `Cancelled` the instant it is asked to stop, while
-/// the `import_start` task spawned for that job keeps running: it can still
-/// be mid-upload with the sidecar, staging or cleaning temp files, or
-/// blocked on the final log read and history write. `RUNNING_IMPORTS` is
-/// cleared only by the worker itself on its way out, so a job id still
-/// present there — regardless of what `job.status` says — means the process
-/// has not finished shutting down. Quitting the app in that window can kill
-/// the sidecar mid-upload and skip the staging/log cleanup that runs after
-/// it, leaving temp artifacts and a half-uploaded run behind. This command
-/// gives a close handler something real to wait on instead of guessing with
-/// a fixed timer: it does not return until both conditions hold, so the
-/// caller can safely treat `Ok` as "the worker is gone, it is safe to exit."
+/// the `import_start` task spawned for that job keeps running through the run
+/// and its shutdown work. `RUNNING_IMPORTS` covers the run itself. The worker
+/// removes that entry before reading the run log, registering the wipe payload,
+/// writing the terminal state, and appending history; `FINALIZING_IMPORTS`
+/// covers that post-run finalization phase. Quitting the app before both sets
+/// clear can kill the sidecar mid-upload or lose cleanup and the history record.
+/// This command gives a close handler something real to wait on instead of
+/// guessing with a fixed timer: `Ok` means the status is terminal and both
+/// worker-state maps are clear, so it is safe to exit.
 ///
 /// This is a shutdown path, not a hot loop, so a coarse 100ms poll is fine —
-/// there is no cheaper event to wait on since the worker's exit is only
-/// observable via `RUNNING_IMPORTS`.
+/// there is no cheaper event to wait on since the run and finalization phases
+/// are only observable through their respective maps.
 #[tauri::command]
 pub async fn import_await_terminal(job_id: String, timeout_ms: u64) -> Result<ImportJob, String> {
     // `timeout_ms` arrives over IPC and must not be trusted to be in range:
@@ -1448,7 +1468,11 @@ pub async fn import_await_terminal(job_id: String, timeout_ms: u64) -> Result<Im
             .lock()
             .map_err(|_| "Could not lock running imports state".to_string())?
             .contains_key(&job_id);
-        if is_terminal(&job.status) && !worker_alive {
+        let finalizing = FINALIZING_IMPORTS
+            .lock()
+            .map_err(|_| "Could not lock finalizing imports state".to_string())?
+            .contains(&job_id);
+        if is_terminal(&job.status) && !worker_alive && !finalizing {
             return Ok(job);
         }
         if Instant::now() >= deadline {
@@ -1724,6 +1748,22 @@ mod tests {
         }
     }
 
+    fn lock_jobs() -> std::sync::MutexGuard<'static, Vec<ImportJob>> {
+        JOBS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_running() -> std::sync::MutexGuard<'static, HashMap<String, Arc<AtomicBool>>> {
+        RUNNING_IMPORTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_finalizing() -> std::sync::MutexGuard<'static, HashSet<String>> {
+        FINALIZING_IMPORTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// "Clear finished" must not silently discard the wipe prompt: dropping the
     /// job drops its PENDING_WIPE payload, stranding verified-uploaded originals
     /// on the card with no way back to the confirmation.
@@ -1815,14 +1855,6 @@ mod tests {
         // These are the same process-global maps the worker uses; recover from
         // poisoning the way every other holder in this crate does rather than
         // letting an unrelated failed test cascade into this one.
-        fn lock_jobs() -> std::sync::MutexGuard<'static, Vec<ImportJob>> {
-            JOBS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-        }
-        fn lock_running() -> std::sync::MutexGuard<'static, HashMap<String, Arc<AtomicBool>>> {
-            RUNNING_IMPORTS
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        }
 
         {
             let mut job = terminal_job(&job_id, false);
@@ -1846,6 +1878,81 @@ mod tests {
         assert!(matches!(job.status, JobStatus::Cancelled));
 
         lock_jobs().retain(|j| j.id != job_id);
+    }
+
+    /// The worker deregisters from `RUNNING_IMPORTS` before it reads the run log
+    /// and appends history. Without the finalizing half of the condition, the
+    /// app can quit mid-finalization and lose the run's history record.
+    #[test]
+    fn await_terminal_waits_for_the_finalizing_phase_too() {
+        let job_id = format!("await-finalizing-{}", Uuid::new_v4());
+        let mut job = terminal_job(&job_id, false);
+        job.status = JobStatus::Cancelled;
+        lock_jobs().push(job);
+        lock_running().remove(&job_id);
+        lock_finalizing().insert(job_id.clone());
+
+        let err =
+            tauri::async_runtime::block_on(import_await_terminal(job_id.clone(), 150)).unwrap_err();
+        assert!(
+            err.contains("shutting down"),
+            "a finalizing worker must keep the caller waiting, got: {err}"
+        );
+
+        lock_finalizing().remove(&job_id);
+        let job = tauri::async_runtime::block_on(import_await_terminal(job_id.clone(), 2_000))
+            .expect("a terminal job with no finalizing worker must resolve");
+        assert!(matches!(job.status, JobStatus::Cancelled));
+        lock_jobs().retain(|j| j.id != job_id);
+    }
+
+    /// Eviction must preserve a terminal job that still owns a wipe prompt:
+    /// dropping it also drops the payload needed to confirm deletion.
+    #[test]
+    fn eviction_keeps_a_job_awaiting_wipe_confirmation() {
+        let awaiting_id = format!("eviction-awaiting-{}", Uuid::new_v4());
+        let mut jobs = Vec::with_capacity(MAX_RETAINED_TERMINAL_JOBS + 1);
+        jobs.push(terminal_job(&awaiting_id, true));
+        for index in 0..MAX_RETAINED_TERMINAL_JOBS {
+            jobs.push(terminal_job(
+                &format!("eviction-clearable-{index}-{}", Uuid::new_v4()),
+                false,
+            ));
+        }
+
+        let evicted = evict_old_terminal_jobs(&mut jobs);
+        assert!(
+            !evicted.contains(&awaiting_id),
+            "eviction must not drop an unanswered wipe prompt"
+        );
+        assert!(
+            jobs.iter().any(|job| job.id == awaiting_id),
+            "the job awaiting wipe confirmation must remain in the local vector"
+        );
+    }
+
+    /// A staging failure can arrive after cancellation publishes `Cancelled`.
+    /// `finalize_job` must preserve that state instead of reviving the run as
+    /// `Failed`, which would hide the cancellation from the user.
+    #[test]
+    fn a_cancelled_job_survives_a_staging_failure_write() {
+        let job_id = format!("staging-cancelled-{}", Uuid::new_v4());
+        let mut cancelled = terminal_job(&job_id, false);
+        cancelled.status = JobStatus::Cancelled;
+        lock_jobs().push(cancelled);
+
+        let mut failed = terminal_job(&job_id, false);
+        failed.status = JobStatus::Failed;
+        failed.error = Some("Staging task failed".to_string());
+        let returned = finalize_job(failed);
+        assert!(matches!(returned.status, JobStatus::Cancelled));
+        let stored = get_job(&job_id).expect("the cancelled job must remain stored");
+        assert!(matches!(stored.status, JobStatus::Cancelled));
+
+        lock_jobs().retain(|job| job.id != job_id);
+        if let Ok(mut pending) = PENDING_WIPE.lock() {
+            pending.remove(&job_id);
+        }
     }
 
     #[test]

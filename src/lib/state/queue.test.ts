@@ -523,6 +523,57 @@ describe("queueState", () => {
 
     expect(get(queueState).jobs).toEqual([completedFresh]);
   });
+  it("a poll that resolves after a dismiss cannot resurrect the dismissed job", async () => {
+    // This pins dismissed cards flickering back into the queue and repeat
+    // completion notifications after a stale poll resolves.
+    const dismissed: ImportJob = {
+      id: "job-dismiss-race",
+      status: "completed",
+      progress: { total: 4, uploaded: 4, duplicates: 0, errors: 0 },
+      error: null,
+      summary: "Imported 4 items.",
+      awaiting_wipe_confirmation: false,
+      pending_wipe_count: 0,
+      file_errors: [],
+      profile_id: "p1",
+    };
+    const poll = Promise.withResolvers<ImportJob[]>();
+    vi.mocked(api.importListJobs).mockReturnValueOnce(poll.promise);
+    vi.mocked(api.importDismiss).mockResolvedValueOnce([]);
+
+    const refresh = queueState.loadJobs();
+    await queueState.dismiss(dismissed.id);
+    poll.resolve([dismissed]);
+    await refresh;
+
+    expect(get(queueState).jobs.some((job) => job.id === dismissed.id)).toBe(false);
+  });
+
+  it("a poll that resolves after clearFinished cannot resurrect cleared jobs", async () => {
+    // This pins cleared cards flickering back into the queue and repeat
+    // completion notifications after a stale poll resolves.
+    const cleared: ImportJob = {
+      id: "job-clear-race",
+      status: "completed",
+      progress: { total: 4, uploaded: 4, duplicates: 0, errors: 0 },
+      error: null,
+      summary: "Imported 4 items.",
+      awaiting_wipe_confirmation: false,
+      pending_wipe_count: 0,
+      file_errors: [],
+      profile_id: "p1",
+    };
+    const poll = Promise.withResolvers<ImportJob[]>();
+    vi.mocked(api.importListJobs).mockReturnValueOnce(poll.promise);
+    vi.mocked(api.importClearFinished).mockResolvedValueOnce([]);
+
+    const refresh = queueState.loadJobs();
+    await queueState.clearFinished();
+    poll.resolve([cleared]);
+    await refresh;
+
+    expect(get(queueState).jobs.some((job) => job.id === cleared.id)).toBe(false);
+  });
 
   it("bumps the source checkpoint version only on a completed transition", async () => {
     const running: ImportJob = {

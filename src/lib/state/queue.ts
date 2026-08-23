@@ -428,6 +428,10 @@ export const queueState = {
   },
   async dismiss(jobId: string) {
     try {
+      // Invalidate a poll that began before dismiss: if it resolves afterwards, it
+      // resurrects the removed cards and re-fires terminal notifications. See
+      // history.ts clearHistory for the same pattern.
+      refreshes.invalidate();
       const jobs = await importDismiss(jobId);
       state.update((s) => ({ ...s, jobs }));
     } catch {
@@ -436,6 +440,7 @@ export const queueState = {
   },
   async clearFinished() {
     try {
+      refreshes.invalidate();
       const jobs = await importClearFinished();
       state.update((s) => ({ ...s, jobs }));
     } catch {
