@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
 
@@ -131,9 +131,13 @@ pub fn last_import_for(app: &AppHandle, profile_id: &str, source_paths: &[String
 }
 
 // Checkpoints are per (profile, source set): the same card imported under a
-// different profile must not inherit another profile's date floor. Changing
-// this key format resets existing checkpoints (the next only-new import re-scans,
-// which server-side dedupe makes safe).
+// different profile must not inherit another profile's date floor. The source
+// key collapses nested roots and exact duplicates, giving one identity to one
+// conceptual source set whether callers provide raw or collapsed selections.
+// Changing this key format resets existing checkpoints (the next only-new import
+// re-scans, which server-side dedupe makes safe). A non-overlapping selection
+// produces the same key as before, so existing checkpoints for the common case
+// survive.
 fn checkpoint_key(profile_id: &str, paths: &[String]) -> String {
     format!("{profile_id}\u{1f}{}", source_key(paths))
 }
@@ -145,7 +149,19 @@ fn source_key(paths: &[String]) -> String {
         .map(|path| normalize_source_path(path))
         .collect();
     normalized.sort();
-    normalized.join("\n")
+    normalized.dedup();
+
+    let collapsed: Vec<String> = normalized
+        .iter()
+        .filter(|candidate| {
+            !normalized.iter().any(|parent| {
+                parent != *candidate && Path::new(candidate).starts_with(Path::new(parent))
+            })
+        })
+        .cloned()
+        .collect();
+
+    collapsed.join("\n")
 }
 
 fn normalize_source_path(path: &str) -> String {
@@ -178,9 +194,9 @@ fn normalize_source_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, path::PathBuf};
 
-    use super::{clear_store_data, source_key, SourceMeta, StoreData};
+    use super::{clear_store_data, normalize_source_path, source_key, SourceMeta, StoreData};
 
     #[test]
     fn clear_history_resets_source_metadata() {
@@ -213,6 +229,67 @@ mod tests {
         ];
 
         assert_eq!(source_key(&canonical_form), source_key(&alternate_form));
+    }
+
+    #[test]
+    fn source_key_collapses_overlapping_existing_roots() {
+        let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let child = parent.join("src");
+        let raw_selection = vec![
+            parent.to_string_lossy().into_owned(),
+            child.to_string_lossy().into_owned(),
+        ];
+        let collapsed_selection = vec![parent.to_string_lossy().into_owned()];
+
+        assert_eq!(source_key(&raw_selection), source_key(&collapsed_selection));
+    }
+
+    #[test]
+    fn source_key_keeps_disjoint_roots_in_the_key() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let disjoint = vec![
+            manifest_dir.join("src").to_string_lossy().into_owned(),
+            manifest_dir
+                .join("Cargo.toml")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let mut expected = disjoint
+            .iter()
+            .map(|path| normalize_source_path(path))
+            .collect::<Vec<_>>();
+        expected.sort();
+
+        let key = source_key(&disjoint);
+
+        assert_eq!(key, expected.join("\n"));
+        assert_eq!(key.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn source_key_ignores_order_and_exact_duplicates() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let first = manifest_dir.join("src").to_string_lossy().into_owned();
+        let second = manifest_dir
+            .join("Cargo.toml")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            source_key(&[first.clone(), second.clone(), first.clone(), second.clone(),]),
+            source_key(&[second, first])
+        );
+    }
+
+    #[test]
+    fn source_key_does_not_collapse_siblings_with_shared_name_prefixes() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("__store_key_test__");
+        let foo = base.join("foo").to_string_lossy().into_owned();
+        let foobar = base.join("foobar").to_string_lossy().into_owned();
+        let mut expected = [normalize_source_path(&foo), normalize_source_path(&foobar)];
+        expected.sort();
+
+        assert_eq!(source_key(&[foo, foobar]), expected.join("\n"));
     }
 
     #[cfg(windows)]

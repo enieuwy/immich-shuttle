@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, LazyLock, Mutex,
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     models::{
-        job::{ImportInput, ImportJob, JobProgress, JobStatus, Organization},
+        job::{FileError, ImportInput, ImportJob, JobProgress, JobStatus, Organization},
         media::{ScanProgress, ScanSummary},
     },
     services::{
@@ -357,6 +357,56 @@ fn retain_paths_under_sources(paths: Vec<String>, source_paths: &[String]) -> (V
     (kept, dropped)
 }
 
+/// Translate paths that immich-go logged under the temporary staging root.
+/// Unmapped paths are dropped because the run log is not trusted enough to guess
+/// which user file should become a deletion candidate.
+fn translate_staged_path(path: &str, links: &staging::StagingPathMap) -> Option<String> {
+    links
+        .original_for(Path::new(path))
+        .map(|original| original.to_string_lossy().into_owned())
+}
+
+fn translate_staged_paths(
+    paths: Vec<String>,
+    links: &staging::StagingPathMap,
+) -> (Vec<String>, usize) {
+    let total = paths.len();
+    let translated = paths
+        .into_iter()
+        .filter_map(|path| translate_staged_path(&path, links))
+        .collect::<Vec<_>>();
+    let dropped = total - translated.len();
+    (translated, dropped)
+}
+
+fn translate_staged_file_errors(
+    errors: Vec<FileError>,
+    links: &staging::StagingPathMap,
+) -> (Vec<FileError>, usize) {
+    let total = errors.len();
+    let translated = errors
+        .into_iter()
+        .filter_map(|mut error| {
+            error.file = translate_staged_path(&error.file, links)?;
+            Some(error)
+        })
+        .collect::<Vec<_>>();
+    let dropped = total - translated.len();
+    (translated, dropped)
+}
+
+/// Return log contents and a visible error when the completed run log cannot be
+/// read. Keeping this pure lets the failure path stay covered without I/O.
+fn read_run_log(result: Result<String, std::io::Error>) -> (String, Option<String>) {
+    match result {
+        Ok(contents) => (contents, None),
+        Err(error) => (
+            String::new(),
+            Some(format!("Could not read import run log: {error}")),
+        ),
+    }
+}
+
 /// Final classification of an import process that ran to completion.
 struct RunOutcome {
     status: JobStatus,
@@ -412,8 +462,8 @@ fn classify_completed_run(
     // filesystem check. A record forged under a root (see
     // `retain_paths_under_sources`) can inflate `landed` without ever
     // surviving containment. `completed_paths_len` is exactly the count that
-    // did survive containment (via `retain_paths_under_sources`, or via
-    // `validate_selected_under_sources` at admission for a staged import — see
+    // did survive containment (via `retain_paths_under_sources`, or via the
+    // staging link map's successful-path translation for staged imports — see
     // the call site), so require it here too. `landed` keeps its existing role
     // in `failed` above unchanged, so ordinary run status is unaffected; only
     // the stricter checkpoint gate gains this extra requirement.
@@ -551,7 +601,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // the explicit normal-path removals below run.
         let _worker_guard = ImportWorkerGuard::new(job_id_clone.clone());
         let api_key_for_album_assignment = api_key_clone.clone();
-        let staging_dir = if staging_requested {
+        let mut staging_dir = if staging_requested {
             let selected_files = select_files.clone();
             let cancel_flag_for_staging = cancel_flag.clone();
             match tauri::async_runtime::spawn_blocking(move || {
@@ -681,6 +731,12 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             }
         }
 
+        // Take the map before cleanup consumes the guard. The log is parsed after
+        // the temporary directory is gone, so only this map can restore user paths.
+        let staged_links = staging_dir
+            .as_mut()
+            .map(|dir| dir.take_links())
+            .unwrap_or_default();
         if let Some(dir) = staging_dir {
             let _ = tauri::async_runtime::spawn_blocking(move || {
                 staging::cleanup_staging_dir(dir);
@@ -701,9 +757,35 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // `\r`-refreshed aggregate that can't be read reliably through the pipe).
         // The log is O_APPEND across multi-path runs, so one read afterwards
         // yields the authoritative totals, completed paths, and per-file errors.
-        let log_contents = std::fs::read_to_string(&request.log_path).unwrap_or_default();
-        let file_errors =
-            crate::services::stdout_parser::parse_error_log(&log_contents, &source_paths);
+        let (log_contents, log_read_error) =
+            read_run_log(std::fs::read_to_string(&request.log_path));
+        if let Some(error) = log_read_error.as_ref() {
+            let _ = logs::append_log(
+                "app.log",
+                &format!("import_run_log_read_failed job_id={job_id_clone} error={error}"),
+            );
+        }
+        let parsed_file_errors = crate::services::stdout_parser::parse_error_log(
+            &log_contents,
+            if staged_import {
+                &invocation_roots
+            } else {
+                &source_paths
+            },
+        );
+        let (file_errors, dropped_staged_errors) = if staged_import {
+            translate_staged_file_errors(parsed_file_errors, &staged_links)
+        } else {
+            (parsed_file_errors, 0)
+        };
+        if dropped_staged_errors > 0 {
+            let _ = logs::append_log(
+                "app.log",
+                &format!(
+                    "import_staged_paths_unmapped job_id={job_id_clone} errors={dropped_staged_errors}"
+                ),
+            );
+        }
         let run =
             crate::services::stdout_parser::parse_run_progress(&log_contents, &invocation_roots);
         // A non-zero count here means some `file=` records in the run log did
@@ -725,26 +807,22 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // file_errors is capped at MAX_FILE_ERRORS for the UI payload. Keep the
         // true count so the final tally never undercounts a mass-failure run.
         let progress = run.progress;
-        // parse_run_progress above resolves `file=` records against
-        // invocation_roots (the staging dir for a staged import, matching what
-        // immich-go actually saw), so uploaded/duplicate counts aren't silently
-        // dropped. Wipe eligibility is a separate, stricter question: for a
-        // staged import the log's paths still point at the temp symlink dir
-        // cleaned up below, so wipe must target the user's selected originals
-        // instead. SHA-1 verify_uploaded still gates deletion to files the
-        // server actually holds, so unuploaded picks are kept safe.
+        // `run.completed_paths` is authoritative for wipe candidates. A staged
+        // run reports temporary destinations, so restore only paths in the
+        // successful-link map captured before cleanup. An unmapped destination
+        // is dropped rather than guessed, because it cannot safely name an
+        // original file.
         let completed_asset_paths = if staged_import {
-            // Already validated under the source roots at admission, by
-            // `validate_selected_under_sources` — which canonicalizes each
-            // entry and so requires it to exist, the same containment
-            // guarantee `retain_paths_under_sources` gives the non-staged
-            // branch below, just established before the run instead of after.
-            // A staged import therefore has no log-derived contained paths at
-            // all (the log only ever saw the temp staging dir), but this
-            // pre-run validation already supplies equivalent evidence, so
-            // `completed_asset_paths.len()` can stand in for it below as
-            // `classify_completed_run`'s contained-path count.
-            select_files.clone()
+            let (translated, dropped) = translate_staged_paths(run.completed_paths, &staged_links);
+            if dropped > 0 {
+                let _ = logs::append_log(
+                    "app.log",
+                    &format!(
+                        "import_staged_completed_paths_unmapped job_id={job_id_clone} dropped={dropped}"
+                    ),
+                );
+            }
+            translated
         } else {
             // Re-contain what the log claims was uploaded: these paths become
             // deletion candidates, and the log is not a trusted channel.
@@ -811,7 +889,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 progress.uploaded,
                 progress.duplicates,
                 exit_nonzero,
-                file_errors.len(),
+                file_errors.len() + dropped_staged_errors,
                 keep_files,
                 completed_asset_paths.len(),
                 run.scan_errors,
@@ -843,7 +921,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 }
             }
 
-            let error = if failed {
+            let error = if let Some(log_error) = log_read_error {
+                Some(log_error)
+            } else if failed {
                 let tail: Vec<&str> = error_lines
                     .iter()
                     .rev()
@@ -1716,6 +1796,130 @@ mod tests {
         assert!(!is_failed(&o));
         assert!(!o.wipe_eligible, "keep-files must suppress deletion");
         assert!(o.checkpoint_eligible, "keeping files is not a failure");
+    }
+
+    #[test]
+    fn staged_run_with_no_uploaded_files_has_no_wipe_candidates() {
+        let tmp = std::env::temp_dir().join(format!("import-staged-empty-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("photo.jpg");
+        std::fs::write(&source, b"photo").unwrap();
+        let selected = vec![source.to_string_lossy().into_owned()];
+        let mut staged = staging::create_staging_dir(&selected, None).unwrap();
+        let invocation_root = staged.path().to_path_buf();
+        let links = staged.take_links();
+        let run = crate::services::stdout_parser::parse_run_progress(
+            "",
+            &[invocation_root.to_string_lossy().into_owned()],
+        );
+        staging::cleanup_staging_dir(staged);
+
+        let (completed, dropped) = translate_staged_paths(run.completed_paths, &links);
+        assert!(completed.is_empty());
+        assert_eq!(dropped, 0);
+        let outcome = classify_completed_run(
+            run.progress.uploaded,
+            run.progress.duplicates,
+            false,
+            0,
+            false,
+            completed.len(),
+            0,
+        );
+        assert!(!outcome.wipe_eligible);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn staged_run_with_landed_files_has_exactly_their_originals_as_candidates() {
+        let tmp = std::env::temp_dir().join(format!("import-staged-landed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let selected: Vec<String> = ["one.jpg", "two.jpg", "three.jpg"]
+            .into_iter()
+            .map(|name| {
+                let path = tmp.join(name);
+                std::fs::write(&path, name.as_bytes()).unwrap();
+                path.to_string_lossy().into_owned()
+            })
+            .collect();
+        let mut staged = staging::create_staging_dir(&selected, None).unwrap();
+        let invocation_root = staged.path().to_path_buf();
+        let links = staged.take_links();
+        let log = links
+            .entries()
+            .iter()
+            .map(|(destination, _)| {
+                let relative = destination.strip_prefix(&invocation_root).unwrap();
+                format!(
+                    "2026-06-24 16:10:00 INF uploaded successfully file={}:{}\n",
+                    invocation_root.display(),
+                    relative.display()
+                )
+            })
+            .collect::<String>();
+        let run = crate::services::stdout_parser::parse_run_progress(
+            &log,
+            &[invocation_root.to_string_lossy().into_owned()],
+        );
+        staging::cleanup_staging_dir(staged);
+
+        let (completed, dropped) = translate_staged_paths(run.completed_paths, &links);
+        assert_eq!(completed, selected);
+        assert_eq!(dropped, 0);
+        let outcome = classify_completed_run(
+            run.progress.uploaded,
+            run.progress.duplicates,
+            false,
+            0,
+            false,
+            completed.len(),
+            0,
+        );
+        assert!(outcome.wipe_eligible);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn staged_file_errors_resolve_to_original_paths() {
+        let tmp = std::env::temp_dir().join(format!("import-staged-errors-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("failed.jpg");
+        std::fs::write(&source, b"failed").unwrap();
+        let selected = vec![source.to_string_lossy().into_owned()];
+        let mut staged = staging::create_staging_dir(&selected, None).unwrap();
+        let invocation_root = staged.path().to_path_buf();
+        let links = staged.take_links();
+        let (destination, _) = &links.entries()[0];
+        let relative = destination.strip_prefix(&invocation_root).unwrap();
+        let log = format!(
+            "2026-06-24 16:10:00 ERR server error file={}:{} error=upload failed\n",
+            invocation_root.display(),
+            relative.display()
+        );
+        let parsed = crate::services::stdout_parser::parse_error_log(
+            &log,
+            &[invocation_root.to_string_lossy().into_owned()],
+        );
+        staging::cleanup_staging_dir(staged);
+
+        let (errors, dropped) = translate_staged_file_errors(parsed, &links);
+        assert_eq!(dropped, 0);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].file, selected[0]);
+        assert!(!errors[0].file.contains("immich-shuttle-stage-"));
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn unreadable_run_log_returns_a_visible_error() {
+        let (_, error) = read_run_log(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        )));
+        assert_eq!(
+            error.as_deref(),
+            Some("Could not read import run log: permission denied")
+        );
     }
 
     #[test]

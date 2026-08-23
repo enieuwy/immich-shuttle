@@ -17,6 +17,35 @@ use std::{
 };
 use uuid::Uuid;
 
+/// The paths immich-go saw for successfully linked files and their user-selected
+/// originals. The run log is parsed after the staging directory is removed, so
+/// callers must take this map before moving the guard into cleanup.
+#[derive(Debug, Clone, Default)]
+pub struct StagingPathMap {
+    entries: Vec<(PathBuf, PathBuf)>,
+}
+
+impl StagingPathMap {
+    /// Resolve a path from the run log back to the selected original.
+    pub fn original_for(&self, staged: &Path) -> Option<&Path> {
+        self.entries.iter().find_map(|(destination, original)| {
+            (destination == staged).then_some(original.as_path())
+        })
+    }
+
+    /// Every `(staged destination, original selection)` pair. Production reads
+    /// the map only through `original_for`; the pairs themselves are needed to
+    /// build run-log fixtures in tests.
+    #[cfg(test)]
+    pub fn entries(&self) -> &[(PathBuf, PathBuf)] {
+        &self.entries
+    }
+
+    fn push(&mut self, staged: PathBuf, original: PathBuf) {
+        self.entries.push((staged, original));
+    }
+}
+
 /// Owns a temporary staging directory and removes it when dropped.
 ///
 /// Normal callers should move this into [`cleanup_staging_dir`] on a blocking
@@ -25,6 +54,7 @@ use uuid::Uuid;
 pub struct StagingDir {
     path: Option<PathBuf>,
     lock: Option<fs::File>,
+    links: StagingPathMap,
 }
 
 impl StagingDir {
@@ -32,6 +62,21 @@ impl StagingDir {
         self.path
             .as_deref()
             .expect("staging directory path is available until cleanup")
+    }
+
+    /// Borrow the link map while the guard still owns it. Production always
+    /// takes the map instead, because cleanup consumes the guard before the run
+    /// log is parsed.
+    #[cfg(test)]
+    pub fn links(&self) -> &StagingPathMap {
+        &self.links
+    }
+
+    /// Take the link map before cleanup consumes this guard. The run log is only
+    /// parsed after cleanup has removed the directory, so the map must leave the
+    /// guard first; nothing may borrow it from a guard that is about to move.
+    pub fn take_links(&mut self) -> StagingPathMap {
+        std::mem::take(&mut self.links)
     }
 
     fn cleanup(&mut self) {
@@ -88,11 +133,10 @@ pub fn create_staging_dir(
             return Err(format!("Could not lock staging dir: {e}"));
         }
     };
-    // Construct the guard immediately after creation so unwinding during any
-    // later staging operation removes partially-created links as well.
-    let guard = StagingDir {
+    let mut guard = StagingDir {
         path: Some(root),
         lock: Some(lock),
+        links: StagingPathMap::default(),
     };
 
     let base = common_ancestor(selected);
@@ -141,6 +185,7 @@ pub fn create_staging_dir(
         if link_file(src, &dest).is_err() {
             continue;
         }
+        guard.links.push(dest.clone(), PathBuf::from(entry));
         used.insert(dest);
         linked += 1;
     }
@@ -268,6 +313,19 @@ mod tests {
 
         assert!(staged.path().join("100/IMG_1.JPG").exists());
         assert!(staged.path().join("101/IMG_2.JPG").exists());
+        assert_eq!(staged.links().entries().len(), 2);
+        assert_eq!(
+            staged
+                .links()
+                .original_for(&staged.path().join("100/IMG_1.JPG")),
+            Some(a.as_path())
+        );
+        assert_eq!(
+            staged
+                .links()
+                .original_for(&staged.path().join("101/IMG_2.JPG")),
+            Some(b.as_path())
+        );
 
         let staged_path = staged.path().to_path_buf();
         cleanup_staging_dir(staged);
@@ -331,6 +389,19 @@ mod tests {
             walkdir_files(staged.path()).len(),
             2,
             "both entries must be staged without collision"
+        );
+        assert_eq!(staged.links().entries().len(), 2);
+        assert_eq!(
+            staged
+                .links()
+                .original_for(&staged.path().join("photo.jpg")),
+            Some(a.as_path())
+        );
+        assert_eq!(
+            staged
+                .links()
+                .original_for(&staged.path().join("1/photo.jpg")),
+            Some(a.as_path())
         );
 
         cleanup_staging_dir(staged);
