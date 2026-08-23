@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Import
+- **Closing the window now also waits for the run's final bookkeeping.** The quit guard waited for the import worker to leave the running set, but the worker left it *before* reading the run log, registering the wipe payload, writing the final state, and saving the history record. A cancelled import was therefore waved through while it was still parsing, so quitting in that window lost the run's History entry and its "Import again" request. The wait now covers that finalization phase too. Cancellation itself is unchanged: an import stops being cancellable at the same moment as before.
+- **A very long session can no longer drop a pending delete-after-import prompt.** Once more than 500 finished imports had accumulated in one session, the oldest were evicted with their pending-wipe payloads — including an import still awaiting confirmation, whose verified-uploaded originals were then stranded with no way back to the prompt. Eviction now skips imports awaiting confirmation, the same way "Clear finished" already did.
+- **A staging failure can no longer relabel a cancelled import as failed.** If the file-staging task itself died while a cancellation was being published, the card showed "Failed" instead of "Cancelled".
+
+### UI
+- **Dismissed and cleared import cards stay gone.** Both actions committed their result without invalidating a queue poll already in flight, so a poll that started first could resolve afterwards and briefly restore the removed cards — repeating their completion notifications. This completes the stale-response work in v0.7.0, which covered the polls but missed these two actions.
+
+### Safety
+- **The source-scope guard can no longer blank a preview for a folder you did select.** Starting a scan cleared the approved-source list and then repopulated it in two steps, so a thumbnail, capture-date, or "Check server" request landing in between was rejected. The scope is now swapped in one atomic step.
+
 ## v0.7.0 - 2026-08-06
 
 ### Import
