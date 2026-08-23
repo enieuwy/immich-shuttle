@@ -32,6 +32,50 @@ pub struct SidecarResult {
 /// Keep enough stderr context to diagnose a failed run without retaining an
 /// unbounded stream from a noisy sidecar.
 const MAX_STDERR_LINES: usize = 16;
+/// Bound each retained stderr line as well as the number of retained lines.
+/// A sidecar can emit arbitrary diagnostics, so neither dimension may grow with
+/// the length of an import.
+const MAX_STDERR_LINE_CHARS: usize = 512;
+
+#[derive(Debug, Default)]
+struct StderrBuffer {
+    lines: VecDeque<String>,
+}
+
+impl StderrBuffer {
+    fn new() -> Self {
+        Self {
+            lines: VecDeque::with_capacity(MAX_STDERR_LINES),
+        }
+    }
+
+    /// Retain only recent, non-empty diagnostics, with a fixed per-line bound.
+    fn push(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+
+        let line = line.chars().take(MAX_STDERR_LINE_CHARS).collect();
+        if self.lines.len() == MAX_STDERR_LINES {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line);
+    }
+
+    /// Render the retained diagnostics for appending to a runner error.
+    fn render_suffix(&self) -> String {
+        self.lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn into_vec(self) -> Vec<String> {
+        self.lines.into_iter().collect()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct UploadRequest {
@@ -395,8 +439,7 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
         .map_err(|e| format!("Could not spawn immich-go sidecar: {e}"))?;
     let mut child = Some(child);
 
-    let mut error_lines = VecDeque::with_capacity(MAX_STDERR_LINES);
-
+    let mut error_lines = StderrBuffer::new();
     // immich-go's --no-ui stdout is a `\r`-refreshed aggregate that never
     // line-flushes through the pipe, so progress is polled from the run log
     // (append-only, written in real time) on a fixed cadence instead. The reader
@@ -425,17 +468,22 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
                         let reap_error = kill_and_reap(&mut child, &mut rx).await.err();
                         let detail = reap_error
                             .unwrap_or_else(|| "sidecar stopped without a termination event".to_string());
+                        let stderr_suffix = error_lines.render_suffix();
+                        let detail = if stderr_suffix.is_empty() {
+                            detail
+                        } else {
+                            format!("{detail}; recent stderr:\n{stderr_suffix}")
+                        };
                         return Err(format!("immich-go event channel closed unexpectedly: {detail}"));
                     }
+
                     Some(CommandEvent::Stderr(line_bytes)) => {
-                        let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
-                        if !line.is_empty() {
-                            if error_lines.len() == MAX_STDERR_LINES {
-                                error_lines.pop_front();
-                            }
-                            error_lines.push_back(line);
+                        let line = String::from_utf8_lossy(&line_bytes);
+                        for line in line.lines() {
+                            error_lines.push(line);
                         }
                     }
+
                     Some(CommandEvent::Terminated(payload)) => {
                         let _ = child.take();
                         break payload.code.unwrap_or(1) != 0;
@@ -463,7 +511,7 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
     );
 
     Ok(SidecarResult {
-        error_lines: error_lines.into_iter().collect(),
+        error_lines: error_lines.into_vec(),
         exit_nonzero,
     })
 }
@@ -606,5 +654,30 @@ mod tests {
         assert!(args.contains(&"--include-type=VIDEO".to_string()));
         assert!(args.contains(&"--include-extensions=.mp4,.mov".to_string()));
         assert!(args.contains(&"--exclude-extensions=.gif".to_string()));
+    }
+
+    #[test]
+    fn stderr_buffer_keeps_recent_bounded_lines_and_renders_error_suffix() {
+        let mut buffer = StderrBuffer::new();
+        for index in 0..=MAX_STDERR_LINES {
+            buffer.push(&format!("line-{index}"));
+        }
+
+        let long_line = "x".repeat(MAX_STDERR_LINE_CHARS + 1);
+        buffer.push(&long_line);
+
+        let rendered = buffer.render_suffix();
+        let expected_lines = (2..=MAX_STDERR_LINES)
+            .map(|index| format!("line-{index}"))
+            .chain(std::iter::once("x".repeat(MAX_STDERR_LINE_CHARS)))
+            .collect::<Vec<_>>();
+        assert_eq!(rendered, expected_lines.join("\n"));
+        assert!(!rendered.contains("line-0"));
+        assert!(!rendered.ends_with(&long_line));
+
+        let error = format!(
+            "immich-go event channel closed unexpectedly: sidecar stopped; recent stderr:\n{rendered}"
+        );
+        assert!(error.ends_with(&format!("recent stderr:\n{rendered}")));
     }
 }
