@@ -15,6 +15,8 @@ pub struct WipeResult {
     /// Files kept because they no longer matched the identity that was verified
     /// against the server (see `FileIdentity`).
     pub changed: usize,
+    /// Paths whose verified files could not be moved to the Trash and may be retried.
+    pub failed_paths: Vec<String>,
     pub errors: Vec<String>,
 }
 
@@ -115,6 +117,7 @@ pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
         failed: 0,
         skipped: 0,
         changed: 0,
+        failed_paths: Vec::new(),
         errors: Vec::new(),
     };
 
@@ -164,6 +167,7 @@ pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
             Ok(_) => result.deleted += 1,
             Err(err) => {
                 result.failed += 1;
+                result.failed_paths.push(file.path.clone());
                 result
                     .errors
                     .push(format!("Could not move {} to Trash: {err}", path.display()));
@@ -403,6 +407,10 @@ mod tests {
         // path (counted as deleted) but, unlike a hard delete, stays recoverable.
 
         assert_eq!(result.deleted, 1);
+        assert!(
+            result.failed_paths.is_empty(),
+            "successful and skipped files must not enter the failed retry set"
+        );
         assert!(!photo.exists());
         assert!(other.exists());
 

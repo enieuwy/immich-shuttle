@@ -14,16 +14,44 @@ use crate::models::device::RemovableDevice;
 
 const DCIM_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-fn run_probe_with_timeout(
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeOutcome {
+    Value(bool),
+    TimedOut,
+    Disconnected,
+}
+
+/// Keep channel disconnect separate from timeout: a disconnected sender means
+/// the probe thread panicked, so silently treating it as "no DCIM" would hide
+/// a detector failure.
+fn run_probe_with_timeout_outcome(
     probe: impl FnOnce() -> bool + Send + 'static,
     timeout: Duration,
-) -> bool {
+) -> ProbeOutcome {
     let (sender, receiver) = mpsc::sync_channel(1);
     let _ = thread::spawn(move || {
         let _ = sender.send(probe());
     });
 
-    receiver.recv_timeout(timeout).unwrap_or(false)
+    match receiver.recv_timeout(timeout) {
+        Ok(value) => ProbeOutcome::Value(value),
+        Err(mpsc::RecvTimeoutError::Timeout) => ProbeOutcome::TimedOut,
+        Err(mpsc::RecvTimeoutError::Disconnected) => ProbeOutcome::Disconnected,
+    }
+}
+
+fn run_probe_with_timeout(
+    probe: impl FnOnce() -> bool + Send + 'static,
+    timeout: Duration,
+) -> bool {
+    match run_probe_with_timeout_outcome(probe, timeout) {
+        ProbeOutcome::Value(value) => value,
+        ProbeOutcome::TimedOut => false,
+        ProbeOutcome::Disconnected => {
+            let _ = crate::services::logs::append_log("app.log", "device_detector_probe_panicked");
+            false
+        }
+    }
 }
 
 /// Mount paths with a probe thread currently running. Keyed so that a mount whose
@@ -180,6 +208,25 @@ mod tests {
 
         assert!(!result);
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn panicking_probe_returns_false_and_is_distinguishable_from_timeout() {
+        let panicked = run_probe_with_timeout(|| panic!("probe failed"), Duration::from_millis(10));
+        assert!(!panicked);
+
+        let disconnected =
+            run_probe_with_timeout_outcome(|| panic!("probe failed"), Duration::from_millis(10));
+        assert_eq!(disconnected, ProbeOutcome::Disconnected);
+
+        let timed_out = run_probe_with_timeout_outcome(
+            || {
+                thread::sleep(Duration::from_millis(250));
+                true
+            },
+            Duration::from_millis(10),
+        );
+        assert_eq!(timed_out, ProbeOutcome::TimedOut);
     }
 
     #[test]

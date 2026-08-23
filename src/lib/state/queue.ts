@@ -48,6 +48,9 @@ let progressUnlisten: UnlistenFn | null = null;
 // a registration that has not resolved yet (the resolved handle would otherwise
 // escape teardown and leak the listener across mount/unmount cycles).
 let progressPending: Promise<UnlistenFn> | null = null;
+// Starts remain visible to shutdown until their admission and the following
+// queue refresh settle, including starts that reject validation or IPC.
+const pendingImportStarts = new Set<Promise<void>>();
 
 type ImportProgressEvent = {
   job_id: string;
@@ -109,17 +112,18 @@ export function recomputeRates(
   return rates;
 }
 
-// Notification permission is resolved once per session and cached; requesting it
-// on every terminal transition would spam the OS prompt.
+// A denial may remain cached because the user must change it in system settings;
+// a grant must be checked again so revoking notification permission takes effect
+// without restarting the app.
 let notifyPermission: boolean | null = null;
 
 async function ensureNotifyPermission(): Promise<boolean> {
-  if (notifyPermission !== null) return notifyPermission;
+  if (notifyPermission === false) return false;
   let granted = await isPermissionGranted();
   if (!granted) {
     granted = (await requestPermission()) === "granted";
   }
-  notifyPermission = granted;
+  notifyPermission = granted ? null : false;
   return granted;
 }
 
@@ -232,6 +236,11 @@ async function refreshJobs() {
 
 export const queueState = {
   subscribe: state.subscribe,
+  // Shutdown snapshots this set before its confirmation prompt; return a copy
+  // so later starts cannot mutate the sequence's fixed pending-start list.
+  pendingStarts() {
+    return [...pendingImportStarts];
+  },
   async loadJobs() {
     state.update((s) => ({ ...s, loading: true }));
     await refreshJobs();
@@ -292,7 +301,7 @@ export const queueState = {
       progressUnlisten = null;
     }
   },
-  async startImport(overrides?: {
+  startImport(overrides?: {
     sourcePaths?: string[];
     keepFiles?: boolean;
     albumIds?: string[];
@@ -305,101 +314,113 @@ export const queueState = {
     stackBurst?: boolean;
     organization?: ImportOrganization;
   }) {
-    const source = get(sourceState);
-    const options = get(importOptionsState);
-    const albums = get(albumsState);
+    const pendingStart = (async () => {
+      const source = get(sourceState);
+      const options = get(importOptionsState);
+      const albums = get(albumsState);
 
-    const profile = overrides?.profileId
-      ? (get(profilesState).profiles.find((p) => p.id === overrides.profileId) ?? null)
-      : get(activeProfile);
-    if (!profile) {
-      throw new Error("Select a profile before starting import.");
-    }
-    const sourcePaths = overrides?.sourcePaths ?? source.selectedPaths;
-    if (sourcePaths.length === 0) {
-      throw new Error("Select a source before starting import.");
-    }
-    if (isDateRangeInvalid(options.dateFrom, options.dateTo)) {
-      throw new Error("The start date must be on or before the end date.");
-    }
+      const profile = overrides?.profileId
+        ? (get(profilesState).profiles.find((p) => p.id === overrides.profileId) ?? null)
+        : get(activeProfile);
+      if (!profile) {
+        throw new Error("Select a profile before starting import.");
+      }
+      const sourcePaths = overrides?.sourcePaths ?? source.selectedPaths;
+      if (sourcePaths.length === 0) {
+        throw new Error("Select a source before starting import.");
+      }
+      if (isDateRangeInvalid(options.dateFrom, options.dateTo)) {
+        throw new Error("The start date must be on or before the end date.");
+      }
 
-    // Album state is scoped to a profile (loadedProfileId). Switching the
-    // active profile and hitting Start before the albums store reloads must
-    // not carry the old profile's selection across: an album id/name that
-    // only exists on the previous server would otherwise silently create a
-    // stray album there, or worse, upload into someone else's album. Gate on
-    // loadedProfileId rather than depending on a sibling clear-on-switch to
-    // have already run.
-    const albumsUsable = albums.loadedProfileId === profile.id;
-    // immich-go assigns albums by name (--into-album), single album per run. A
-    // device rule can supply the name directly; otherwise resolve it from the
-    // first selected album id.
-    const albumIds = overrides?.albumIds ?? (albumsUsable ? albums.selectedAlbumIds : []);
-    const intoAlbum =
-      overrides?.intoAlbum !== undefined
-        ? overrides.intoAlbum
-        : albumIds.length > 0
-          ? (albums.availableAlbums.find((a) => a.id === albumIds[0])?.album_name ?? null)
-          : null;
+      // Album state is scoped to a profile (loadedProfileId). Switching the
+      // active profile and hitting Start before the albums store reloads must
+      // not carry the old profile's selection across: an album id/name that
+      // only exists on the previous server would otherwise silently create a
+      // stray album there, or worse, upload into someone else's album. Gate on
+      // loadedProfileId rather than depending on a sibling clear-on-switch to
+      // have already run.
+      const albumsUsable = albums.loadedProfileId === profile.id;
+      // immich-go assigns albums by name (--into-album), single album per run. A
+      // device rule can supply the name directly; otherwise resolve it from the
+      // first selected album id.
+      const albumIds = overrides?.albumIds ?? (albumsUsable ? albums.selectedAlbumIds : []);
+      const intoAlbum =
+        overrides?.intoAlbum !== undefined
+          ? overrides.intoAlbum
+          : albumIds.length > 0
+            ? (albums.availableAlbums.find((a) => a.id === albumIds[0])?.album_name ?? null)
+            : null;
 
-    // An explicit preview selection IS the import: the user hand-picked exact
-    // files, so no coarse filter may silently drop one. Type, date, include-
-    // and exclude-extension filters therefore all apply only on the no-preview
-    // (fast) path and to History replays, which clear the selection. Durable
-    // excludes are hygiene for unattended scans, not a veto over a ticked file
-    // — the preview grid never filters by extension, so a selection genuinely
-    // can contain one.
-    const selectFiles = overrides?.selectFiles ?? null;
-    const hasSelection = !!selectFiles && selectFiles.length > 0;
+      // An explicit preview selection IS the import: the user hand-picked exact
+      // files, so no coarse filter may silently drop one. Type, date, include-
+      // and exclude-extension filters therefore all apply only on the no-preview
+      // (fast) path and to History replays, which clear the selection. Durable
+      // excludes are hygiene for unattended scans, not a veto over a ticked file
+      // — the preview grid never filters by extension, so a selection genuinely
+      // can contain one.
+      const selectFiles = overrides?.selectFiles ?? null;
+      const hasSelection = !!selectFiles && selectFiles.length > 0;
 
-    // Explicit From/To range wins. Otherwise, "only new since last import"
-    // derives a capture-date floor from this source's stored last-import time.
-    // immich-go's --date-range needs both bounds, so pair the floor with a
-    // far-future upper bound (open-ended "floor," is rejected).
-    let dateRange: string | null = null;
-    if (!hasSelection) {
-      dateRange = toImmichDateRange(options.dateFrom, options.dateTo);
-      if (!dateRange && options.onlyNewSinceLastImport) {
-        const lastMs = await historySourceLastImport(profile.id, sourcePaths);
-        if (lastMs != null) {
-          // Format in the local calendar zone: immich-go parses --date-range in
-          // local time, so a UTC date could land a day off and skip newer files.
-          const d = new Date(lastMs);
-          const floor = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
-            d.getDate(),
-          ).padStart(2, "0")}`;
-          dateRange = `${floor},9999-12-31`;
+      // Explicit From/To range wins. Otherwise, "only new since last import"
+      // derives a capture-date floor from this source's stored last-import time.
+      // immich-go's --date-range needs both bounds, so pair the floor with a
+      // far-future upper bound (open-ended "floor," is rejected).
+      let dateRange: string | null = null;
+      if (!hasSelection) {
+        dateRange = toImmichDateRange(options.dateFrom, options.dateTo);
+        if (!dateRange && options.onlyNewSinceLastImport) {
+          const lastMs = await historySourceLastImport(profile.id, sourcePaths);
+          if (lastMs != null) {
+            // Format in the local calendar zone: immich-go parses --date-range in
+            // local time, so a UTC date could land a day off and skip newer files.
+            const d = new Date(lastMs);
+            const floor = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+              d.getDate(),
+            ).padStart(2, "0")}`;
+            dateRange = `${floor},9999-12-31`;
+          }
         }
       }
-    }
 
-    await importStart({
-      profile_id: profile.id,
-      source_paths: sourcePaths,
-      album_ids: albumIds,
-      keep_files: overrides?.keepFiles ?? options.keepFiles,
-      stack_raw_jpeg: overrides?.stackRawJpeg ?? options.stackRawJpeg,
-      stack_burst: overrides?.stackBurst ?? options.stackBurst,
-      date_range: dateRange,
-      concurrent_tasks: options.concurrentTasks,
-      select_files: selectFiles,
-      into_album: intoAlbum,
-      organization: overrides?.organization ?? options.organization,
-      on_errors: options.keepGoingOnErrors ? "continue" : null,
-      overwrite: options.overwrite,
-      tags: options.tags,
-      session_tag: options.sessionTag,
-      include_type: hasSelection
-        ? null
-        : options.mediaType === "image"
-          ? "IMAGE"
-          : options.mediaType === "video"
-            ? "VIDEO"
-            : null,
-      include_extensions: hasSelection ? [] : options.includeExtensions,
-      exclude_extensions: hasSelection ? [] : options.excludeExtensions,
-    });
-    await refreshJobs();
+      await importStart({
+        profile_id: profile.id,
+        source_paths: sourcePaths,
+        album_ids: albumIds,
+        keep_files: overrides?.keepFiles ?? options.keepFiles,
+        stack_raw_jpeg: overrides?.stackRawJpeg ?? options.stackRawJpeg,
+        stack_burst: overrides?.stackBurst ?? options.stackBurst,
+        date_range: dateRange,
+        concurrent_tasks: options.concurrentTasks,
+        select_files: selectFiles,
+        into_album: intoAlbum,
+        organization: overrides?.organization ?? options.organization,
+        on_errors: options.keepGoingOnErrors ? "continue" : null,
+        overwrite: options.overwrite,
+        tags: options.tags,
+        session_tag: options.sessionTag,
+        include_type: hasSelection
+          ? null
+          : options.mediaType === "image"
+            ? "IMAGE"
+            : options.mediaType === "video"
+              ? "VIDEO"
+              : null,
+        include_extensions: hasSelection ? [] : options.includeExtensions,
+        exclude_extensions: hasSelection ? [] : options.excludeExtensions,
+      });
+      await refreshJobs();
+    })();
+    pendingImportStarts.add(pendingStart);
+    void pendingStart
+      .finally(() => {
+        pendingImportStarts.delete(pendingStart);
+      })
+      .catch(() => {
+        // The caller still receives the original rejection; consume only the
+        // cleanup branch's mirrored rejection to keep shutdown best-effort.
+      });
+    return pendingStart;
   },
   // cancelImport/retry/dismiss/clearFinished/confirmWipe below already report
   // their failure once via errorsState.addError before reaching here — the

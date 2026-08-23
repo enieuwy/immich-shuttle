@@ -7,12 +7,16 @@ use serde_json::{json, Value};
 /// One shared HTTP client (connection pool + TLS config) reused across every
 /// request. Building a fresh `Client` per call is wasteful and was a likely
 /// source of flaky "error sending request" failures during the startup burst.
-static HTTP: LazyLock<Client> = LazyLock::new(|| {
+///
+/// Keep the build error instead of falling back to reqwest's default
+/// constructor: that fallback can panic for the same TLS or resolver failure
+/// that rejected the configured client, poisoning this process-wide lazy value.
+static HTTP: LazyLock<Result<Client, String>> = LazyLock::new(|| {
     Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|_| Client::new())
+        .map_err(|error| format!("Failed to build shared Immich HTTP client: {error}"))
 });
 
 /// Client for authenticated raw-byte fetches (profile images). Redirects are
@@ -20,13 +24,13 @@ static HTTP: LazyLock<Client> = LazyLock::new(|| {
 /// Cookie-class headers, so a 3xx would otherwise resend the custom
 /// `x-api-key` header to whatever origin the server names. The image endpoint
 /// never legitimately redirects, so a 3xx is treated as "no image".
-static HTTP_NO_REDIRECT: LazyLock<Client> = LazyLock::new(|| {
+static HTTP_NO_REDIRECT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|_| Client::new())
+        .map_err(|error| format!("Failed to build shared no-redirect Immich HTTP client: {error}"))
 });
 
 use crate::models::album::{Album, AlbumShareLink, AlbumUser};
@@ -199,7 +203,7 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
 pub struct ImmichClient {
     server_url: String,
     api_key: String,
-    http: Client,
+    http: Result<Client, String>,
 }
 
 impl ImmichClient {
@@ -219,11 +223,11 @@ impl ImmichClient {
     ) -> Result<Value, String> {
         let display_path = format!("/{}", path.join("/"));
         let candidates = api_endpoint_urls(&self.server_url, path)?;
+        let http = self.http.as_ref().map_err(|error| error.clone())?;
 
         for (index, url) in candidates.iter().enumerate() {
             let has_alternate = index + 1 < candidates.len();
-            let mut req = self
-                .http
+            let mut req = http
                 .request(method.clone(), url.clone())
                 .header("x-api-key", &self.api_key)
                 .header("accept", "application/json");
@@ -322,10 +326,11 @@ impl ImmichClient {
         const MAX_AVATAR_BYTES: usize = 8 * 1024 * 1024;
         let display_path = format!("/users/{user_id}/profile-image");
         let candidates = api_endpoint_urls(&self.server_url, &["users", user_id, "profile-image"])?;
+        let http = HTTP_NO_REDIRECT.as_ref().map_err(|error| error.clone())?;
 
         for (index, url) in candidates.iter().enumerate() {
             let has_alternate = index + 1 < candidates.len();
-            match HTTP_NO_REDIRECT
+            match http
                 .get(url.clone())
                 .header("x-api-key", &self.api_key)
                 .send()
@@ -656,8 +661,12 @@ pub async fn probe_is_immich(server_url: &str) -> bool {
     let Ok(candidates) = api_endpoint_urls(&root, &["server", "ping"]) else {
         return false;
     };
+    let Ok(http) = HTTP.as_ref() else {
+        return false;
+    };
+
     for url in candidates {
-        let resp = HTTP
+        let resp = http
             .get(url)
             .header("accept", "application/json")
             // Short bound so failover stays snappy; covers connect + response.

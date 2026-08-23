@@ -51,6 +51,29 @@ struct PendingWipe {
     server_url: String,
     api_key: String,
 }
+/// Removes a worker's liveness markers if its body unwinds before normal
+/// finalization. `JOB_INPUTS` deliberately stays intact because `import_retry`
+/// needs the saved request after a failed or panicking run.
+struct ImportWorkerGuard {
+    job_id: String,
+}
+
+impl ImportWorkerGuard {
+    fn new(job_id: String) -> Self {
+        Self { job_id }
+    }
+}
+
+impl Drop for ImportWorkerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut running) = RUNNING_IMPORTS.lock() {
+            running.remove(&self.job_id);
+        }
+        if let Ok(mut finalizing) = FINALIZING_IMPORTS.lock() {
+            finalizing.remove(&self.job_id);
+        }
+    }
+}
 
 fn collapse_overlapping_roots(paths: Vec<String>) -> Vec<String> {
     let roots: Vec<(String, Option<PathBuf>)> = paths
@@ -524,6 +547,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     history_request.select_files = None;
 
     tauri::async_runtime::spawn(async move {
+        // Keep liveness state recoverable if any worker operation panics before
+        // the explicit normal-path removals below run.
+        let _worker_guard = ImportWorkerGuard::new(job_id_clone.clone());
         let api_key_for_album_assignment = api_key_clone.clone();
         let staging_dir = if staging_requested {
             let selected_files = select_files.clone();
@@ -1092,6 +1118,19 @@ fn normalize_extensions(exts: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Retain only confirmed files whose Trash move failed. Changed files stay out
+/// of this retry payload because the verify-before-wipe safety gate kept them.
+fn retry_pending_wipe(pending: PendingWipe, failed_paths: Vec<String>) -> Option<PendingWipe> {
+    if failed_paths.is_empty() {
+        return None;
+    }
+    Some(PendingWipe {
+        paths: failed_paths,
+        server_url: pending.server_url,
+        api_key: pending.api_key,
+    })
+}
+
 #[tauri::command]
 pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<ImportJob, String> {
     let mut job = get_job(&job_id)?;
@@ -1171,6 +1210,9 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
                                 job_id, confirmed_count, unverified_count, wipe_result.deleted, wipe_result.changed
                             ),
                         );
+                        if wipe_result.failed > 0 {
+                            retry_pending = retry_pending_wipe(pending, wipe_result.failed_paths);
+                        }
                     }
                     Err(err) => {
                         job.summary = Some(
@@ -1203,24 +1245,26 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
     } else {
         job.summary = Some(format!("Wipe skipped by user. {pending_count} files kept."));
     }
-
     if let Some(payload) = retry_pending {
+        let retry_count = payload.paths.len();
         // Put the payload back so a later import_confirm_wipe can retry.
         if let Ok(mut map) = PENDING_WIPE.lock() {
             map.insert(job_id.clone(), payload);
         }
         job.awaiting_wipe_confirmation = true;
-        job.pending_wipe_count = pending_count as u32;
+        job.pending_wipe_count = retry_count as u32;
     } else {
         job.awaiting_wipe_confirmation = false;
         job.pending_wipe_count = 0;
     }
     set_job(job.clone())?;
+    // `pending_count` is the size of the payload this confirmation acted on;
+    // `retrying` reports how much of it stayed queued for a later attempt.
     let _ = logs::append_log(
         "app.log",
         &format!(
-            "import_wipe_confirmed job_id={} confirm={} pending_count={}",
-            job_id, confirm, pending_count
+            "import_wipe_confirmed job_id={} confirm={} pending_count={} retrying={}",
+            job_id, confirm, pending_count, job.pending_wipe_count
         ),
     );
 
@@ -1520,6 +1564,14 @@ pub async fn import_dismiss(job_id: String) -> Result<Vec<ImportJob>, String> {
             if matches!(&job.status, JobStatus::Running | JobStatus::Pending) {
                 return Err("Cannot dismiss a running import".to_string());
             }
+            // The pending payload is the only handle on verified originals, so
+            // answer the delete prompt before dismissing this terminal job.
+            if job.awaiting_wipe_confirmation {
+                return Err(
+                    "Cannot dismiss an import while wipe confirmation is pending; answer the delete prompt first"
+                        .to_string(),
+                );
+            }
         }
         jobs.retain(|j| j.id != job_id);
     }
@@ -1762,6 +1814,110 @@ mod tests {
         FINALIZING_IMPORTS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+    /// Dismissing a terminal job must not drop the payload that can still
+    /// delete verified originals.
+    #[test]
+    fn dismiss_refuses_a_job_awaiting_wipe_confirmation_and_keeps_payload() {
+        let job_id = format!("dismiss-awaiting-{}", Uuid::new_v4());
+        lock_jobs().push(terminal_job(&job_id, true));
+        {
+            let mut pending = PENDING_WIPE.lock().unwrap();
+            pending.insert(
+                job_id.clone(),
+                PendingWipe {
+                    paths: vec!["/tmp/photo.jpg".to_string()],
+                    server_url: "https://example.invalid".to_string(),
+                    api_key: "key".to_string(),
+                },
+            );
+        }
+
+        let err = tauri::async_runtime::block_on(import_dismiss(job_id.clone())).unwrap_err();
+        assert!(
+            err.contains("answer the delete prompt first"),
+            "the user must be told how to clear the pending wipe: {err}"
+        );
+        assert!(get_job(&job_id).is_ok());
+        assert!(PENDING_WIPE.lock().unwrap().contains_key(&job_id));
+
+        lock_jobs().retain(|job| job.id != job_id);
+        PENDING_WIPE.lock().unwrap().remove(&job_id);
+    }
+
+    #[test]
+    fn dismiss_succeeds_for_a_finished_job_without_pending_wipe() {
+        let job_id = format!("dismiss-finished-{}", Uuid::new_v4());
+        lock_jobs().push(terminal_job(&job_id, false));
+
+        let jobs = tauri::async_runtime::block_on(import_dismiss(job_id.clone()))
+            .expect("a finished job without a wipe prompt is dismissible");
+        assert!(!jobs.iter().any(|job| job.id == job_id));
+        assert!(get_job(&job_id).is_err());
+    }
+
+    /// A worker panic must not leave shutdown waiting forever, while the saved
+    /// input remains available for `import_retry`.
+    #[test]
+    fn worker_guard_removes_liveness_state_but_keeps_retry_input() {
+        let job_id = format!("worker-guard-{}", Uuid::new_v4());
+        let input = ImportInput {
+            profile_id: "profile".to_string(),
+            source_paths: vec!["/tmp/source".to_string()],
+            album_ids: Vec::new(),
+            keep_files: false,
+            stack_raw_jpeg: false,
+            stack_burst: false,
+            date_range: None,
+            concurrent_tasks: None,
+            select_files: None,
+            into_album: None,
+            organization: Organization::SingleAlbum,
+            on_errors: None,
+            overwrite: false,
+            tags: Vec::new(),
+            session_tag: false,
+            include_type: None,
+            include_extensions: Vec::new(),
+            exclude_extensions: Vec::new(),
+        };
+        JOB_INPUTS.lock().unwrap().insert(job_id.clone(), input);
+        lock_running().insert(job_id.clone(), Arc::new(AtomicBool::new(false)));
+        lock_finalizing().insert(job_id.clone());
+
+        {
+            let _guard = ImportWorkerGuard::new(job_id.clone());
+        }
+
+        assert!(!lock_running().contains_key(&job_id));
+        assert!(!lock_finalizing().contains(&job_id));
+        assert!(JOB_INPUTS.lock().unwrap().contains_key(&job_id));
+        JOB_INPUTS.lock().unwrap().remove(&job_id);
+    }
+
+    #[test]
+    fn partial_wipe_retry_payload_contains_only_failed_verified_files() {
+        let pending = PendingWipe {
+            paths: vec![
+                "/tmp/deleted.jpg".to_string(),
+                "/tmp/failed.jpg".to_string(),
+                "/tmp/changed.jpg".to_string(),
+                "/tmp/unverified.jpg".to_string(),
+            ],
+            server_url: "https://example.invalid".to_string(),
+            api_key: "key".to_string(),
+        };
+        let result = wipe::WipeResult {
+            deleted: 1,
+            failed: 1,
+            skipped: 1,
+            changed: 1,
+            failed_paths: vec!["/tmp/failed.jpg".to_string()],
+            errors: vec!["failed".to_string()],
+        };
+
+        let retry = retry_pending_wipe(pending, result.failed_paths).expect("failed file retries");
+        assert_eq!(retry.paths, vec!["/tmp/failed.jpg"]);
     }
 
     /// "Clear finished" must not silently discard the wipe prompt: dropping the

@@ -21,7 +21,9 @@ async function invokeCommand<T>(command: string, args?: Record<string, unknown>)
     return await invoke<T>(command, args);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`${command} failed: ${message}`);
+    // Keep the original rejection reachable as `cause`: the message stays the
+    // contract the UI shows, but a caller can still inspect what actually failed.
+    throw new Error(`${command} failed: ${message}`, { cause: error });
   }
 }
 

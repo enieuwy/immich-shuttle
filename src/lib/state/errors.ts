@@ -15,9 +15,11 @@ export const errorsState = {
   addError(message: string, level: UiError["level"] = "error") {
     const id = `${Date.now()}-${counter++}`;
     state.update((items) => [...items, { id, level, message }]);
-    setTimeout(() => {
-      state.update((items) => items.filter((item) => item.id !== id));
-    }, 5000);
+    if (level !== "error") {
+      setTimeout(() => {
+        state.update((items) => items.filter((item) => item.id !== id));
+      }, 5000);
+    }
   },
   dismissError(id: string) {
     state.update((items) => items.filter((item) => item.id !== id));

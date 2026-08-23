@@ -60,6 +60,50 @@ describe("queueState", () => {
     await expect(queueState.startImport()).rejects.toThrow("Select a profile before starting import");
   });
 
+  it("reports an in-flight start and removes it after settling", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+
+    const start = Promise.withResolvers<string>();
+    vi.mocked(api.importStart).mockReturnValueOnce(start.promise);
+    const importPromise = queueState.startImport();
+
+    expect(queueState.pendingStarts()).toHaveLength(1);
+    start.resolve("job-1");
+    await importPromise;
+    expect(queueState.pendingStarts()).toEqual([]);
+  });
+
+  it("removes a rejected start from shutdown tracking", async () => {
+    await profilesState.saveProfile({
+      id: "p1",
+      display_name: "Ellis",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+    profilesState.setActiveProfile("p1");
+    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+
+    const start = Promise.withResolvers<string>();
+    vi.mocked(api.importStart).mockReturnValueOnce(start.promise);
+    const importPromise = queueState.startImport();
+
+    expect(queueState.pendingStarts()).toHaveLength(1);
+    start.reject(new Error("start failed"));
+    await expect(importPromise).rejects.toThrow("start failed");
+    expect(queueState.pendingStarts()).toEqual([]);
+  });
+
   it("forwards stack flags to importStart", async () => {
     await profilesState.saveProfile({
       id: "p1",

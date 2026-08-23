@@ -168,7 +168,7 @@
                   <ExternalLink class="h-4 w-4" /> Open in Immich
                 </Button>
               {/if}
-              {#if isFinished(job.status)}
+              {#if isFinished(job.status) && !job.awaiting_wipe_confirmation}
                 <Button
                   variant="ghost"
                   size="icon-sm"

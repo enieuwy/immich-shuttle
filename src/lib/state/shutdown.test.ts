@@ -111,6 +111,38 @@ describe("runImportShutdown", () => {
     expect(awaitTerminal).toHaveBeenCalledWith("job-1", 1_000);
   });
 
+  it("closes and drops a retained job that the backend has removed", async () => {
+    const retainedJobIds = new Set<string>(["job-evicted"]);
+    const awaitTerminal = vi.fn(() =>
+      Promise.reject(new Error("import_await_terminal failed: Job not found: job-evicted")),
+    );
+
+    const outcome = await runImportShutdown(
+      deps({ retainedJobIds, awaitTerminal }),
+    );
+
+    expect(outcome).toEqual({ kind: "complete" });
+    expect([...retainedJobIds]).toEqual([]);
+    expect(awaitTerminal).toHaveBeenCalledWith("job-evicted", 1_000);
+  });
+
+  it("keeps the window open for a genuine await timeout", async () => {
+    const retainedJobIds = new Set<string>(["job-timeout"]);
+    const awaitTerminal = vi.fn(() =>
+      Promise.reject(new Error("import_await_terminal failed: timed out")),
+    );
+
+    const outcome = await runImportShutdown(
+      deps({ retainedJobIds, awaitTerminal }),
+    );
+
+    expect(outcome).toEqual({
+      kind: "incomplete",
+      message: SHUTDOWN_INCOMPLETE_MESSAGE,
+    });
+    expect([...retainedJobIds]).toEqual(["job-timeout"]);
+  });
+
   /**
    * A start the backend has admitted is not yet in the polled queue snapshot, so
    * it has no job id to cancel. Quitting in that window must still wait for the

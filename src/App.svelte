@@ -70,11 +70,6 @@
     isDateRangeInvalid($importOptionsState.dateFrom, $importOptionsState.dateTo),
   );
 
-  // The queue snapshot is refreshed only after importStart resolves, so the
-  // backend may have admitted a worker while the store still appears idle.
-  const pendingImportStarts = new Set<Promise<void>>();
-
-
   async function startImport() {
     importError = "";
     if (dateRangeInvalid) {
@@ -86,14 +81,11 @@
     const pendingStart = queueState.startImport(
       selection.length > 0 ? { selectFiles: selection } : {},
     );
-    pendingImportStarts.add(pendingStart);
     try {
       await pendingStart;
       selectionState.clear();
     } catch (error) {
       importError = error instanceof Error ? error.message : String(error);
-    } finally {
-      pendingImportStarts.delete(pendingStart);
     }
   }
 
@@ -157,8 +149,6 @@
     // Cancellation publishes a terminal status before the worker exits; retain
     // timed-out jobs so a retry cannot mistake that status for safe shutdown.
     const shutdownPendingJobIds = new Set<string>();
-
-
     void profilesState.loadProfiles().then(() => {
       if (getProfilesSnapshot().profiles.length === 0) {
         showOnboarding = true;
@@ -172,7 +162,7 @@
     // process mid-upload -- see immich-shuttle finding for the reproduction.
     // `finish` is a parameter so that fix can reuse this sequence unchanged.
     const requestShutdown = (finish: () => Promise<unknown>): boolean => {
-      const pendingStarts = [...pendingImportStarts];
+      const pendingStarts = queueState.pendingStarts();
       const runningJobIds = $queueState.jobs
         .filter((job) => job.status === "running")
         .map((job) => job.id);

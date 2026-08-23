@@ -56,14 +56,25 @@ export type ShutdownDeps = {
  * blocking `confirm()` prompt, which freezes the JS thread while the job list
  * was snapshotted from a store only the 2s poll refreshes. `awaitTerminal` runs
  * over a superset of the cancelled ids and re-checks the real condition, so
- * this case is safe to ignore. Any OTHER rejection (lock failure, unknown job)
- * means cancellation may not have taken effect and must still block the close.
+ * this case is safe to ignore. A missing job is also terminal: the backend
+ * cannot await work that it has already removed. Any OTHER rejection (lock
+ * failure, timeout, unknown job) means cancellation may not have taken effect
+ * and must still block the close.
  */
 function isAlreadyTerminal(reason: unknown): boolean {
   return (
     reason instanceof Error &&
     reason.message.includes("Cannot cancel a terminal import")
   );
+}
+
+/**
+ * `import_await_terminal` looks up the job before it waits. A dismissed or
+ * evicted job therefore rejects with this text, but no worker can still be
+ * running without a backend job, so shutdown can treat the id as terminal.
+ */
+function isJobAlreadyGone(reason: unknown): boolean {
+  return reason instanceof Error && reason.message.includes("Job not found:");
 }
 
 export async function runImportShutdown(deps: ShutdownDeps): Promise<ShutdownOutcome> {
@@ -90,8 +101,19 @@ export async function runImportShutdown(deps: ShutdownDeps): Promise<ShutdownOut
   const terminals = await Promise.allSettled(
     jobIdsToAwait.map((jobId) => deps.awaitTerminal(jobId, timeoutMs)),
   );
+  let fatalTerminalFailure = false;
+  terminals.forEach((result, index) => {
+    if (result.status !== "rejected") return;
+    if (isJobAlreadyGone(result.reason)) {
+      // Do not carry an evicted id into every later quit attempt: the backend
+      // has already removed the only record that could represent its worker.
+      deps.retainedJobIds.delete(jobIdsToAwait[index]);
+      return;
+    }
+    fatalTerminalFailure = true;
+  });
 
-  if (fatalCancellationFailure || terminals.some((r) => r.status === "rejected")) {
+  if (fatalCancellationFailure || fatalTerminalFailure) {
     return { kind: "incomplete", message: SHUTDOWN_INCOMPLETE_MESSAGE };
   }
 
@@ -101,3 +123,4 @@ export async function runImportShutdown(deps: ShutdownDeps): Promise<ShutdownOut
   deps.retainedJobIds.clear();
   return { kind: "complete" };
 }
+
