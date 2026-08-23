@@ -79,6 +79,10 @@ export function albumShareLink(profileId: string, albumId: string): Promise<Albu
   return invokeCommand<AlbumShareLink>("album_share_link", { profileId, albumId });
 }
 
+export function appQuit(): Promise<void> {
+  return invokeCommand<void>("app_quit");
+}
+
 export function importStart(input: ImportInput): Promise<string> {
   return invokeCommand<string>("import_start", { input });
 }

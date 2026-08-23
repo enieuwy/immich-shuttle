@@ -157,6 +157,38 @@ fn has_active_import() -> Result<bool, String> {
         .map_err(|_| "Could not lock running imports state".to_string())?;
     Ok(has_active_job || !running.is_empty())
 }
+/// Reports whether an import worker or its post-run finalization is still live.
+///
+/// A poisoned lock fails safe: shutdown must not proceed while the worker state
+/// cannot be read with confidence.
+pub fn has_live_import_worker() -> bool {
+    if has_active_import().unwrap_or(true) {
+        return true;
+    }
+    FINALIZING_IMPORTS
+        .lock()
+        .map(|finalizing| !finalizing.is_empty())
+        .unwrap_or(true)
+}
+
+/// Register a fake finalizing worker so another module can exercise a guard that
+/// depends on worker liveness. Test-only: production liveness comes from the
+/// worker's own registration.
+#[cfg(test)]
+pub fn mark_worker_live_for_test(job_id: &str) {
+    FINALIZING_IMPORTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(job_id.to_string());
+}
+
+#[cfg(test)]
+pub fn clear_worker_live_for_test(job_id: &str) {
+    FINALIZING_IMPORTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(job_id);
+}
 
 fn evict_old_terminal_jobs(jobs: &mut Vec<ImportJob>) -> Vec<String> {
     // The 500-job cap bounds only clearable terminal jobs. Unanswered wipe

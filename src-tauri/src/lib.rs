@@ -1,6 +1,10 @@
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 use std::{fs, path::Path, time::Duration};
 
 use fs4::fs_std::FileExt;
+#[cfg(target_os = "macos")]
+use tauri::Emitter;
 use tauri::Manager;
 use uuid::Uuid;
 
@@ -119,6 +123,102 @@ fn prune_startup_artifacts() {
     prune_stale_run_logs();
 }
 
+#[cfg(target_os = "macos")]
+static MAC_APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+/// Whether AppKit may tear the process down right now.
+///
+/// Split out of the delegate callback so the decision itself is testable
+/// without an NSApplication: the callback is an Objective-C entry point.
+#[cfg(target_os = "macos")]
+fn may_terminate_now() -> bool {
+    commands::app::quit_is_approved() || !commands::import::has_live_import_worker()
+}
+
+/// Intercept AppKit's application termination callback on tao's live delegate.
+///
+/// The window close callback cannot see application-menu Cmd-Q, and Tauri's
+/// `RunEvent::ExitRequested` does not fire for this AppKit termination path.
+/// Replacing the menu item also fails because AppKit keeps `terminate:` bound
+/// at the application level. The delegate callback is therefore the only point
+/// that can cancel Cmd-Q before AppKit tears down the process.
+#[cfg(target_os = "macos")]
+fn install_application_termination_guard(app: &tauri::AppHandle) {
+    let _ = MAC_APP_HANDLE.set(app.clone());
+    use objc2::{
+        runtime::{AnyObject, Imp, Sel},
+        sel, MainThreadMarker,
+    };
+    use objc2_app_kit::{NSApplication, NSApplicationTerminateReply};
+
+    unsafe extern "C-unwind" fn application_should_terminate(
+        _delegate: *mut AnyObject,
+        _selector: Sel,
+        _application: *mut AnyObject,
+    ) -> NSApplicationTerminateReply {
+        if may_terminate_now() {
+            return NSApplicationTerminateReply::TerminateNow;
+        }
+
+        // Durable, because the user sees only a prompt: this line is what tells
+        // support that a quit was deferred rather than ignored.
+        let _ = crate::services::logs::append_log(
+            "app.log",
+            "app_quit_deferred import_worker_live emitting=quit-requested",
+        );
+        if let Some(app) = MAC_APP_HANDLE.get() {
+            let _ = app.emit("quit-requested", ());
+        }
+        NSApplicationTerminateReply::TerminateCancel
+    }
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let application = NSApplication::sharedApplication(mtm);
+    let Some(delegate) = application.delegate() else {
+        return;
+    };
+    // The delegate arrives as a protocol object; reborrow it as a plain
+    // Objective-C object so its concrete class can be patched below.
+    let delegate_object: &AnyObject =
+        unsafe { &*objc2::rc::Retained::as_ptr(&delegate).cast::<AnyObject>() };
+    let delegate_class = delegate_object.class();
+    let selector = sel!(applicationShouldTerminate:);
+    let callback: Imp = unsafe {
+        std::mem::transmute(
+            application_should_terminate
+                as unsafe extern "C-unwind" fn(
+                    *mut AnyObject,
+                    Sel,
+                    *mut AnyObject,
+                ) -> NSApplicationTerminateReply,
+        )
+    };
+
+    let added = unsafe {
+        objc2::ffi::class_addMethod(
+            delegate_class as *const _ as *mut _,
+            selector,
+            callback,
+            c"Q@:@".as_ptr().cast(),
+        )
+    };
+    if !added.as_bool() {
+        if let Some(method) = delegate_class.instance_method(selector) {
+            // SAFETY: The callback uses the exact Objective-C ABI and return
+            // type declared by `applicationShouldTerminate:`.
+            unsafe {
+                method.set_implementation(callback);
+            }
+        }
+    }
+    let _ = crate::services::logs::append_log(
+        "app.log",
+        &format!("app_quit_guard_installed added={}", added.as_bool()),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +239,20 @@ mod tests {
         )));
         assert!(!is_run_log_name(&format!("run-{UUID}.log.old")));
         assert!(!is_run_log_name("run-upload.log"));
+    }
+
+    /// The quit guard's whole purpose is refusing AppKit while a worker lives.
+    /// Only that direction is asserted: sibling import tests register their own
+    /// workers concurrently, so "no worker anywhere" is not a state this test
+    /// can pin. The idle path (Cmd-Q quits at once) and the Objective-C
+    /// plumbing are verified by hand against a real window.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_live_import_worker_refuses_application_termination() {
+        let job_id = format!("quit-guard-{UUID}");
+        commands::import::mark_worker_live_for_test(&job_id);
+        assert!(!may_terminate_now());
+        commands::import::clear_worker_live_for_test(&job_id);
     }
 }
 
@@ -180,6 +294,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            install_application_termination_guard(app.handle());
             crate::services::device_detector::start_polling(app.handle().clone());
             // Evict stale thumbnails so the on-disk cache can't grow without
             // bound across sessions. Off-thread: it stats/deletes cache files.
@@ -200,6 +316,7 @@ pub fn run() {
             commands::albums::album_share_users,
             commands::albums::album_share_link,
             commands::tags::tags_list,
+            commands::app::app_quit,
             commands::import::import_start,
             commands::import::import_forecast,
             commands::import::import_confirm_wipe,

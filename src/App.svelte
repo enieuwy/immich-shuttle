@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { listen } from "@tauri-apps/api/event";
   import { Play, FileText, KeyRound, Settings } from "@lucide/svelte";
 
   import AppLayout from "$lib/components/layout/AppLayout.svelte";
@@ -25,7 +26,7 @@
   import { activeProfile, getProfilesSnapshot, profilesState } from "$lib/state/profiles";
   import { albumsState } from "$lib/state/albums";
   import type { Profile } from "$lib/types";
-  import { importAwaitTerminal, importCancel } from "$lib/api";
+  import { appQuit, importAwaitTerminal, importCancel } from "$lib/api";
   import { queueState } from "$lib/state/queue";
   import { runImportShutdown, SHUTDOWN_INCOMPLETE_MESSAGE } from "$lib/state/shutdown";
   import { selectionState } from "$lib/state/selection";
@@ -144,6 +145,7 @@
   onMount(() => {
     let disposed = false;
     let unlistenClose: (() => void) | undefined;
+    let unlistenQuitRequested: (() => void) | undefined;
     let allowCloseAfterCancel = false;
     let cancellingForClose = false;
     // Cancellation publishes a terminal status before the worker exits; retain
@@ -212,6 +214,20 @@
       return true;
     };
 
+    void listen("quit-requested", () => {
+      if (allowCloseAfterCancel || cancellingForClose) {
+        return;
+      }
+      if (!requestShutdown(appQuit)) {
+        void appQuit();
+      }
+    }).then((fn) => {
+      // Drop the handler if the component unmounted before registration
+      // resolved, so a remount cannot stack duplicate application-quit prompts.
+      if (disposed) fn();
+      else unlistenQuitRequested = fn;
+    });
+
     void getCurrentWindow()
       .onCloseRequested((event) => {
         if (allowCloseAfterCancel) {
@@ -236,6 +252,7 @@
       disposed = true;
       queueState.stopPolling();
       unlistenClose?.();
+      unlistenQuitRequested?.();
     };
   });
 
