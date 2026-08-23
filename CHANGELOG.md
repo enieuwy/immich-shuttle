@@ -32,6 +32,10 @@
 ### Network
 - **Discovery searches your whole LAN, not just a /24.** "Discover servers" swept only the 254 addresses around the machine's own address regardless of the network's real size, so on a /16 or larger network — ordinary with 10.x or 172.16-31.x addressing — a reachable Immich server on a neighbouring subnet was never found. The range now follows the interface's netmask, capped and ordered nearest-first so the search still finishes within its deadline.
 
+### Maintenance
+- **Dependency updates**: `svelte` 5.56.9, `@tauri-apps/plugin-dialog` and `tauri-plugin-dialog` 2.7.2, `tauri-plugin-fs` 2.5.1, and `@tailwindcss/vite` 4.3.3. `nanoid` now resolves to 3.3.18, which fixes GHSA-2v37-7h3g-55p8 in build tooling.
+- **Release builds now compile on every target.** The macOS-only quit guard no longer creates dead-code errors on Linux and Windows. CI also updates its pinned Rust toolchain action.
+
 ## v0.7.0 - 2026-08-06
 
 ### Import
