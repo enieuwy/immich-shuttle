@@ -157,6 +157,7 @@ fn has_active_import() -> Result<bool, String> {
         .map_err(|_| "Could not lock running imports state".to_string())?;
     Ok(has_active_job || !running.is_empty())
 }
+#[cfg(target_os = "macos")]
 /// Reports whether an import worker or its post-run finalization is still live.
 ///
 /// A poisoned lock fails safe: shutdown must not proceed while the worker state
@@ -174,7 +175,7 @@ pub fn has_live_import_worker() -> bool {
 /// Register a fake finalizing worker so another module can exercise a guard that
 /// depends on worker liveness. Test-only: production liveness comes from the
 /// worker's own registration.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub fn mark_worker_live_for_test(job_id: &str) {
     FINALIZING_IMPORTS
         .lock()
@@ -182,7 +183,7 @@ pub fn mark_worker_live_for_test(job_id: &str) {
         .insert(job_id.to_string());
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub fn clear_worker_live_for_test(job_id: &str) {
     FINALIZING_IMPORTS
         .lock()
