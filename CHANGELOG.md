@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.7.1 - 2026-08-23
+
 ### Import
 - **Closing the window now also waits for the run's final bookkeeping.** The quit guard waited for the import worker to leave the running set, but the worker left it *before* reading the run log, registering the wipe payload, writing the final state, and saving the history record. A cancelled import was therefore waved through while it was still parsing, so quitting in that window lost the run's History entry and its "Import again" request. The wait now covers that finalization phase too. Cancellation itself is unchanged: an import stops being cancellable at the same moment as before.
 - **A very long session can no longer drop a pending delete-after-import prompt.** Once more than 500 finished imports had accumulated in one session, the oldest were evicted with their pending-wipe payloads — including an import still awaiting confirmation, whose verified-uploaded originals were then stranded with no way back to the prompt. Eviction now skips imports awaiting confirmation, the same way "Clear finished" already did.
