@@ -11,4 +11,13 @@ declare module "@tauri-apps/plugin-dialog" {
   };
 
   export function open(options?: OpenDialogOptions): Promise<string | string[] | null>;
+
+  export type ConfirmDialogOptions = {
+    title?: string;
+    kind?: "info" | "warning" | "error";
+    okLabel?: string;
+    cancelLabel?: string;
+  };
+
+  export function confirm(message: string, options?: string | ConfirmDialogOptions): Promise<boolean>;
 }

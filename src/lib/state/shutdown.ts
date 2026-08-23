@@ -52,14 +52,13 @@ export type ShutdownDeps = {
 
 /**
  * A cancel rejecting because the job is ALREADY terminal is not a safety
- * failure — it means the import finished on its own, most often during the
- * blocking `confirm()` prompt, which freezes the JS thread while the job list
- * was snapshotted from a store only the 2s poll refreshes. `awaitTerminal` runs
- * over a superset of the cancelled ids and re-checks the real condition, so
- * this case is safe to ignore. A missing job is also terminal: the backend
- * cannot await work that it has already removed. Any OTHER rejection (lock
- * failure, timeout, unknown job) means cancellation may not have taken effect
- * and must still block the close.
+ * failure — it means the import finished on its own while the user considered
+ * the native quit confirmation, after the caller took its job snapshot.
+ * `awaitTerminal` runs over a superset of the cancelled ids and re-checks the
+ * real condition, so this case is safe to ignore. A missing job is also
+ * terminal: the backend cannot await work that it has already removed. Any
+ * OTHER rejection (lock failure, timeout, unknown job) means cancellation may
+ * not have taken effect and must still block the close.
  */
 function isAlreadyTerminal(reason: unknown): boolean {
   return (

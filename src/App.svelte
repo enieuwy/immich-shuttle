@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { listen } from "@tauri-apps/api/event";
+  import { confirm } from "@tauri-apps/plugin-dialog";
   import { Play, FileText, KeyRound, Settings } from "@lucide/svelte";
 
   import AppLayout from "$lib/components/layout/AppLayout.svelte";
@@ -147,6 +148,7 @@
     let unlistenClose: (() => void) | undefined;
     let unlistenQuitRequested: (() => void) | undefined;
     let allowCloseAfterCancel = false;
+    let confirmingShutdown = false;
     let cancellingForClose = false;
     // Cancellation publishes a terminal status before the worker exits; retain
     // timed-out jobs so a retry cannot mistake that status for safe shutdown.
@@ -160,9 +162,9 @@
     queueState.startPolling();
 
     // NOTE: this guards WINDOW closes only (red button, window.close()).
-    // Application-menu quit (Cmd-Q on macOS) bypasses it entirely and kills the
-    // process mid-upload -- see immich-shuttle finding for the reproduction.
-    // `finish` is a parameter so that fix can reuse this sequence unchanged.
+    // Application-menu quit (Cmd-Q on macOS) enters through the native
+    // applicationShouldTerminate: guard in lib.rs. Both paths deliberately use
+    // this function, so they ask, cancel, and await under the same contract.
     const requestShutdown = (finish: () => Promise<unknown>): boolean => {
       const pendingStarts = queueState.pendingStarts();
       const runningJobIds = $queueState.jobs
@@ -175,17 +177,27 @@
       ) {
         return false;
       }
-      if (
-        !window.confirm(
-          "An import is in progress. Quit now and cancel the running import?",
-        )
-      ) {
+      if (confirmingShutdown || cancellingForClose) {
         return true;
       }
-      cancellingForClose = true;
 
+      confirmingShutdown = true;
       void (async () => {
         try {
+          const shouldQuit = await confirm(
+            "An import is in progress. Quit now and cancel the running import?",
+            {
+              title: "Cancel import and quit?",
+              kind: "warning",
+              okLabel: "Quit",
+              cancelLabel: "Keep importing",
+            },
+          );
+          if (!shouldQuit) {
+            return;
+          }
+
+          cancellingForClose = true;
           const outcome = await runImportShutdown({
             pendingStarts,
             runningJobIds,
@@ -205,9 +217,9 @@
           allowCloseAfterCancel = true;
           await finish();
         } catch {
-          allowCloseAfterCancel = false;
           importError = SHUTDOWN_INCOMPLETE_MESSAGE;
         } finally {
+          confirmingShutdown = false;
           cancellingForClose = false;
         }
       })();
