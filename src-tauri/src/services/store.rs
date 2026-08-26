@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
@@ -134,15 +135,14 @@ pub fn last_import_for(app: &AppHandle, profile_id: &str, source_paths: &[String
 // different profile must not inherit another profile's date floor. The source
 // key collapses nested roots and exact duplicates, giving one identity to one
 // conceptual source set whether callers provide raw or collapsed selections.
-// Changing this key format resets existing checkpoints (the next only-new import
-// re-scans, which server-side dedupe makes safe). A non-overlapping selection
-// produces the same key as before, so existing checkpoints for the common case
-// survive.
+// Changing this key format resets existing `last_import` associations. The key
+// still collapses nested roots and exact duplicates, so equivalent source sets
+// retain the same checkpoint identity.
 fn checkpoint_key(profile_id: &str, paths: &[String]) -> String {
     format!("{profile_id}\u{1f}{}", source_key(paths))
 }
 
-// Changing this normalization changes persisted keys and resets existing `last_import` associations.
+// Changing this normalization or encoding changes persisted keys and resets existing `last_import` associations.
 fn source_key(paths: &[String]) -> String {
     let mut normalized: Vec<String> = paths
         .iter()
@@ -161,7 +161,13 @@ fn source_key(paths: &[String]) -> String {
         .cloned()
         .collect();
 
-    collapsed.join("\n")
+    let capacity = collapsed.iter().map(|path| path.len() + 1).sum();
+    let mut key = String::with_capacity(capacity);
+    for path in collapsed {
+        write!(&mut key, "{}:", path.len()).expect("writing a checkpoint key cannot fail");
+        key.push_str(&path);
+    }
+    key
 }
 
 fn normalize_source_path(path: &str) -> String {
@@ -261,9 +267,12 @@ mod tests {
         expected.sort();
 
         let key = source_key(&disjoint);
+        let expected = expected
+            .iter()
+            .map(|path| format!("{}:{path}", path.len()))
+            .collect::<String>();
 
-        assert_eq!(key, expected.join("\n"));
-        assert_eq!(key.matches('\n').count(), 1);
+        assert_eq!(key, expected);
     }
 
     #[test]
@@ -282,6 +291,25 @@ mod tests {
     }
 
     #[test]
+    fn source_key_distinguishes_newline_path_from_multiple_paths() {
+        let single = vec!["left\nright".to_string()];
+        let multiple = vec!["left".to_string(), "right".to_string()];
+
+        assert_ne!(source_key(&single), source_key(&multiple));
+    }
+
+    #[test]
+    fn source_key_keeps_reordered_and_redundant_sets_equal() {
+        let newline_path = "left\nright".to_string();
+        let other_path = "other".to_string();
+
+        assert_eq!(
+            source_key(&[newline_path.clone(), other_path.clone()]),
+            source_key(&[other_path.clone(), newline_path.clone(), other_path])
+        );
+    }
+
+    #[test]
     fn source_key_does_not_collapse_siblings_with_shared_name_prefixes() {
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("__store_key_test__");
         let foo = base.join("foo").to_string_lossy().into_owned();
@@ -289,7 +317,12 @@ mod tests {
         let mut expected = [normalize_source_path(&foo), normalize_source_path(&foobar)];
         expected.sort();
 
-        assert_eq!(source_key(&[foo, foobar]), expected.join("\n"));
+        let expected = expected
+            .iter()
+            .map(|path| format!("{}:{path}", path.len()))
+            .collect::<String>();
+
+        assert_eq!(source_key(&[foo, foobar]), expected);
     }
 
     #[cfg(windows)]

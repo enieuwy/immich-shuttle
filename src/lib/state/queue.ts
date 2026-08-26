@@ -54,8 +54,7 @@ const pendingImportStarts = new Set<Promise<void>>();
 
 type ImportProgressEvent = {
   job_id: string;
-  progress?: ImportJob["progress"];
-  parsed_progress?: ImportJob["progress"];
+  progress: ImportJob["progress"];
   current_file?: string | null;
 };
 
@@ -229,7 +228,7 @@ async function refreshJobs() {
     void handleTerminalTransitions(prev, jobs);
   } catch (error) {
     if (!isCurrent()) return;
-    errorsState.addError("Could not refresh import queue.");
+    errorsState.addError("Could not refresh import queue.", "error", "queue-refresh");
     state.update((s) => ({ ...s, error: error instanceof Error ? error.message : String(error) }));
   }
 }
@@ -256,7 +255,7 @@ export const queueState = {
         if (!payload?.job_id) {
           return;
         }
-        const progress = payload.parsed_progress ?? payload.progress;
+        const progress = payload.progress;
         if (!progress) {
           return;
         }

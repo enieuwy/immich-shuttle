@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Import
+- **A crashed import worker now becomes a failed job instead of a phantom running job.** Panic cleanup updates the job record as well as the worker-liveness maps, so later imports and quit are not blocked by a worker that no longer exists.
+- **A failed wipe-payload save can no longer publish an unusable delete prompt.** The app keeps the originals and reports the finalization failure instead of offering a confirmation action with no data behind it.
+- **Incremental-import checkpoint keys cannot collide through newline characters in source paths.** Source sets now use an unambiguous length-prefixed encoding.
+
+### UI
+- **Repeated queue-poll failures no longer create an unlimited stack of identical error messages.** One persistent message remains dismissible, and a later failure can appear again after dismissal.
+- **Keychain failures include platform-specific recovery guidance.** macOS, Windows, and Linux messages retain the underlying backend error for diagnosis.
+
+### Maintenance
+- **Progress events no longer carry the same progress object twice.** The Rust event and TypeScript consumer now use one required `progress` field.
+- **Server compatibility policy has one implementation.** Profile validation and server information now share the same minimum version and warning.
+- **Pull-request builds declare read-only repository permissions.**
+
 ## v0.7.1 - 2026-08-23
 
 ### Import

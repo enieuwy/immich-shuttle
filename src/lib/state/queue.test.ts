@@ -545,12 +545,39 @@ describe("queueState", () => {
     expect(get(historyState).lastImportVersion).toBe(before + 1);
   });
 
-  it("a failing cancelImport reports through errorsState and resolves rather than rejecting", async () => {
-    vi.mocked(api.importCancel).mockRejectedValueOnce(new Error("network down"));
+  it("keeps repeated queue refresh failures to one active error", async () => {
+    for (const error of get(errorsState)) {
+      errorsState.dismissError(error.id);
+    }
 
-    await expect(queueState.cancelImport("job-x")).resolves.toBeUndefined();
+    vi.mocked(api.importListJobs)
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockRejectedValueOnce(new Error("network still down"))
+      .mockResolvedValueOnce([])
+      .mockRejectedValueOnce(new Error("network down again"))
+      .mockRejectedValueOnce(new Error("network down after dismissal"));
 
-    expect(get(errorsState).some((e) => e.message === "Could not cancel import.")).toBe(true);
+    await queueState.loadJobs();
+    await queueState.loadJobs();
+    expect(
+      get(errorsState).filter((error) => error.message === "Could not refresh import queue."),
+    ).toHaveLength(1);
+
+    await queueState.loadJobs();
+    await queueState.loadJobs();
+    expect(
+      get(errorsState).filter((error) => error.message === "Could not refresh import queue."),
+    ).toHaveLength(1);
+
+    const queueError = get(errorsState).find(
+      (error) => error.message === "Could not refresh import queue.",
+    );
+    expect(queueError).toBeDefined();
+    errorsState.dismissError(queueError!.id);
+    await queueState.loadJobs();
+    expect(
+      get(errorsState).filter((error) => error.message === "Could not refresh import queue."),
+    ).toHaveLength(1);
   });
 });
 

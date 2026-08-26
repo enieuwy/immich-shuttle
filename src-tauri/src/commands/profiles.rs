@@ -3,7 +3,7 @@ use uuid::Uuid;
 use crate::{
     models::profile::{Profile, ProfileInput, ServerInfo},
     services::{
-        immich_client::{normalize_server_url, ImmichClient},
+        immich_client::{normalize_server_url, server_compatibility, ImmichClient},
         keychain, profile_store,
     },
 };
@@ -127,7 +127,7 @@ pub async fn profile_validate(url: String, api_key: String) -> Result<ServerInfo
     let version = client.get_server_version().await?;
     let me = client.get_my_user().await?;
 
-    let is_compatible = (version.major, version.minor, version.patch) >= (1, 106, 0);
+    let (is_compatible, warning) = server_compatibility(&version);
 
     Ok(ServerInfo {
         user_name: me
@@ -136,14 +136,7 @@ pub async fn profile_validate(url: String, api_key: String) -> Result<ServerInfo
             .unwrap_or_else(|| "Immich User".to_string()),
         server_version: format!("{}.{}.{}", version.major, version.minor, version.patch),
         is_compatible,
-        warning: if is_compatible {
-            None
-        } else {
-            Some(
-                "Immich server version may be below the minimum supported by bundled immich-go."
-                    .to_string(),
-            )
-        },
+        warning,
     })
 }
 

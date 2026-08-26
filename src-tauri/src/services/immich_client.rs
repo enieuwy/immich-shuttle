@@ -143,6 +143,16 @@ pub struct ServerVersion {
     pub patch: i64,
 }
 
+pub fn server_compatibility(version: &ServerVersion) -> (bool, Option<String>) {
+    const MIN_SUPPORTED_VERSION: (i64, i64, i64) = (1, 106, 0);
+    const WARNING: &str =
+        "Immich server version may be below the minimum supported by bundled immich-go.";
+
+    let is_compatible = (version.major, version.minor, version.patch) >= MIN_SUPPORTED_VERSION;
+    let warning = (!is_compatible).then(|| WARNING.to_string());
+    (is_compatible, warning)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeUser {
     pub id: String,
@@ -693,7 +703,7 @@ pub async fn probe_is_immich(server_url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_server_url;
+    use super::{normalize_server_url, server_compatibility, ServerVersion};
     #[test]
     fn sniffs_only_known_image_signatures() {
         use super::sniff_image_mime;
@@ -732,6 +742,39 @@ mod tests {
         ] {
             assert_eq!(normalize_server_url(input), expected);
         }
+    }
+
+    #[test]
+    fn server_compatibility_uses_minimum_version_boundary() {
+        let warning = Some(
+            "Immich server version may be below the minimum supported by bundled immich-go."
+                .to_string(),
+        );
+
+        assert_eq!(
+            server_compatibility(&ServerVersion {
+                major: 1,
+                minor: 105,
+                patch: 99,
+            }),
+            (false, warning.clone())
+        );
+        assert_eq!(
+            server_compatibility(&ServerVersion {
+                major: 1,
+                minor: 106,
+                patch: 0,
+            }),
+            (true, None)
+        );
+        assert_eq!(
+            server_compatibility(&ServerVersion {
+                major: 1,
+                minor: 106,
+                patch: 1,
+            }),
+            (true, None)
+        );
     }
 
     #[test]

@@ -42,6 +42,29 @@ const SCAN_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// huge value can't push `Instant::now() + Duration::from_millis(..)` past
 /// `Instant`'s `Add` overflow panic.
 const MAX_AWAIT_TERMINAL_TIMEOUT_MS: u64 = 600_000;
+const IMPORT_WORKER_PANIC_ERROR: &str = "Import worker stopped unexpectedly.";
+const PENDING_WIPE_STORE_ERROR: &str =
+    "Could not prepare wipe confirmation; source files were kept on disk. Retry the import to try again.";
+
+fn mark_worker_panic(job_id: &str) {
+    let mut jobs = match JOBS.lock() {
+        Ok(jobs) => jobs,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(job) = jobs.iter_mut().find(|job| job.id == job_id) else {
+        return;
+    };
+    if !matches!(job.status, JobStatus::Running) {
+        return;
+    }
+
+    job.status = JobStatus::Failed;
+    job.progress.errors = job.progress.errors.saturating_add(1);
+    job.error = Some(IMPORT_WORKER_PANIC_ERROR.to_string());
+    job.summary = None;
+    job.awaiting_wipe_confirmation = false;
+    job.pending_wipe_count = 0;
+}
 
 static IMPORT_START_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static ACTIVE_SCAN: LazyLock<Mutex<Option<Arc<AtomicBool>>>> = LazyLock::new(|| Mutex::new(None));
@@ -66,12 +89,23 @@ impl ImportWorkerGuard {
 
 impl Drop for ImportWorkerGuard {
     fn drop(&mut self) {
-        if let Ok(mut running) = RUNNING_IMPORTS.lock() {
+        {
+            let mut running = match RUNNING_IMPORTS.lock() {
+                Ok(running) => running,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             running.remove(&self.job_id);
         }
-        if let Ok(mut finalizing) = FINALIZING_IMPORTS.lock() {
+
+        {
+            let mut finalizing = match FINALIZING_IMPORTS.lock() {
+                Ok(finalizing) => finalizing,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             finalizing.remove(&self.job_id);
         }
+
+        mark_worker_panic(&self.job_id);
     }
 }
 
@@ -302,6 +336,12 @@ fn finalize_job(update: ImportJob) -> ImportJob {
         {
             cancelled_id = Some(update.id);
             jobs[index].clone()
+        } else if matches!(jobs[index].status, JobStatus::Failed)
+            && jobs[index].error.as_deref() == Some(IMPORT_WORKER_PANIC_ERROR)
+        {
+            // A panic guard publishes this terminal state while unwinding.
+            // Never let a late finalization write revive the job.
+            jobs[index].clone()
         } else {
             let terminal = is_terminal(&update.status);
             let stored = update.clone();
@@ -510,6 +550,18 @@ fn classify_completed_run(
         status,
         wipe_eligible,
         checkpoint_eligible,
+    }
+}
+
+fn wipe_prompt_state(
+    wipe_eligible: bool,
+    pending_wipe_stored: bool,
+    pending_wipe_count: usize,
+) -> (bool, u32) {
+    if wipe_eligible && pending_wipe_stored {
+        (true, pending_wipe_count as u32)
+    } else {
+        (false, 0)
     }
 }
 
@@ -929,32 +981,41 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             );
             checkpoint_eligible = eligible;
             let failed = matches!(status, JobStatus::Failed);
+            let mut pending_wipe_stored = false;
+            let mut pending_wipe_store_failed = false;
             if wipe_eligible {
-                if let Ok(mut pending) = PENDING_WIPE.lock() {
-                    pending.insert(
-                        job_id_clone.clone(),
-                        PendingWipe {
-                            paths: completed_asset_paths.clone(),
-                            // Verify against the URL the upload actually used
-                            // (post-failover), not the primary configured one,
-                            // or the existence check can hit the wrong server.
-                            server_url: request.server_url.clone(),
-                            api_key: api_key_for_album_assignment.clone(),
-                        },
-                    );
-                } else {
-                    let _ = logs::append_log(
-                        "app.log",
-                        &format!(
-                            "import_wipe_pending_store_failed job_id={} pending_count={}",
-                            job_id_clone,
-                            completed_asset_paths.len()
-                        ),
-                    );
+                match PENDING_WIPE.lock() {
+                    Ok(mut pending) => {
+                        pending.insert(
+                            job_id_clone.clone(),
+                            PendingWipe {
+                                paths: completed_asset_paths.clone(),
+                                // Verify against the URL the upload actually used
+                                // (post-failover), not the primary configured one,
+                                // or the existence check can hit the wrong server.
+                                server_url: request.server_url.clone(),
+                                api_key: api_key_for_album_assignment.clone(),
+                            },
+                        );
+                        pending_wipe_stored = true;
+                    }
+                    Err(_) => {
+                        pending_wipe_store_failed = true;
+                        let _ = logs::append_log(
+                            "app.log",
+                            &format!(
+                                "import_wipe_pending_store_failed job_id={} pending_count={}",
+                                job_id_clone,
+                                completed_asset_paths.len()
+                            ),
+                        );
+                    }
                 }
             }
 
-            let error = if let Some(log_error) = log_read_error {
+            let error = if pending_wipe_store_failed {
+                Some(PENDING_WIPE_STORE_ERROR.to_string())
+            } else if let Some(log_error) = log_read_error {
                 Some(log_error)
             } else if failed {
                 let tail: Vec<&str> = error_lines
@@ -978,6 +1039,11 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 None
             };
 
+            let (awaiting_wipe_confirmation, pending_wipe_count) = wipe_prompt_state(
+                wipe_eligible,
+                pending_wipe_stored,
+                completed_asset_paths.len(),
+            );
             let summary = if failed {
                 None
             } else {
@@ -987,8 +1053,10 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 );
                 Some(if keep_files {
                     format!("{head} Files kept on disk.")
-                } else if wipe_eligible {
+                } else if awaiting_wipe_confirmation {
                     format!("{head} Awaiting wipe confirmation.")
+                } else if pending_wipe_store_failed {
+                    format!("{head} Source files were kept on disk because wipe confirmation could not be prepared.")
                 } else {
                     head
                 })
@@ -1000,12 +1068,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 progress,
                 error,
                 summary,
-                awaiting_wipe_confirmation: wipe_eligible,
-                pending_wipe_count: if wipe_eligible {
-                    completed_asset_paths.len() as u32
-                } else {
-                    0
-                },
+                awaiting_wipe_confirmation,
+                pending_wipe_count,
                 file_errors: file_errors.clone(),
                 profile_id: profile.id.clone(),
                 album_id: target_album_id.clone(),
@@ -2092,11 +2156,10 @@ mod tests {
         assert!(!jobs.iter().any(|job| job.id == job_id));
         assert!(get_job(&job_id).is_err());
     }
-
     /// A worker panic must not leave shutdown waiting forever, while the saved
     /// input remains available for `import_retry`.
     #[test]
-    fn worker_guard_removes_liveness_state_but_keeps_retry_input() {
+    fn worker_guard_marks_a_panicking_running_job_failed_and_keeps_retry_input() {
         let job_id = format!("worker-guard-{}", Uuid::new_v4());
         let input = ImportInput {
             profile_id: "profile".to_string(),
@@ -2119,17 +2182,49 @@ mod tests {
             exclude_extensions: Vec::new(),
         };
         JOB_INPUTS.lock().unwrap().insert(job_id.clone(), input);
+        let mut running_job = terminal_job(&job_id, false);
+        running_job.status = JobStatus::Running;
+        lock_jobs().push(running_job);
         lock_running().insert(job_id.clone(), Arc::new(AtomicBool::new(false)));
         lock_finalizing().insert(job_id.clone());
 
-        {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = ImportWorkerGuard::new(job_id.clone());
-        }
-
+            panic!("simulate worker panic");
+        }));
+        assert!(panic.is_err());
         assert!(!lock_running().contains_key(&job_id));
         assert!(!lock_finalizing().contains(&job_id));
+        let failed = get_job(&job_id).expect("the panicking worker must publish a terminal job");
+        assert!(matches!(failed.status, JobStatus::Failed));
+        assert_eq!(
+            failed.error.as_deref(),
+            Some(IMPORT_WORKER_PANIC_ERROR),
+            "panic cleanup must use the stable internal error"
+        );
+        assert_eq!(failed.progress.errors, 1);
+        assert!(!failed.awaiting_wipe_confirmation);
+        assert_eq!(failed.pending_wipe_count, 0);
+        assert!(!is_active(&failed.status));
+        let mut late_completion = failed.clone();
+        late_completion.status = JobStatus::Completed;
+        late_completion.error = None;
+        let preserved = finalize_job(late_completion);
+        assert!(matches!(preserved.status, JobStatus::Failed));
         assert!(JOB_INPUTS.lock().unwrap().contains_key(&job_id));
+        lock_jobs().retain(|job| job.id != job_id);
         JOB_INPUTS.lock().unwrap().remove(&job_id);
+    }
+
+    #[test]
+    fn failed_pending_wipe_insertion_never_publishes_a_wipe_prompt() {
+        let (awaiting, count) = wipe_prompt_state(true, false, 3);
+        assert!(!awaiting);
+        assert_eq!(count, 0);
+
+        let (awaiting, count) = wipe_prompt_state(true, true, 3);
+        assert!(awaiting, "a stored payload still publishes the prompt");
+        assert_eq!(count, 3);
     }
 
     #[test]

@@ -265,7 +265,6 @@ fn emit_progress(
         serde_json::json!({
             "job_id": job_id,
             "progress": progress,
-            "parsed_progress": progress,
             "current_file": current_file,
         }),
     );
