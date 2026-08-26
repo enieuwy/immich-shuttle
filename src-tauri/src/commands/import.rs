@@ -44,26 +44,39 @@ const SCAN_DEADLINE: Duration = Duration::from_secs(60 * 60);
 const MAX_AWAIT_TERMINAL_TIMEOUT_MS: u64 = 600_000;
 const IMPORT_WORKER_PANIC_ERROR: &str = "Import worker stopped unexpectedly.";
 const PENDING_WIPE_STORE_ERROR: &str =
-    "Could not prepare wipe confirmation; source files were kept on disk. Retry the import to try again.";
+    "Could not prepare wipe confirmation; source files were kept on disk. Import the source again to retry the delete.";
 
 fn mark_worker_panic(job_id: &str) {
-    let mut jobs = match JOBS.lock() {
-        Ok(jobs) => jobs,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let Some(job) = jobs.iter_mut().find(|job| job.id == job_id) else {
-        return;
-    };
-    if !matches!(job.status, JobStatus::Running) {
-        return;
-    }
+    let marked = {
+        let mut jobs = match JOBS.lock() {
+            Ok(jobs) => jobs,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(job) = jobs.iter_mut().find(|job| job.id == job_id) else {
+            return;
+        };
+        if !matches!(job.status, JobStatus::Running) {
+            return;
+        }
 
-    job.status = JobStatus::Failed;
-    job.progress.errors = job.progress.errors.saturating_add(1);
-    job.error = Some(IMPORT_WORKER_PANIC_ERROR.to_string());
-    job.summary = None;
-    job.awaiting_wipe_confirmation = false;
-    job.pending_wipe_count = 0;
+        job.status = JobStatus::Failed;
+        job.progress.errors = job.progress.errors.saturating_add(1);
+        job.error = Some(IMPORT_WORKER_PANIC_ERROR.to_string());
+        job.summary = None;
+        job.awaiting_wipe_confirmation = false;
+        job.pending_wipe_count = 0;
+        true
+    };
+
+    // The prompt is gone, so any payload this run registered is unreachable —
+    // and it holds the profile's API key. Drop it rather than leave it resident
+    // until an unrelated dismiss or eviction happens to clear it. Taken after
+    // the `JOBS` guard is released, matching `finalize_job`'s lock order.
+    if marked {
+        if let Ok(mut pending) = PENDING_WIPE.lock() {
+            pending.remove(job_id);
+        }
+    }
 }
 
 static IMPORT_START_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -1424,12 +1437,29 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
     }
     if let Some(payload) = retry_pending {
         let retry_count = payload.paths.len();
-        // Put the payload back so a later import_confirm_wipe can retry.
-        if let Ok(mut map) = PENDING_WIPE.lock() {
-            map.insert(job_id.clone(), payload);
+        // Put the payload back so a later import_confirm_wipe can retry — but
+        // only re-offer the prompt if that actually landed. A prompt with no
+        // payload behind it cannot be answered, and an awaiting-wipe job
+        // refuses both dismiss and eviction, so it would strand the card.
+        let stored = match PENDING_WIPE.lock() {
+            Ok(mut map) => {
+                map.insert(job_id.clone(), payload);
+                true
+            }
+            Err(_) => false,
+        };
+        let (awaiting, count) = wipe_prompt_state(true, stored, retry_count);
+        job.awaiting_wipe_confirmation = awaiting;
+        job.pending_wipe_count = count;
+        if !stored {
+            // The summary set above promises a retry of the wipe. Without a
+            // stored payload there is nothing to retry, so replace it rather
+            // than leave two contradictory sentences on the card.
+            job.summary = Some(format!(
+                "All {retry_count} files were kept. The delete list could not be saved, so this run cannot re-offer them."
+            ));
+            job.error = Some(PENDING_WIPE_STORE_ERROR.to_string());
         }
-        job.awaiting_wipe_confirmation = true;
-        job.pending_wipe_count = retry_count as u32;
     } else {
         job.awaiting_wipe_confirmation = false;
         job.pending_wipe_count = 0;
@@ -2205,7 +2235,11 @@ mod tests {
         assert_eq!(failed.progress.errors, 1);
         assert!(!failed.awaiting_wipe_confirmation);
         assert_eq!(failed.pending_wipe_count, 0);
-        assert!(!is_active(&failed.status));
+        // No assertion on `has_active_import()`: it is process-global and these
+        // tests run in parallel with siblings that publish their own jobs, so it
+        // would be testing the other tests. `Failed` above plus the two liveness
+        // maps are this job's whole contribution to admission, and asserting
+        // `!is_active` on the same status it just matched would prove nothing.
         let mut late_completion = failed.clone();
         late_completion.status = JobStatus::Completed;
         late_completion.error = None;

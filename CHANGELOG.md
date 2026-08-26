@@ -4,11 +4,12 @@
 
 ### Import
 - **A crashed import worker now becomes a failed job instead of a phantom running job.** Panic cleanup updates the job record as well as the worker-liveness maps, so later imports and quit are not blocked by a worker that no longer exists.
-- **A failed wipe-payload save can no longer publish an unusable delete prompt.** The app keeps the originals and reports the finalization failure instead of offering a confirmation action with no data behind it.
-- **Incremental-import checkpoint keys cannot collide through newline characters in source paths.** Source sets now use an unambiguous length-prefixed encoding.
+- **A failed wipe-payload save can no longer publish an unusable delete prompt.** This covers both the end of a run and a retry after a partly failed delete. The app keeps the originals and reports the failure instead of offering a confirmation action with no data behind it, which could not be answered and could not be dismissed.
+- **A crashed import worker no longer leaves the run's stored API key resident.** Panic cleanup drops the pending-delete payload along with the prompt.
+- **Incremental-import checkpoints cannot borrow another source set's or another profile's date floor.** Both halves of the checkpoint identity — the profile id and the collapsed source list — are now length-prefixed, so no combination of separator characters inside a profile id or a folder name can compose one key from two different inputs. **One-time consequence of the new format: every existing "last imported" association is reset, so the first import after upgrading re-scans each source in full even with "only import media new since last time" on.** Nothing is uploaded twice; the server recognises what it already holds. This supersedes the v0.7.1 note that non-overlapping selections keep their checkpoints.
 
 ### UI
-- **Repeated queue-poll failures no longer create an unlimited stack of identical error messages.** One persistent message remains dismissible, and a later failure can appear again after dismissal.
+- **Repeated queue-poll failures no longer create an unlimited stack of identical error messages.** One message stands for an ongoing outage, and it is retired as soon as a poll succeeds, so a later outage is reported rather than hidden behind the message from the last one.
 - **Keychain failures include platform-specific recovery guidance.** macOS, Windows, and Linux messages retain the underlying backend error for diagnosis.
 
 ### Maintenance

@@ -563,7 +563,13 @@ describe("queueState", () => {
       get(errorsState).filter((error) => error.message === "Could not refresh import queue."),
     ).toHaveLength(1);
 
+    // A successful poll retires the message: it no longer describes reality,
+    // and leaving it active would suppress the next outage's error.
     await queueState.loadJobs();
+    expect(
+      get(errorsState).filter((error) => error.message === "Could not refresh import queue."),
+    ).toHaveLength(0);
+
     await queueState.loadJobs();
     expect(
       get(errorsState).filter((error) => error.message === "Could not refresh import queue."),

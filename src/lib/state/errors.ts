@@ -38,5 +38,12 @@ export const errorsState = {
   dismissError(id: string) {
     state.update((items) => items.filter((item) => item.id !== id));
   },
+  /** Drop every active error carrying this key. Callers that dedupe by key use
+   *  this on recovery: the keyed error stays suppressed while it is active, so
+   *  without an explicit clear the next failure of the same kind would be
+   *  swallowed by the message the user was already shown. */
+  clearKeyed(dedupeKey: string) {
+    state.update((items) => items.filter((item) => item.dedupeKey !== dedupeKey));
+  },
 };
 

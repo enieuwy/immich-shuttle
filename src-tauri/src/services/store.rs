@@ -138,8 +138,19 @@ pub fn last_import_for(app: &AppHandle, profile_id: &str, source_paths: &[String
 // Changing this key format resets existing `last_import` associations. The key
 // still collapses nested roots and exact duplicates, so equivalent source sets
 // retain the same checkpoint identity.
+//
+// Both halves are length-prefixed. Prefixing only the source list would leave
+// the separator ambiguous: a profile id ending in `\u{1f}10:/a` and a source
+// path starting `/a\u{1f}5:` compose the same bytes as the reverse split, so
+// two unrelated (profile, source set) pairs would share one date floor.
+// `profile_id` is renderer-supplied (`profile_upsert` only defaults it to a
+// UUID when absent), so it cannot be assumed to be hex-and-dashes.
 fn checkpoint_key(profile_id: &str, paths: &[String]) -> String {
-    format!("{profile_id}\u{1f}{}", source_key(paths))
+    format!(
+        "{}:{profile_id}\u{1f}{}",
+        profile_id.len(),
+        source_key(paths)
+    )
 }
 
 // Changing this normalization or encoding changes persisted keys and resets existing `last_import` associations.
@@ -161,7 +172,8 @@ fn source_key(paths: &[String]) -> String {
         .cloned()
         .collect();
 
-    let capacity = collapsed.iter().map(|path| path.len() + 1).sum();
+    // Each entry writes its decimal byte length, a colon, then the path.
+    let capacity = collapsed.iter().map(|path| path.len() + 8).sum();
     let mut key = String::with_capacity(capacity);
     for path in collapsed {
         write!(&mut key, "{}:", path.len()).expect("writing a checkpoint key cannot fail");
@@ -202,7 +214,9 @@ fn normalize_source_path(path: &str) -> String {
 mod tests {
     use std::{collections::HashMap, path::PathBuf};
 
-    use super::{clear_store_data, normalize_source_path, source_key, SourceMeta, StoreData};
+    use super::{
+        checkpoint_key, clear_store_data, normalize_source_path, source_key, SourceMeta, StoreData,
+    };
 
     #[test]
     fn clear_history_resets_source_metadata() {
@@ -296,6 +310,18 @@ mod tests {
         let multiple = vec!["left".to_string(), "right".to_string()];
 
         assert_ne!(source_key(&single), source_key(&multiple));
+    }
+
+    #[test]
+    fn checkpoint_key_distinguishes_profile_and_source_splits() {
+        // Both pairs compose the same bytes when only the source half carries a
+        // length prefix: "P" + US + "10:/a<US>5:/b/cd" versus
+        // "P<US>10:/a" + US + "5:/b/cd". Sharing one key would hand one card's
+        // only-new date floor to an unrelated profile.
+        assert_ne!(
+            checkpoint_key("P", &["/a\u{1f}5:/b/cd".to_string()]),
+            checkpoint_key("P\u{1f}10:/a", &["/b/cd".to_string()])
+        );
     }
 
     #[test]

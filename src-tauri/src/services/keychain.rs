@@ -54,9 +54,13 @@ pub fn store_api_key(profile_id: &str, api_key: &str) -> Result<(), String> {
         format_keychain_error("verify the API key in the keychain after writing", error)
     })?;
     if readback != api_key {
-        return Err(format!(
-            "Keychain write succeeded but readback returned different value. {KEYCHAIN_RECOVERY_GUIDANCE}"
-        ));
+        // The write itself succeeded, so this is an integrity failure in the
+        // credential store, not a locked or unapproved keychain. Recovery
+        // guidance about unlocking would name a cause this branch disproves.
+        return Err(
+            "Keychain write succeeded but readback returned a different value. The system credential store is not storing secrets reliably."
+                .to_string(),
+        );
     }
     Ok(())
 }

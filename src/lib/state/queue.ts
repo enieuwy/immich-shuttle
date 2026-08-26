@@ -185,6 +185,10 @@ async function handleTerminalTransitions(prev: ImportJob[], next: ImportJob[]) {
 // already-applied completion side effects on the stale "correction".
 const refreshes = createGeneration();
 
+// One keyed identity for the 2s poll's failure toast: repeated failures collapse
+// onto it while it is active, and a successful poll clears it.
+const QUEUE_REFRESH_ERROR_KEY = "queue-refresh";
+
 async function refreshJobs() {
   const isCurrent = refreshes.begin();
   try {
@@ -225,10 +229,14 @@ async function refreshJobs() {
         error: null,
       };
     });
+    // A poll succeeded, so the keyed refresh error no longer describes reality.
+    // Clearing it also re-arms the dedupe: the next outage produces a visible
+    // error instead of being suppressed by the one shown for the last one.
+    errorsState.clearKeyed(QUEUE_REFRESH_ERROR_KEY);
     void handleTerminalTransitions(prev, jobs);
   } catch (error) {
     if (!isCurrent()) return;
-    errorsState.addError("Could not refresh import queue.", "error", "queue-refresh");
+    errorsState.addError("Could not refresh import queue.", "error", QUEUE_REFRESH_ERROR_KEY);
     state.update((s) => ({ ...s, error: error instanceof Error ? error.message : String(error) }));
   }
 }
