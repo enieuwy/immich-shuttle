@@ -13,10 +13,12 @@ use uuid::Uuid;
 
 use crate::{
     models::{
+        history::RecordStatus,
         job::{FileError, ImportInput, ImportJob, JobProgress, JobStatus, Organization},
-        media::{ScanProgress, ScanSummary},
+        media::{ScanProgress, ScanStatus, ScanSummary},
     },
     services::{
+        immich_client::ImmichClient,
         keychain, logs, media_scanner, profile_store,
         sidecar_runner::{run_upload, UploadRequest},
         source_guard, staging, url_resolver, wipe,
@@ -192,6 +194,22 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Error returned when a cancel arrives for a job that already finished.
+///
+/// The frontend matches this text to treat the cancel as a no-op rather than a
+/// failure, so app quit is not blocked by a race it already won (`shutdown.ts`,
+/// `isAlreadyTerminal`). Rewording it changes that behaviour, so the wording is
+/// pinned by a test in this module.
+pub const TERMINAL_CANCEL_ERROR: &str = "Cannot cancel a terminal import";
+
+/// Prefix of the error returned when a job id is not in `JOBS`.
+///
+/// The frontend matches this text to tell "the job was evicted" apart from a
+/// real IPC failure, so app quit can proceed instead of waiting for a job that
+/// no longer exists (`shutdown.ts`, `isJobAlreadyGone`). Rewording it changes
+/// that behaviour, so the wording is pinned by a test in this module.
+pub const JOB_NOT_FOUND_ERROR: &str = "Job not found:";
+
 fn get_job(job_id: &str) -> Result<ImportJob, String> {
     let jobs = JOBS
         .lock()
@@ -199,7 +217,7 @@ fn get_job(job_id: &str) -> Result<ImportJob, String> {
     jobs.iter()
         .find(|j| j.id == job_id)
         .cloned()
-        .ok_or_else(|| format!("Job not found: {job_id}"))
+        .ok_or_else(|| format!("{JOB_NOT_FOUND_ERROR} {job_id}"))
 }
 
 fn is_active(status: &JobStatus) -> bool {
@@ -605,8 +623,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     }
 
     let profile = profile_store::get_profile(&input.profile_id)?;
-    let api_key = keychain::get_api_key(&input.profile_id)?
-        .ok_or_else(|| format!("No API key found for profile: {}", input.profile_id))?;
+    let api_key = keychain::require_api_key(&input.profile_id)?;
 
     let source_paths = collapse_overlapping_roots(input.source_paths.clone());
     let record_source_paths = source_paths.clone();
@@ -623,16 +640,22 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     let album_ids = input.album_ids.clone();
     let into_album = input.into_album.clone();
     let organization = input.organization;
-    // `on_errors` arrives over IPC; accept only immich-go's known modes or a
-    // non-negative integer count, else drop it (leaving immich-go's default).
-    let on_errors = input.on_errors.as_deref().and_then(|v| {
-        let v = v.trim();
-        if v == "stop" || v == "continue" || v.parse::<u32>().is_ok() {
-            Some(v.to_string())
-        } else {
-            None
+    // `on_errors` arrives over IPC. Refuse an unknown value instead of dropping
+    // it: the fallback is immich-go's default of stopping at the first per-file
+    // error, so a typo would silently invert "keep going on errors" and abort a
+    // long unattended run. This boundary already rejects out-of-scope paths and
+    // bad album roles rather than normalizing them.
+    let on_errors = match input.on_errors.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(value) if value == "stop" || value == "continue" || value.parse::<u32>().is_ok() => {
+            Some(value.to_string())
         }
-    });
+        Some(value) => {
+            return Err(format!(
+                "Unsupported error mode: {value}. Expected \"stop\", \"continue\", or a number."
+            ))
+        }
+    };
     let overwrite = input.overwrite;
     let tags: Vec<String> = input
         .tags
@@ -641,9 +664,18 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         .filter(|t| !t.is_empty())
         .collect();
     let session_tag = input.session_tag;
-    let include_type = sanitize_include_type(input.include_type.as_deref());
+    let include_type = parse_include_type(input.include_type.as_deref())?;
     let include_extensions = normalize_extensions(&input.include_extensions);
     let exclude_extensions = normalize_extensions(&input.exclude_extensions);
+    // immich-go uploads into a single album per run (`--into-album`), so more
+    // than one id is not a request this command can honour. Only element 0 was
+    // ever read; refuse the rest rather than discard it silently.
+    if album_ids.len() > 1 {
+        return Err(format!(
+            "An import targets one album, but {} were selected.",
+            album_ids.len()
+        ));
+    }
     // The "Open in Immich" deep-link points at a specific album only when the run
     // actually targets one: SingleAlbum mode AND a non-empty --into-album name
     // (folder/tag modes fan out; an unresolved selection sends no into_album, so
@@ -652,7 +684,10 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         .as_deref()
         .map(|a| !a.trim().is_empty())
         .unwrap_or(false);
-    let target_album_id = if organization == Organization::SingleAlbum && into_album_active {
+    // Provisional: the id the picker chose, shown while the run is in flight. The
+    // album the upload actually populated is resolved from its name at
+    // finalization, because the NAME is what immich-go targets.
+    let provisional_album_id = if organization == Organization::SingleAlbum && into_album_active {
         album_ids.first().cloned()
     } else {
         None
@@ -681,7 +716,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         pending_wipe_count: 0,
         file_errors: Vec::new(),
         profile_id: input.profile_id.clone(),
-        album_id: target_album_id.clone(),
+        album_id: provisional_album_id.clone(),
     };
 
     // Publish a job only after all fallible setup has succeeded. The admission
@@ -718,7 +753,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // Keep liveness state recoverable if any worker operation panics before
         // the explicit normal-path removals below run.
         let _worker_guard = ImportWorkerGuard::new(job_id_clone.clone());
-        let api_key_for_album_assignment = api_key_clone.clone();
+        // Used at finalization by both the wipe payload and the album lookup.
+        let api_key_for_finalization = api_key_clone.clone();
         let mut staging_dir = if staging_requested {
             let selected_files = select_files.clone();
             let cancel_flag_for_staging = cancel_flag.clone();
@@ -1027,7 +1063,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                                 // (post-failover), not the primary configured one,
                                 // or the existence check can hit the wrong server.
                                 server_url: request.server_url.clone(),
-                                api_key: api_key_for_album_assignment.clone(),
+                                api_key: api_key_for_finalization.clone(),
                             },
                         );
                         pending_wipe_stored = true;
@@ -1095,6 +1131,24 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 })
             };
 
+            // The deep link must name the album the upload actually populated.
+            // immich-go targets albums by NAME and creates one that does not
+            // exist yet, so the picker's id is only a hint: a device-rule run
+            // supplies the name with no id at all, and a recorded id goes stale
+            // when the album is deleted and recreated. Resolve the name against
+            // the server that received the upload (post-failover, same reason as
+            // the wipe payload above) and prefer that answer.
+            let resolved_album_id = if failed {
+                None
+            } else {
+                resolve_album_id_by_name(
+                    &request.server_url,
+                    &api_key_for_finalization,
+                    request.into_album.as_deref(),
+                )
+                .await
+            };
+
             ImportJob {
                 id: job_id_clone.clone(),
                 status,
@@ -1105,7 +1159,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 pending_wipe_count,
                 file_errors: file_errors.clone(),
                 profile_id: profile.id.clone(),
-                album_id: target_album_id.clone(),
+                album_id: resolved_album_id.or_else(|| provisional_album_id.clone()),
             }
         };
 
@@ -1139,9 +1193,9 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let checkpoint_eligible =
             checkpoint_eligible && matches!(update.status, JobStatus::Completed);
         let status = match &update.status {
-            JobStatus::Completed => "completed",
-            JobStatus::Cancelled => "cancelled",
-            _ => "failed",
+            JobStatus::Completed => RecordStatus::Completed,
+            JobStatus::Cancelled => RecordStatus::Cancelled,
+            _ => RecordStatus::Failed,
         };
         if let Err(err) = crate::services::store::append_history(
             &app_clone,
@@ -1151,8 +1205,10 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 finished_at: now_ms(),
                 profile_id: profile.id.clone(),
                 source_paths: record_source_paths.clone(),
-                album_ids: album_ids.clone(),
-                status: status.to_string(),
+                // The album this run actually landed in, resolved from the name
+                // immich-go targeted, rather than whatever id the picker sent.
+                album_ids: update.album_id.clone().into_iter().collect(),
+                status,
                 total: update.progress.total,
                 uploaded: update.progress.uploaded,
                 duplicates: update.progress.duplicates,
@@ -1240,8 +1296,7 @@ pub async fn import_forecast(
     }
 
     let profile = profile_store::get_profile(&profile_id)?;
-    let api_key = keychain::get_api_key(&profile_id)?
-        .ok_or_else(|| format!("No API key found for profile: {profile_id}"))?;
+    let api_key = keychain::require_api_key(&profile_id)?;
     let server_url = url_resolver::resolve_server_url(&profile).await;
     if server_url.is_empty() {
         return Err("No reachable Immich server URL for this profile.".to_string());
@@ -1251,7 +1306,7 @@ pub async fn import_forecast(
     // counts the files that will actually upload (both filters are extension-based
     // on immich-go's side, so this matches). Date/only-new is intentionally NOT
     // applied here — it needs per-file EXIF — so the UI flags the estimate.
-    let include_type = sanitize_include_type(include_type.as_deref());
+    let include_type = parse_include_type(include_type.as_deref())?;
     let include_extensions = normalize_extensions(&include_extensions);
     let exclude_extensions = normalize_extensions(&exclude_extensions);
     let keep = move |path: &str| -> bool {
@@ -1337,13 +1392,51 @@ pub async fn import_forecast(
     Ok(result)
 }
 
-/// immich-go accepts only VIDEO or IMAGE for --include-type; anything else drops.
-fn sanitize_include_type(value: Option<&str>) -> Option<String> {
-    value.and_then(|v| match v.trim().to_ascii_uppercase().as_str() {
-        "VIDEO" => Some("VIDEO".to_string()),
-        "IMAGE" => Some("IMAGE".to_string()),
-        _ => None,
-    })
+/// Best-effort lookup of the album id for an exact album name.
+///
+/// This only backs the "Open in Immich" deep link, so every failure returns
+/// `None` and leaves the run's outcome untouched. An ambiguous name also returns
+/// `None`: Immich permits duplicate album names, and immich-go's `--into-album`
+/// gives no way to tell which one it used, so linking to a guess would send the
+/// user to an album that may not hold the upload.
+async fn resolve_album_id_by_name(
+    server_url: &str,
+    api_key: &str,
+    name: Option<&str>,
+) -> Option<String> {
+    let name = name.map(str::trim).filter(|name| !name.is_empty())?;
+    if server_url.is_empty() {
+        return None;
+    }
+    let albums = ImmichClient::new(server_url, api_key)
+        .list_albums(None)
+        .await
+        .ok()?;
+    let mut matched = albums.into_iter().filter(|album| album.album_name == name);
+    let first = matched.next()?;
+    match matched.next() {
+        Some(_) => None,
+        None => Some(first.id),
+    }
+}
+
+/// immich-go accepts only VIDEO or IMAGE for `--include-type`.
+///
+/// An unrecognized value is refused rather than dropped. Dropping it removes the
+/// media-kind filter entirely, so a typo would upload the kinds the user
+/// filtered out — and on a delete-after-import run, then delete them from the
+/// card. Refusing keeps the run's semantics equal to what was asked for.
+fn parse_include_type(value: Option<&str>) -> Result<Option<String>, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(value) => match value.to_ascii_uppercase().as_str() {
+            "VIDEO" => Ok(Some("VIDEO".to_string())),
+            "IMAGE" => Ok(Some("IMAGE".to_string())),
+            _ => Err(format!(
+                "Unsupported media type filter: {value}. Expected \"VIDEO\" or \"IMAGE\"."
+            )),
+        },
+    }
 }
 
 /// Normalize extensions to immich-go's leading-dot, lowercase form, dropping blanks.
@@ -1437,14 +1530,23 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
                             Some(format!(
                                 "{unverified_count} file(s) were not found on the server and were kept for safety."
                             ))
+                        } else if wipe_result.skipped > 0 {
+                            // Now that the delete path has no extension gate, this
+                            // can only mean the file left the card between the
+                            // server check and the delete. Say so rather than
+                            // folding it into an anonymous "kept" total.
+                            Some(format!(
+                                "{} file(s) were gone before they could be deleted.",
+                                wipe_result.skipped
+                            ))
                         } else {
                             None
                         };
                         let _ = logs::append_log(
                             "app.log",
                             &format!(
-                                "import_wipe_verified job_id={} confirmed={} unverified={} deleted={} changed={}",
-                                job_id, confirmed_count, unverified_count, wipe_result.deleted, wipe_result.changed
+                                "import_wipe_verified job_id={} confirmed={} unverified={} deleted={} changed={} skipped={}",
+                                job_id, confirmed_count, unverified_count, wipe_result.deleted, wipe_result.changed, wipe_result.skipped
                             ),
                         );
                         if wipe_result.failed > 0 {
@@ -1557,7 +1659,7 @@ pub async fn scan_sources_stream(
     let deadline = Instant::now() + SCAN_DEADLINE;
     let scan_cancellation = cancellation.clone();
     let progress = Arc::new(Mutex::new(ScanSummary {
-        status: "complete".to_string(),
+        status: ScanStatus::Complete,
         photo_count: 0,
         video_count: 0,
         total_size_bytes: 0,
@@ -1639,7 +1741,7 @@ pub async fn scan_sources_stream(
                         .lock()
                         .map_err(|_| "Could not lock scan progress state".to_string())?
                         .clone();
-                    summary.status = "cancelled".to_string();
+                    summary.status = ScanStatus::Cancelled;
                     return Ok(summary);
                 }
                 Err(media_scanner::ScanError::TimedOut) => {
@@ -1647,7 +1749,7 @@ pub async fn scan_sources_stream(
                         .lock()
                         .map_err(|_| "Could not lock scan progress state".to_string())?
                         .clone();
-                    summary.status = "timed_out".to_string();
+                    summary.status = ScanStatus::TimedOut;
                     return Ok(summary);
                 }
                 Err(media_scanner::ScanError::Failed(error)) => return Err(error),
@@ -1669,7 +1771,7 @@ pub async fn scan_sources_stream(
                     .lock()
                     .map_err(|_| "Could not lock scan progress state".to_string())?
                     .clone();
-                summary.status = "timed_out".to_string();
+                summary.status = ScanStatus::TimedOut;
                 Ok(summary)
             }
         },
@@ -1683,7 +1785,7 @@ pub async fn scan_sources_stream(
                 .lock()
                 .map_err(|_| "Could not lock scan progress state".to_string())?
                 .clone();
-            summary.status = "cancelled".to_string();
+            summary.status = ScanStatus::Cancelled;
             Ok(summary)
         },
     };
@@ -1736,7 +1838,7 @@ pub async fn import_cancel(job_id: String) -> Result<(), String> {
         }
         JobStatus::Pending => {}
         JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => {
-            return Err(format!("Cannot cancel a terminal import: {job_id}"));
+            return Err(format!("{TERMINAL_CANCEL_ERROR}: {job_id}"));
         }
     }
 
@@ -2563,5 +2665,42 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.contains("no-such-job"), "got: {err}");
+    }
+
+    #[test]
+    fn cross_boundary_error_texts_keep_their_frontend_contract() {
+        // `shutdown.ts` substring-matches both of these to decide whether app
+        // quit may proceed. A reword here silently changes quit behaviour, and
+        // shutdown.test.ts cannot catch it because it builds its own strings.
+        assert_eq!(JOB_NOT_FOUND_ERROR, "Job not found:");
+        assert_eq!(TERMINAL_CANCEL_ERROR, "Cannot cancel a terminal import");
+
+        let err = get_job("no-such-job").unwrap_err();
+        assert!(
+            err.starts_with(JOB_NOT_FOUND_ERROR),
+            "the frontend matches this prefix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_media_type_filter_is_refused_not_dropped() {
+        // Dropping it removes the filter, so a typo would upload the kinds the
+        // user excluded — and delete them from the card on a wipe run.
+        assert_eq!(
+            parse_include_type(Some("VIDEO")).unwrap(),
+            Some("VIDEO".to_string())
+        );
+        assert_eq!(
+            parse_include_type(Some(" image ")).unwrap(),
+            Some("IMAGE".to_string())
+        );
+        assert_eq!(parse_include_type(None).unwrap(), None);
+        assert_eq!(parse_include_type(Some("  ")).unwrap(), None);
+
+        let err = parse_include_type(Some("VIDO")).unwrap_err();
+        assert!(
+            err.contains("VIDO"),
+            "the rejection must name the value, got: {err}"
+        );
     }
 }

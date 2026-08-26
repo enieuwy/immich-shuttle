@@ -46,11 +46,37 @@ pub struct ScanProgress {
     pub skipped_unreadable: usize,
 }
 
+/// Why a streamed scan stopped. `Complete` is the only outcome that means the
+/// file list is the whole selection; the other two mean it is a prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanStatus {
+    Complete,
+    Cancelled,
+    TimedOut,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanSummary {
-    pub status: String,
+    pub status: ScanStatus,
     pub photo_count: usize,
     pub video_count: usize,
     pub total_size_bytes: u64,
     pub skipped_unreadable: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_status_serializes_to_the_frontend_union() {
+        // These three strings are the `ScanSummary.status` union in types.ts.
+        // Renaming a variant without updating that union breaks the frontend
+        // silently, so pin the wire values here.
+        let wire = |status| serde_json::to_string(&status).expect("serialize scan status");
+        assert_eq!(wire(ScanStatus::Complete), "\"complete\"");
+        assert_eq!(wire(ScanStatus::Cancelled), "\"cancelled\"");
+        assert_eq!(wire(ScanStatus::TimedOut), "\"timed_out\"");
+    }
 }

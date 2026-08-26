@@ -4,6 +4,17 @@ use reqwest::{Client, Method, Response, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Prefix for a transport-level failure — DNS, TCP, or TLS — as opposed to an
+/// HTTP error from a server that did answer.
+///
+/// It is both the user-facing opening of the message and the marker the frontend
+/// matches to decide whether retrying is worthwhile (`albums.ts`). Before this
+/// existed the frontend pattern-matched reqwest's own prose ("error sending
+/// request", "tcp connect"), which any dependency bump could reword. Only
+/// `request_json` marks its errors this way; that is the path the album loader
+/// retries on.
+pub const UNREACHABLE_ERROR: &str = "Could not reach the server";
+
 /// One shared HTTP client (connection pool + TLS config) reused across every
 /// request. Building a fresh `Client` per call is wasteful and was a likely
 /// source of flaky "error sending request" failures during the startup burst.
@@ -278,7 +289,9 @@ impl ImmichClient {
                         detail.push_str(&s.to_string());
                         src = s.source();
                     }
-                    let err = format!("API {method} {display_path} failed at {url}: {detail}");
+                    let err = format!(
+                        "{UNREACHABLE_ERROR}: API {method} {display_path} at {url}: {detail}"
+                    );
                     // A GET is idempotent, so retain its existing compatibility
                     // fallback after transport failures. A write may have reached
                     // the first endpoint despite its client-side error.

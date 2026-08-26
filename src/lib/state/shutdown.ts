@@ -15,6 +15,8 @@
  * backend's `RUNNING_IMPORTS` map — can authorise the close.
  */
 
+import { isBackendError } from "$lib/backendErrors";
+
 /** Shown when shutdown could not be confirmed; the window must stay open. */
 export const SHUTDOWN_INCOMPLETE_MESSAGE =
   "The import is still shutting down. Keep this window open and retry quitting.";
@@ -61,10 +63,7 @@ export type ShutdownDeps = {
  * not have taken effect and must still block the close.
  */
 function isAlreadyTerminal(reason: unknown): boolean {
-  return (
-    reason instanceof Error &&
-    reason.message.includes("Cannot cancel a terminal import")
-  );
+  return isBackendError(reason, "TERMINAL_CANCEL");
 }
 
 /**
@@ -73,7 +72,7 @@ function isAlreadyTerminal(reason: unknown): boolean {
  * running without a backend job, so shutdown can treat the id as terminal.
  */
 function isJobAlreadyGone(reason: unknown): boolean {
-  return reason instanceof Error && reason.message.includes("Job not found:");
+  return isBackendError(reason, "JOB_NOT_FOUND");
 }
 
 export async function runImportShutdown(deps: ShutdownDeps): Promise<ShutdownOutcome> {

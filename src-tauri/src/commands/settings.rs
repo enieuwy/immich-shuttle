@@ -7,8 +7,7 @@ use crate::services::{
 #[tauri::command]
 pub async fn get_server_info(profile_id: String) -> Result<ServerInfo, String> {
     let profile = profile_store::get_profile(&profile_id)?;
-    let api_key = keychain::get_api_key(&profile_id)?
-        .ok_or_else(|| format!("No API key found for profile: {profile_id}"))?;
+    let api_key = keychain::require_api_key(&profile_id)?;
     let server_url = url_resolver::resolve_server_url(&profile).await;
     let client = ImmichClient::new(&server_url, &api_key);
     let version = client.get_server_version().await?;

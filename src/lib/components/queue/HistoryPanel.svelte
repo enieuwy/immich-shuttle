@@ -1,6 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { CheckCircle2, XCircle, CircleSlash, Clock, Trash2, RotateCcw } from "@lucide/svelte";
+  import {
+    CheckCircle2,
+    XCircle,
+    CircleSlash,
+    CircleHelp,
+    Clock,
+    Trash2,
+    RotateCcw,
+  } from "@lucide/svelte";
 
   import { historyState, replayImport } from "$lib/state/history";
   import { errorsState } from "$lib/state/errors";
@@ -110,8 +118,11 @@
                   <CheckCircle2 class="size-4 shrink-0 text-emerald-500" aria-label="Completed" />
                 {:else if record.status === "failed"}
                   <XCircle class="size-4 shrink-0 text-destructive" aria-label="Failed" />
-                {:else}
+                {:else if record.status === "cancelled"}
                   <CircleSlash class="size-4 shrink-0 text-muted-foreground" aria-label="Cancelled" />
+                {:else}
+                  <!-- A record written by a newer build. Do not label it "Cancelled". -->
+                  <CircleHelp class="size-4 shrink-0 text-muted-foreground" aria-label="Unknown outcome" />
                 {/if}
                 <span class="min-w-0 flex-1 truncate text-sm" title={record.source_paths.join(", ")}>
                   <span class="text-muted-foreground">{sourceLabel(record.source_paths)}</span>

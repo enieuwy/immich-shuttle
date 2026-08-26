@@ -79,6 +79,18 @@ pub fn get_api_key(profile_id: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// Prefix of the error every command returns when a profile has no stored key.
+///
+/// The frontend matches this to render "connect your API key" instead of a
+/// generic failure (`albums.ts`), so the wording is a contract, not a message.
+/// It lived inline in ten command sites before this; keep it in one place.
+pub const MISSING_API_KEY_ERROR: &str = "No API key found for profile";
+
+/// The profile's API key, or an error naming the profile when none is stored.
+pub fn require_api_key(profile_id: &str) -> Result<String, String> {
+    get_api_key(profile_id)?.ok_or_else(|| format!("{MISSING_API_KEY_ERROR}: {profile_id}"))
+}
+
 pub fn delete_api_key(profile_id: &str) -> Result<(), String> {
     let _guard = keychain_guard();
     let e = entry(profile_id)?;

@@ -131,7 +131,11 @@ export interface ScanResult {
   skipped_unreadable: number;
 }
 
-/** Terminal outcome of a streamed scan (see scan_sources_stream). */
+/**
+ * Terminal outcome of a streamed scan (see scan_sources_stream). Mirrors the
+ * Rust `ScanStatus` enum; the wire values are pinned by
+ * `scan_status_serializes_to_the_frontend_union`.
+ */
 export interface ScanSummary {
   status: "complete" | "cancelled" | "timed_out";
   photo_count: number;
@@ -163,7 +167,12 @@ export interface ImportRecord {
   profile_id: string;
   source_paths: string[];
   album_ids: string[];
-  status: "completed" | "failed" | "cancelled";
+  /**
+   * Mirrors the Rust `RecordStatus` enum, whose wire values are pinned by
+   * `record_status_serializes_to_the_frontend_union`. `"unknown"` is what a
+   * record written by a newer build degrades to, so it must stay renderable.
+   */
+  status: "completed" | "failed" | "cancelled" | "unknown";
   total: number;
   uploaded: number;
   duplicates: number;

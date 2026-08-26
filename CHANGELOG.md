@@ -12,16 +12,23 @@
 - **A card whose one-click import fails to start can be retried.** The card-detected banner returns instead of treating the card as handled for the rest of the session.
 - **"Import again" no longer silently uploads into the library when the recorded album has changed.** The recorded album is matched by id and then by name, because Immich assigns albums by name, so an album that was recreated still receives the replay. When neither matches, the app reports it and stages no album.
 - **A sidecar that ends without a termination event is judged by its run log.** A finished upload is no longer reported as a failure, and the diagnostic now states plainly that the process was killed and its exit could not be confirmed.
+- **"Delete originals after import" now deletes every format the server confirmed.** The delete step applied its own 25-entry format allowlist, so a file that immich-go uploaded and the server confirmed — an AVCHD `.mts`, a `.webm`, a `.3gp`, a vendor raw outside the list — was silently kept and counted as skipped while the app reported the delete as done. The confirmed-by-the-server set is now the only authority, alongside the unchanged checks that each path lies under a chosen source folder and still matches the file that was verified. A file that vanished before it could be deleted is now named as such instead of disappearing into an anonymous "kept" total.
+- **"Open in Immich" now points at the album the upload actually populated.** Immich assigns albums by name, and the album may not exist until the run creates it, so the id is resolved from the name once the run finishes. A card-rule import into a named album previously offered no album link at all, and a link recorded before the album was recreated pointed at the deleted one.
+- **An unusable import option is refused instead of silently reverting to a default.** An unrecognised error mode reverted to stopping the whole run at the first per-file error — the opposite of "keep going" — and an unrecognised media-type filter dropped the filter entirely, uploading the kinds that were excluded and, on a delete-after-import run, deleting them from the card.
 
 ### UI
 - **Repeated queue-poll failures no longer create an unlimited stack of identical error messages.** One message stands for an ongoing outage, and it is retired as soon as a poll succeeds, so a later outage is reported rather than hidden behind the message from the last one.
 - **The "Check server" button can no longer stay stuck on "Checking…".** Changing an import input while a forecast was in flight left the button disabled for the rest of the session; a superseded forecast now releases it.
 - **Keychain failures include platform-specific recovery guidance.** macOS, Windows, and Linux messages retain the underlying backend error for diagnosis.
+- **A history entry with an outcome this build does not recognise is no longer labelled "Cancelled".** It is shown as an unknown outcome instead, and one unreadable entry can no longer prevent the rest of the history from loading.
 
 ### Maintenance
 - **Progress events no longer carry the same progress object twice.** The Rust event and TypeScript consumer now use one required `progress` field.
 - **Server compatibility policy has one implementation.** Profile validation and server information now share the same minimum version and warning.
 - **Pull-request builds declare read-only repository permissions.**
+- **Scan and history outcomes are typed rather than free strings.** The two status fields that the frontend declares as fixed sets are now Rust enums whose wire values are pinned by tests, so a new outcome cannot type-check its way into a mislabelled row.
+- **The error texts the app branches on are defined once.** App quit, album retry, and the missing-key prompt read those decisions from backend error text; each string now has a single definition, pinned by a test, and the retry decision no longer pattern-matches the HTTP client's own wording, which any dependency bump could reword.
+- **A failed thumbnail is diagnosable.** One summary line per batch records how many tiles were unsupported against how many genuinely failed, with a representative reason, so a missing thumbnail can be told apart from an unwritable cache directory or a corrupt file. A batch of merely unsupported formats stays silent.
 
 ## v0.7.1 - 2026-08-23
 

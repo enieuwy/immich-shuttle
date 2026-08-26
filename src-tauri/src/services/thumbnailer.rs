@@ -280,40 +280,69 @@ fn is_raw_ext(ext: &str) -> bool {
     )
 }
 
-/// Generate (or fetch from cache) a thumbnail for a single file. Never errors:
-/// any failure yields a placeholder so one bad file can't break a batch.
-pub fn thumbnail(path_str: &str, max: u32) -> ThumbResult {
-    let placeholder = || ThumbResult {
+/// The reason a thumbnail request produced its result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ThumbnailOutcome {
+    Ok,
+    Unsupported,
+    Cancelled,
+    Failed(String),
+}
+
+fn placeholder(path_str: &str) -> ThumbResult {
+    ThumbResult {
         path: path_str.to_string(),
         data_url: None,
         width: 0,
         height: 0,
-    };
+    }
+}
 
+/// Generate (or fetch from cache) a thumbnail and report why it produced a placeholder.
+///
+/// The thumbnail itself never errors: any failure yields a placeholder so one bad
+/// file cannot break a batch.
+pub(crate) fn thumbnail_with_outcome(path_str: &str, max: u32) -> (ThumbResult, ThumbnailOutcome) {
     let path = Path::new(path_str);
     if !path.is_file() {
-        return placeholder();
+        return (
+            placeholder(path_str),
+            ThumbnailOutcome::Failed("path_not_file".to_string()),
+        );
     }
 
     let cache = match cache_dir() {
         Ok(d) => d,
-        Err(_) => return placeholder(),
+        Err(reason) => {
+            return (
+                placeholder(path_str),
+                ThumbnailOutcome::Failed(format!("cache_dir: {reason}")),
+            );
+        }
     };
     let key = cache_key(path, max);
     let jpg = cache.join(format!("{key}.jpg"));
     let png = cache.join(format!("{key}.png"));
 
     let cache_files = CacheFileGuard::new([jpg.clone(), png.clone()]);
-    let (file, wrote_cache) = if jpg.is_file() {
-        (Some(jpg.clone()), false)
+    let (file, wrote_cache, generation_outcome) = if jpg.is_file() {
+        (Some(jpg.clone()), false, None)
     } else if png.is_file() {
-        (Some(png.clone()), false)
+        (Some(png.clone()), false, None)
     } else {
-        (generate(path, max, &jpg, &png), true)
+        let generated = generate(path, max, &jpg, &png);
+        let outcome = generated.is_none().then(|| {
+            if is_supported_format(&ext_lower(path)) {
+                ThumbnailOutcome::Failed(format!("renderer_failed_for_{}", ext_lower(path)))
+            } else {
+                ThumbnailOutcome::Unsupported
+            }
+        });
+        (generated, true, outcome)
     };
 
     // Fully read the cache file before allowing post-write pruning to remove it.
-    let result = file.as_deref().and_then(|file| {
+    let decode_result = file.as_deref().map(|file| {
         // Snapshot (mtime, len) before decoding so the self-heal delete below
         // can tell whether `file` is still the entry that failed to decode.
         // Without this, the delete races an atomic publish: it is
@@ -323,16 +352,16 @@ pub fn thumbnail(path_str: &str, max: u32) -> ThumbResult {
         // a good file a third worker published in the gap.
         let identity_before = cache_file_identity(file);
         match to_result(path_str, file) {
-            Ok(r) => Some(r),
+            Ok(r) => Ok(r),
             // A legacy truncated entry (written before atomic publish, or from a
             // process that crashed mid-write) must not be served as a "hit"
             // forever; delete it so the next request regenerates it cleanly --
             // but only if it's still the same file we failed to decode.
-            Err(_) => {
+            Err(reason) => {
                 if cache_file_identity(file) == identity_before {
                     let _ = fs::remove_file(file);
                 }
-                None
+                Err(reason)
             }
         }
     });
@@ -341,7 +370,38 @@ pub fn thumbnail(path_str: &str, max: u32) -> ThumbResult {
         prune_cache_after_write(&cache);
     }
 
-    result.unwrap_or_else(placeholder)
+    match decode_result {
+        Some(Ok(result)) => (result, ThumbnailOutcome::Ok),
+        Some(Err(reason)) => (
+            placeholder(path_str),
+            ThumbnailOutcome::Failed(format!("cache_entry_decode: {reason}")),
+        ),
+        None => (
+            placeholder(path_str),
+            generation_outcome.unwrap_or_else(|| {
+                ThumbnailOutcome::Failed("thumbnail_generation_failed".to_string())
+            }),
+        ),
+    }
+}
+
+fn is_supported_format(ext: &str) -> bool {
+    let portable = matches!(
+        ext,
+        "jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "gif" | "bmp"
+    );
+    if portable || is_raw_ext(ext) {
+        return true;
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        matches!(ext, "mp4" | "mov" | "m4v" | "avi" | "mkv" | "heic" | "heif")
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        false
+    }
 }
 
 fn to_result(path_str: &str, file: &Path) -> Result<ThumbResult, String> {
@@ -983,7 +1043,7 @@ mod tests {
         let _guard = CACHE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let r = thumbnail("/no/such/file.jpg", 64);
+        let r = thumbnail_with_outcome("/no/such/file.jpg", 64).0;
         assert!(r.data_url.is_none());
         assert_eq!(r.width, 0);
     }
@@ -1001,7 +1061,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let src = concat!(env!("CARGO_MANIFEST_DIR"), "/icons/128x128.png");
-        let r = thumbnail(src, 64);
+        let r = thumbnail_with_outcome(src, 64).0;
         assert!(r.data_url.is_some(), "expected a thumbnail data url");
         assert!(r.width > 0 && r.height > 0);
         assert!(r.data_url.unwrap().starts_with("data:image/"));
@@ -1242,6 +1302,49 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_extension_reports_unsupported() {
+        let _guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let src =
+            std::env::temp_dir().join(format!("immich_shuttle_unsupported_{}.xyz", Uuid::new_v4()));
+        fs::write(&src, b"not a supported media format").unwrap();
+
+        let (_, outcome) = thumbnail_with_outcome(src.to_str().unwrap(), MAX_PX);
+
+        assert_eq!(outcome, ThumbnailOutcome::Unsupported);
+        let _ = fs::remove_file(&src);
+    }
+
+    #[test]
+    fn corrupt_cache_entry_reports_hard_failure_reason() {
+        let _guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let src = std::env::temp_dir().join(format!(
+            "immich_shuttle_corrupt_cache_{}.jpg",
+            Uuid::new_v4()
+        ));
+        fs::write(&src, jpeg_of(32, 32)).unwrap();
+
+        let cache = cache_dir().unwrap();
+        let key = cache_key(&src, MAX_PX);
+        let jpg = cache.join(format!("{key}.jpg"));
+        fs::write(&jpg, b"not a real jpeg").unwrap();
+
+        let (_, outcome) = thumbnail_with_outcome(src.to_str().unwrap(), MAX_PX);
+
+        match outcome {
+            ThumbnailOutcome::Failed(reason) => {
+                assert!(reason.contains("cache_entry_decode"));
+            }
+            other => panic!("expected cache decode failure, got {other:?}"),
+        }
+        assert!(!jpg.exists());
+        let _ = fs::remove_file(&src);
+    }
+
+    #[test]
     fn truncated_cache_entry_self_heals() {
         // Seed a cache entry that can't be decoded (crash mid-write, or a
         // pre-atomic-publish leftover from before dc066bc5). `thumbnail` must
@@ -1260,7 +1363,7 @@ mod tests {
         let jpg = cache.join(format!("{key}.jpg"));
         fs::write(&jpg, b"not a real jpeg").unwrap();
 
-        let first = thumbnail(src.to_str().unwrap(), MAX_PX);
+        let first = thumbnail_with_outcome(src.to_str().unwrap(), MAX_PX).0;
         assert!(
             first.data_url.is_none(),
             "an undecodable cache entry must never be served as a hit"
@@ -1270,7 +1373,7 @@ mod tests {
             "the corrupt cache entry must be deleted, not left to poison later requests"
         );
 
-        let second = thumbnail(src.to_str().unwrap(), MAX_PX);
+        let second = thumbnail_with_outcome(src.to_str().unwrap(), MAX_PX).0;
         assert!(
             second.data_url.is_some(),
             "the freed cache slot should regenerate a real thumbnail"

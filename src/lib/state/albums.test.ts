@@ -101,12 +101,15 @@ describe("albumsState", () => {
     expect(s.availableUsers).toEqual([]);
   });
 
-  it("auto-retries a connection error and recovers", async () => {
+  it("auto-retries a transport failure the backend marked, and recovers", async () => {
     await useProfile();
 
     vi.useFakeTimers();
     vi.mocked(api.albumsList)
-      .mockRejectedValueOnce(new Error("error sending request: tcp connect error -> No route to host"))
+      // The backend's own marker, not reqwest's prose. See backendErrors.ts.
+      .mockRejectedValueOnce(
+        new Error("Could not reach the server: API GET /albums at http://x: tcp connect error"),
+      )
       .mockResolvedValueOnce([{ id: "a1", album_name: "Family", shared_with: [] }]);
 
     const pending = albumsState.loadAlbums();
@@ -117,6 +120,21 @@ describe("albumsState", () => {
     const s = get(albumsState);
     expect(s.error).toBeNull();
     expect(s.availableAlbums.map((a) => a.id)).toContain("a1");
+  });
+
+  it("does not retry a failure from a server that answered", async () => {
+    await useProfile();
+
+    // A 500 is not a connectivity problem: the server replied, so retrying the
+    // same request twice more just delays the error the user needs to see.
+    const callsBefore = vi.mocked(api.albumsList).mock.calls.length;
+    vi.mocked(api.albumsList).mockRejectedValueOnce(
+      new Error("API GET /albums failed at http://x (500 Internal Server Error): boom"),
+    );
+    await albumsState.loadAlbums();
+
+    expect(vi.mocked(api.albumsList).mock.calls.length - callsBefore).toBe(1);
+    expect(get(albumsState).error).toBe("Couldn't load albums.");
   });
 
   it("creates album and selects it", async () => {

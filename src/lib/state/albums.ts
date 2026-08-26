@@ -1,6 +1,7 @@
 import { get, writable } from "svelte/store";
 
 import { albumCreate, albumShareLink, albumShareUsers, albumsList, usersList, type AlbumShareRole } from "$lib/api";
+import { isBackendError } from "$lib/backendErrors";
 import { avatarsState } from "$lib/state/avatars";
 import { errorsState } from "$lib/state/errors";
 import { createGeneration } from "$lib/state/generation";
@@ -160,7 +161,7 @@ export const albumsState = {
         if (!isCurrent()) return;
         const message = error instanceof Error ? error.message : String(error);
         // A missing key isn't an error to shout about — surface a CTA to add it.
-        if (/No API key/i.test(message)) {
+        if (isBackendError(error, "MISSING_API_KEY")) {
           state.update((s) => ({
             ...s,
             loading: false,
@@ -171,10 +172,10 @@ export const albumsState = {
           }));
           return;
         }
-        const isConnectionError =
-          /error sending request|tcp connect|no route to host|connection refused|dns error|connect/i.test(
-            message,
-          );
+        // Retry only a transport failure. The backend marks those itself, so
+        // this no longer pattern-matches reqwest's wording, which a dependency
+        // bump could reword out from under us.
+        const isConnectionError = isBackendError(error, "UNREACHABLE_SERVER");
         if (isConnectionError && attempt < maxAttempts) {
           if (!isCurrent()) return;
           await delay(2500, signal);

@@ -1,4 +1,4 @@
-use crate::services::thumbnailer::{thumbnail, ThumbResult, MAX_PX};
+use crate::services::thumbnailer::{thumbnail_with_outcome, ThumbResult, ThumbnailOutcome, MAX_PX};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Highest preview session token cancelled by the frontend.
@@ -27,6 +27,11 @@ pub async fn preview_thumbnails(
     token: u64,
 ) -> Result<Vec<ThumbResult>, String> {
     let mut results = Vec::with_capacity(paths.len());
+    let mut ok_count = 0usize;
+    let mut unsupported_count = 0usize;
+    let mut cancelled_count = 0usize;
+    let mut failed_count = 0usize;
+    let mut representative_reason = None;
 
     for chunk in paths.chunks(8) {
         if preview_session_cancelled(token) {
@@ -41,24 +46,30 @@ pub async fn preview_thumbnails(
                     // Re-check right before the decode, not just once per
                     // chunk at spawn time: see `preview_session_cancelled`.
                     if preview_session_cancelled(token) {
-                        return ThumbResult {
-                            path,
-                            data_url: None,
-                            width: 0,
-                            height: 0,
-                        };
+                        return (
+                            ThumbResult {
+                                path,
+                                data_url: None,
+                                width: 0,
+                                height: 0,
+                            },
+                            ThumbnailOutcome::Cancelled,
+                        );
                     }
                     // Only read files under a folder the user selected as a
                     // source; reject arbitrary paths from the IPC boundary.
                     if crate::services::source_guard::is_within_approved(&path) {
-                        thumbnail(&path, MAX_PX)
+                        thumbnail_with_outcome(&path, MAX_PX)
                     } else {
-                        ThumbResult {
-                            path,
-                            data_url: None,
-                            width: 0,
-                            height: 0,
-                        }
+                        (
+                            ThumbResult {
+                                path,
+                                data_url: None,
+                                width: 0,
+                                height: 0,
+                            },
+                            ThumbnailOutcome::Failed("outside_approved_source_roots".to_string()),
+                        )
                     }
                 });
                 (fallback_path, handle)
@@ -67,15 +78,58 @@ pub async fn preview_thumbnails(
 
         for (path, handle) in handles {
             match handle.await {
-                Ok(result) => results.push(result),
-                Err(_) => results.push(ThumbResult {
-                    path,
-                    data_url: None,
-                    width: 0,
-                    height: 0,
-                }),
+                Ok((result, outcome)) => {
+                    match &outcome {
+                        ThumbnailOutcome::Ok => ok_count += 1,
+                        ThumbnailOutcome::Unsupported => unsupported_count += 1,
+                        ThumbnailOutcome::Cancelled => cancelled_count += 1,
+                        ThumbnailOutcome::Failed(reason) => {
+                            failed_count += 1;
+                            if representative_reason.is_none() {
+                                representative_reason = Some(reason.clone());
+                            }
+                        }
+                    }
+                    results.push(result);
+                }
+                Err(_) => {
+                    failed_count += 1;
+                    if representative_reason.is_none() {
+                        representative_reason = Some("worker_join_error".to_string());
+                    }
+                    results.push(ThumbResult {
+                        path,
+                        data_url: None,
+                        width: 0,
+                        height: 0,
+                    });
+                }
             }
         }
+    }
+
+    if failed_count > 0 {
+        // The reason can carry an OS error string with spaces or newlines, which
+        // would break the one-line `key=value` shape every other entry in
+        // app.log uses. Collapse anything outside that shape.
+        let reason = representative_reason
+            .unwrap_or_else(|| "unknown_thumbnail_failure".to_string())
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let _ = crate::services::logs::append_log(
+            "app.log",
+            &format!(
+                "preview_thumbnails ok={} unsupported={} cancelled={} failed={} reason={}",
+                ok_count, unsupported_count, cancelled_count, failed_count, reason
+            ),
+        );
     }
 
     Ok(results)

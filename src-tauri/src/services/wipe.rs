@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fs, io,
     path::Path,
     sync::{
@@ -15,6 +14,7 @@ use crate::services::immich_client::ImmichClient;
 pub struct WipeResult {
     pub deleted: usize,
     pub failed: usize,
+    /// Files kept because the path no longer names an existing regular file.
     pub skipped: usize,
     /// Files kept because they no longer matched the identity that was verified
     /// against the server (see `FileIdentity`).
@@ -80,16 +80,6 @@ pub struct VerifiedFile {
     pub identity: FileIdentity,
 }
 
-fn allowed_media_exts() -> HashSet<&'static str> {
-    [
-        ".jpg", ".jpeg", ".png", ".heic", ".heif", ".avif", ".tiff", ".tif", ".gif", ".bmp",
-        ".webp", ".raw", ".dng", ".cr2", ".cr3", ".nef", ".arw", ".orf", ".rw2", ".raf", ".mp4",
-        ".mov", ".m4v", ".avi", ".mkv",
-    ]
-    .into_iter()
-    .collect()
-}
-
 /// A trash handle configured to avoid extra OS permission prompts. On macOS the
 /// crate's default backend drives Finder via AppleScript (needs automation
 /// permission and fails in headless sessions), so files that verified as
@@ -109,12 +99,16 @@ fn trash_context() -> trash::TrashContext {
 
 /// Move server-confirmed originals to the Trash.
 ///
+/// There is intentionally no extension gate: the verified-confirmed set is the
+/// authority, and `retain_paths_under_sources` already enforced containment
+/// upstream. This prevents an allowlist from silently stranding media the
+/// server already holds and reporting the upload as skipped.
+///
 /// Every file is re-stat'd immediately before deletion and kept if its identity
 /// no longer matches what was hashed for the server check — the stat and the
 /// delete are deliberately adjacent so the window a concurrent writer could slip
 /// into is as small as the loop body.
 pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
-    let exts = allowed_media_exts();
     let trash = trash_context();
     let mut result = WipeResult {
         deleted: 0,
@@ -128,15 +122,6 @@ pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
     for file in files {
         let path = Path::new(&file.path);
         if !path.exists() || !path.is_file() {
-            result.skipped += 1;
-            continue;
-        }
-
-        let ext = path
-            .extension()
-            .map(|v| format!(".{}", v.to_string_lossy().to_lowercase()))
-            .unwrap_or_default();
-        if !exts.contains(ext.as_str()) {
             result.skipped += 1;
             continue;
         }
@@ -428,23 +413,21 @@ mod tests {
     #[test]
     fn moves_only_selected_media_files_to_trash() {
         let photo = temp_file("photo", "jpg");
-        let other = temp_file("other", "txt");
+        let other = temp_file("other", "png");
         fs::write(&photo, b"a").expect("write photo");
-        fs::write(&other, b"b").expect("write text");
+        fs::write(&other, b"b").expect("write other media");
 
         let result = wipe_files(&[verified(&photo), verified(&other)]);
         // trash::delete moves the file to the OS Trash: it leaves the origin
         // path (counted as deleted) but, unlike a hard delete, stays recoverable.
 
-        assert_eq!(result.deleted, 1);
+        assert_eq!(result.deleted, 2);
         assert!(
             result.failed_paths.is_empty(),
-            "successful and skipped files must not enter the failed retry set"
+            "successful files must not enter the failed retry set"
         );
         assert!(!photo.exists());
-        assert!(other.exists());
-
-        let _ = fs::remove_file(other);
+        assert!(!other.exists());
     }
 
     #[test]
@@ -456,14 +439,15 @@ mod tests {
     }
 
     #[test]
-    fn skips_non_media_file_extensions() {
-        let text = temp_file("notes", "txt");
-        fs::write(&text, b"x").expect("write text");
-        let result = wipe_files(&[verified(&text)]);
-        assert_eq!(result.deleted, 0);
-        assert_eq!(result.skipped, 1);
-        assert!(text.exists());
-        let _ = fs::remove_file(text);
+    fn deletes_server_confirmed_file_with_unlisted_extension() {
+        let media = temp_file("transport-stream", "mts");
+        fs::write(&media, b"video").expect("write media");
+
+        let result = wipe_files(&[verified(&media)]);
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.skipped, 0);
+        assert!(!media.exists());
     }
 
     /// The core verify-before-wipe invariant: a file rewritten between the
