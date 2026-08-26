@@ -35,8 +35,10 @@ pub fn read_recent(file_name: &str, max_lines: usize) -> Result<String, String> 
     if !path.exists() {
         return Ok(String::new());
     }
-    let content = fs::read_to_string(&path).map_err(|e| format!("Could not read log file: {e}"))?;
-    Ok(tail_lines(&content, max_lines))
+    // Lossy on purpose: a single mangled byte in a log line must not hide the
+    // whole log from the viewer.
+    let content = fs::read(&path).map_err(|e| format!("Could not read log file: {e}"))?;
+    Ok(tail_lines(&String::from_utf8_lossy(&content), max_lines))
 }
 
 pub fn append_log(file_name: &str, line: &str) -> Result<(), String> {
@@ -55,7 +57,9 @@ pub fn append_log(file_name: &str, line: &str) -> Result<(), String> {
     // so cap its unbounded growth here: once it crosses a size threshold, trim
     // it to the newest APP_LOG_KEEP_LINES. The metadata stat runs on every
     // append (cheap); the rewrite is rare and preserves recent history, which is
-    // all `read_recent` (last 500 lines) ever needs.
+    // all `read_recent` (last 500 lines) ever needs. A trim error here is an I/O
+    // failure on the log volume itself, which no log line could report, so the
+    // line that was already written stands and the next append retries.
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > APP_LOG_MAX_BYTES {
         let _ = trim_to_trailing_lines(&path, APP_LOG_KEEP_LINES);
     }
@@ -67,13 +71,37 @@ const APP_LOG_MAX_BYTES: u64 = 1_000_000;
 /// Number of most-recent lines retained when a durable log is trimmed.
 const APP_LOG_KEEP_LINES: usize = 5_000;
 
+/// The last `keep` lines of `content`, as raw bytes.
+///
+/// Byte-oriented on purpose: one non-UTF-8 byte in the log - a mangled path, a
+/// truncated write - must not make the file untrimmable, because the trim is the
+/// only thing bounding its growth.
+fn tail_bytes(content: &[u8], keep: usize) -> &[u8] {
+    // A trailing newline terminates the last line rather than starting another.
+    let end = content.strip_suffix(b"\n").unwrap_or(content).len();
+    let mut seen = 0;
+    for (index, byte) in content[..end].iter().enumerate().rev() {
+        if *byte != b'\n' {
+            continue;
+        }
+        seen += 1;
+        if seen == keep {
+            return &content[index + 1..];
+        }
+    }
+    content
+}
+
 /// Rewrite `path` in place keeping only its last `keep` lines.
 fn trim_to_trailing_lines(path: &std::path::Path, keep: usize) -> Result<(), String> {
-    let content = fs::read_to_string(path).map_err(|e| format!("Could not read log file: {e}"))?;
-    let trimmed = tail_lines(&content, keep);
+    let content = fs::read(path).map_err(|e| format!("Could not read log file: {e}"))?;
+    let mut trimmed = tail_bytes(&content, keep).to_vec();
+    if !trimmed.ends_with(b"\n") {
+        trimmed.push(b'\n');
+    }
     // Preserve owner-only perms established on the logs dir; a plain write keeps
     // the existing file mode.
-    fs::write(path, format!("{trimmed}\n")).map_err(|e| format!("Could not trim log file: {e}"))
+    fs::write(path, trimmed).map_err(|e| format!("Could not trim log file: {e}"))
 }
 
 pub fn rotate_recent_logs(max_files: usize) -> Result<(), String> {
@@ -132,6 +160,41 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 100);
+        assert_eq!(lines.first().copied(), Some("line 900"));
+        assert_eq!(lines.last().copied(), Some("line 999"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mangled_byte_does_not_make_the_log_untrimmable() {
+        // The trim is the only bound on app.log's growth, and it used to require
+        // the whole file to be valid UTF-8. One bad byte - a mangled path from a
+        // removable card, a torn write - would then fail every later trim, so the
+        // log grew without limit while each append re-read all of it.
+        let dir = std::env::temp_dir().join(format!("logs-invalid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.log");
+        let mut raw = Vec::new();
+        for i in 0..500 {
+            raw.extend_from_slice(format!("line {i}\n").as_bytes());
+        }
+        raw.extend_from_slice(b"copy failed: /Volumes/CARD/\xFF\xFE.jpg\n");
+        for i in 500..1_000 {
+            raw.extend_from_slice(format!("line {i}\n").as_bytes());
+        }
+        std::fs::write(&path, &raw).unwrap();
+        assert!(
+            std::fs::read_to_string(&path).is_err(),
+            "fixture must not be valid UTF-8"
+        );
+
+        trim_to_trailing_lines(&path, 100).unwrap();
+
+        let content = std::fs::read(&path).unwrap();
+        let text = String::from_utf8_lossy(&content);
+        let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 100);
         assert_eq!(lines.first().copied(), Some("line 900"));
         assert_eq!(lines.last().copied(), Some("line 999"));

@@ -21,6 +21,8 @@
 
 ### UI
 - **Repeated queue-poll failures no longer create an unlimited stack of identical error messages.** One message stands for an ongoing outage, and it is retired as soon as a poll succeeds, so a later outage is reported rather than hidden behind the message from the last one.
+- **Live import progress recovers from a failed event-listener registration.** One failed registration used to stop live per-file progress for the rest of the session; the two-second refresh kept the cards moving, but nothing in between. The next poll cycle now retries.
+- **A dismissed card can no longer flicker back into the queue.** A refresh that began while the dismiss was still in flight could commit the list it read beforehand, briefly restoring the card. "Clear finished" had the same window.
 - **The "Check server" button can no longer stay stuck on "Checking…".** Changing an import input while a forecast was in flight left the button disabled for the rest of the session; a superseded forecast now releases it.
 - **Keychain failures include platform-specific recovery guidance.** macOS, Windows, and Linux messages retain the underlying backend error for diagnosis.
 - **A history entry with an outcome this build does not recognise is no longer labelled "Cancelled".** It is shown as an unknown outcome instead, one unreadable entry can no longer prevent the rest of the history from loading, and the entry keeps its own outcome: a later import no longer rewrites it as "unknown", which would have made a newer build's record unrecoverable.
@@ -32,6 +34,7 @@
 - **Scan and history outcomes are typed rather than free strings.** The two status fields that the frontend declares as fixed sets are now Rust enums whose wire values are pinned by tests, so a new outcome cannot type-check its way into a mislabelled row.
 - **The error texts the app branches on are defined once.** App quit, album retry, and the missing-key prompt read those decisions from backend error text; each string now has a single definition, pinned by a test, and the retry decision no longer pattern-matches the HTTP client's own wording, which any dependency bump could reword. A failed request also carries the backend's own message separately from the displayed text, and each decision is anchored to the start of it, so a server's response body cannot impersonate one of these markers and choose the app's behaviour.
 - **A failed thumbnail is diagnosable.** One summary line per batch records how many tiles were unsupported against how many genuinely failed, with a representative reason, so a missing thumbnail can be told apart from an unwritable cache directory or a corrupt file. A batch of merely unsupported formats stays silent.
+- **The app log cannot outgrow its 1 MB budget.** Trimming required the whole log to be valid UTF-8, so one mangled byte - a garbled path from a removable card, a torn write - disabled every later trim, leaving the log to grow while each new line re-read all of it. Trimming is byte-based now, and the log viewer no longer refuses to show a log containing one bad byte.
 
 ## v0.7.1 - 2026-08-23
 

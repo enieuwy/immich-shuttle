@@ -241,6 +241,18 @@ async function refreshJobs() {
   }
 }
 
+// Applies a queue mutation whose returned list replaces the poll's view.
+// Polls are invalidated on both sides of the request: one begun before it holds
+// a pre-mutation snapshot, and one begun during it can still read the backend
+// list before the mutation lands and resolve afterwards. Either would resurrect
+// the removed cards and re-fire their terminal notifications.
+async function replaceJobs(mutate: () => Promise<ImportJob[]>) {
+  refreshes.invalidate();
+  const jobs = await mutate();
+  refreshes.invalidate();
+  state.update((s) => ({ ...s, jobs }));
+}
+
 export const queueState = {
   subscribe: state.subscribe,
   // Shutdown snapshots this set before its confirmation prompt; return a copy
@@ -282,17 +294,26 @@ export const queueState = {
           return { ...s, jobs, rates, currentFiles };
         });
       });
-      void progressPending.then((unlisten) => {
-        progressPending = null;
-        // If polling was stopped while this registration was in flight, tear the
-        // listener down immediately rather than leaking it; otherwise retain the
-        // handle so stopPolling can unlisten later.
-        if (pollTimer) {
-          progressUnlisten = unlisten;
-        } else {
-          unlisten();
-        }
-      });
+      void progressPending.then(
+        (unlisten) => {
+          progressPending = null;
+          // If polling was stopped while this registration was in flight, tear the
+          // listener down immediately rather than leaking it; otherwise retain the
+          // handle so stopPolling can unlisten later.
+          if (pollTimer) {
+            progressUnlisten = unlisten;
+          } else {
+            unlisten();
+          }
+        },
+        () => {
+          // A failed registration must release the slot. Leaving the rejected
+          // promise in it refuses every later attempt, so live progress would
+          // stay dead for the rest of the session. Polling still refreshes the
+          // cards every two seconds; the next startPolling retries the listener.
+          progressPending = null;
+        },
+      );
     }
     pollTimer = setInterval(() => {
       void refreshJobs();
@@ -456,21 +477,14 @@ export const queueState = {
   },
   async dismiss(jobId: string) {
     try {
-      // Invalidate a poll that began before dismiss: if it resolves afterwards, it
-      // resurrects the removed cards and re-fires terminal notifications. See
-      // history.ts clearHistory for the same pattern.
-      refreshes.invalidate();
-      const jobs = await importDismiss(jobId);
-      state.update((s) => ({ ...s, jobs }));
+      await replaceJobs(() => importDismiss(jobId));
     } catch {
       errorsState.addError("Could not dismiss job.");
     }
   },
   async clearFinished() {
     try {
-      refreshes.invalidate();
-      const jobs = await importClearFinished();
-      state.update((s) => ({ ...s, jobs }));
+      await replaceJobs(() => importClearFinished());
     } catch {
       errorsState.addError("Could not clear finished jobs.");
     }

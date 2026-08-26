@@ -420,6 +420,27 @@ describe("queueState", () => {
     expect(unlisten).toHaveBeenCalledTimes(1);
   });
 
+  it("retries the progress listener after a failed registration", async () => {
+    // A rejected registration used to stay in the pending slot forever, so every
+    // later attempt was refused and live progress was dead for the session.
+    listenMock
+      .mockRejectedValueOnce(new Error("event channel unavailable"))
+      .mockResolvedValueOnce(vi.fn());
+
+    queueState.startPolling();
+    await Promise.resolve();
+    await Promise.resolve();
+    queueState.stopPolling();
+
+    const attemptsBefore = listenMock.mock.calls.length;
+    queueState.startPolling();
+    await Promise.resolve();
+    queueState.stopPolling();
+    await Promise.resolve();
+
+    expect(listenMock.mock.calls.length).toBe(attemptsBefore + 1);
+  });
+
   it("out-of-order refresh: a newer poll snapshot wins over a stale, later-resolving older poll", async () => {
     const older = Promise.withResolvers<ImportJob[]>();
     const newer = Promise.withResolvers<ImportJob[]>();
@@ -512,6 +533,39 @@ describe("queueState", () => {
     await refresh;
 
     expect(get(queueState).jobs.some((job) => job.id === cleared.id)).toBe(false);
+  });
+
+  it("a poll begun during a dismiss cannot resurrect the dismissed job", async () => {
+    // The invalidate before the request cannot reach a poll that starts while it
+    // is in flight: that poll is current, and it can read the backend list before
+    // the dismiss lands and commit it afterwards.
+    const dismissed: ImportJob = {
+      id: "job-dismiss-midflight",
+      status: "completed",
+      progress: { total: 4, uploaded: 4, duplicates: 0, errors: 0 },
+      error: null,
+      summary: "Imported 4 items.",
+      awaiting_wipe_confirmation: false,
+      pending_wipe_count: 0,
+      file_errors: [],
+      profile_id: "p1",
+    };
+    const poll = Promise.withResolvers<ImportJob[]>();
+    const dismiss = Promise.withResolvers<ImportJob[]>();
+    vi.mocked(api.importListJobs).mockReturnValueOnce(poll.promise);
+    vi.mocked(api.importDismiss).mockReturnValueOnce(dismiss.promise);
+
+    const pendingDismiss = queueState.dismiss(dismissed.id);
+    // Begins after dismiss's invalidate, while importDismiss is still in flight,
+    // so it holds a backend list from before the dismiss landed.
+    const refresh = queueState.loadJobs();
+    dismiss.resolve([]);
+    await pendingDismiss;
+    // The stale snapshot arrives only now, after the queue was emptied.
+    poll.resolve([dismissed]);
+    await refresh;
+
+    expect(get(queueState).jobs.some((job) => job.id === dismissed.id)).toBe(false);
   });
 
   it("bumps the source checkpoint version only on a completed transition", async () => {
