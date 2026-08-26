@@ -1,9 +1,12 @@
 use std::{
     collections::HashSet,
-    fs,
+    fmt, fs,
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Instant,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Condvar, LazyLock, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 use walkdir::WalkDir;
@@ -11,6 +14,99 @@ use walkdir::WalkDir;
 use crate::models::media::MediaFile;
 #[cfg(test)]
 use crate::models::media::ScanResult;
+
+/// How long a claim waits for the previous walk of the same root to return.
+///
+/// A cancelled walk on a responsive source exits at its next [`WalkDir`] entry,
+/// so the wait normally ends at once. Only a source whose filesystem call is
+/// genuinely blocked holds the claim for the whole grace period.
+pub(crate) const CLAIM_GRACE: Duration = Duration::from_secs(5);
+
+/// Source roots whose blocking walks have not returned yet.
+///
+/// A cancelled `spawn_blocking` task keeps running when its filesystem call
+/// blocks. This registry limits a hung source to one leaked walking thread.
+static IN_FLIGHT_SCAN_ROOTS: LazyLock<(Mutex<HashSet<String>>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(HashSet::new()), Condvar::new()));
+
+/// Which walk owns a claim. The grid scan and the preflight forecast walk the
+/// same roots for different answers and legitimately run at the same time, so
+/// they claim in separate namespaces and never block each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanPurpose {
+    Scan,
+    Forecast,
+}
+
+impl fmt::Display for ScanPurpose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScanPurpose::Scan => f.write_str("scan"),
+            ScanPurpose::Forecast => f.write_str("forecast"),
+        }
+    }
+}
+
+fn claim_keys(purpose: ScanPurpose, roots: &[String]) -> Vec<String> {
+    roots
+        .iter()
+        .map(|root| format!("{purpose}:{root}"))
+        .collect()
+}
+
+/// Owns source-root entries until the blocking walk returns.
+///
+/// The guard must move into the walking task. Dropping the caller's join handle
+/// cannot stop a running `WalkDir` call, so cleanup there would admit duplicates.
+#[derive(Debug)]
+pub(crate) struct InFlightScanRoots {
+    keys: Vec<String>,
+}
+
+impl Drop for InFlightScanRoots {
+    fn drop(&mut self) {
+        let (lock, released) = &*IN_FLIGHT_SCAN_ROOTS;
+        let mut roots = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in &self.keys {
+            roots.remove(key);
+        }
+        drop(roots);
+        // Wake every caller waiting to re-claim one of these roots.
+        released.notify_all();
+    }
+}
+
+/// Claims every collapsed root for one blocking walk of `purpose`.
+///
+/// Waits up to [`CLAIM_GRACE`] for a previous walk of the same root to return,
+/// because the caller normally cancels that walk immediately before claiming and
+/// a responsive source releases it within one entry. After the grace the claim
+/// fails fast and names the source that has not returned: an empty result would
+/// incorrectly tell the caller that the source holds no media.
+pub(crate) fn acquire_scan_roots(
+    purpose: ScanPurpose,
+    roots: &[String],
+) -> Result<InFlightScanRoots, String> {
+    let keys = claim_keys(purpose, roots);
+    let (lock, released) = &*IN_FLIGHT_SCAN_ROOTS;
+    let mut in_flight = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let deadline = Instant::now() + CLAIM_GRACE;
+    while let Some(taken) = keys.iter().position(|key| in_flight.contains(key)) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "Source is still being scanned and is not responding: {}",
+                roots[taken]
+            ));
+        }
+        let (guard, _) = released
+            .wait_timeout(in_flight, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        in_flight = guard;
+    }
+    in_flight.extend(keys.iter().cloned());
+    Ok(InFlightScanRoots { keys })
+}
 
 /// The reason a directory scan stopped before producing a complete result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +419,68 @@ mod tests {
         fs::remove_dir_all(&tmp).unwrap();
     }
 
+    #[test]
+    fn a_hung_walk_fails_a_second_claim_after_the_grace_period() {
+        use std::{sync::mpsc, thread};
+
+        let root = format!("/unresponsive-source-{}", Uuid::new_v4());
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+        let guard = acquire_scan_roots(ScanPurpose::Scan, std::slice::from_ref(&root))
+            .expect("first walk claims root");
+        let worker = thread::spawn(move || {
+            let _guard = guard;
+            release_receiver.recv().expect("test releases blocked walk");
+        });
+
+        let started = Instant::now();
+        let second = acquire_scan_roots(ScanPurpose::Scan, std::slice::from_ref(&root))
+            .expect_err("a walk that never returns must fail the next claim");
+        assert!(second.contains(&root));
+        // The claim waited rather than failing on contact, so a walk that is
+        // merely finishing is not reported as unresponsive.
+        assert!(started.elapsed() >= CLAIM_GRACE);
+
+        release_sender.send(()).expect("blocked walk is released");
+        worker.join().expect("walking task exits");
+        drop(
+            acquire_scan_roots(ScanPurpose::Scan, std::slice::from_ref(&root))
+                .expect("the guard clears on the walking task"),
+        );
+    }
+
+    #[test]
+    fn a_released_walk_admits_the_next_claim_without_waiting_out_the_grace() {
+        use std::{thread, time::Duration};
+
+        let root = format!("/slow-but-alive-{}", Uuid::new_v4());
+        let guard = acquire_scan_roots(ScanPurpose::Scan, std::slice::from_ref(&root))
+            .expect("first walk claims root");
+        // Models the real sequence: the caller cancels the previous walk, which
+        // then returns at its next entry while the new claim is already waiting.
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            drop(guard);
+        });
+
+        let started = Instant::now();
+        let second = acquire_scan_roots(ScanPurpose::Scan, std::slice::from_ref(&root))
+            .expect("a walk that returns must not fail the next claim");
+        assert!(started.elapsed() < CLAIM_GRACE);
+        drop(second);
+    }
+
+    #[test]
+    fn a_forecast_and_a_scan_claim_the_same_root_together() {
+        let root = format!("/shared-source-{}", Uuid::new_v4());
+        // The grid scan and the preflight forecast walk the same source for
+        // different answers; neither may report the other as unresponsive.
+        let scan = acquire_scan_roots(ScanPurpose::Scan, std::slice::from_ref(&root))
+            .expect("the scan claims the root");
+        let forecast = acquire_scan_roots(ScanPurpose::Forecast, std::slice::from_ref(&root))
+            .expect("the forecast claims the same root in its own namespace");
+        drop((scan, forecast));
+    }
+
     #[cfg(unix)]
     #[test]
     fn skips_symlinks_pointing_outside_the_tree() {
@@ -397,6 +555,26 @@ mod tests {
         assert_eq!(result.photo_count, 0);
         assert!(result.files[0].is_video);
 
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+    #[test]
+    fn streaming_scan_honors_cancellation_between_entries() {
+        let tmp = std::env::temp_dir().join(format!("scan-cancel-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        for index in 0..=STREAM_BATCH_SIZE {
+            fs::write(tmp.join(format!("{index}.jpg")), b"photo").unwrap();
+        }
+
+        let cancellation = AtomicBool::new(false);
+        let mut batches = 0;
+        let result = scan_directory_streaming(&tmp, Some(&cancellation), None, &mut |batch| {
+            batches += 1;
+            assert_eq!(batch.len(), STREAM_BATCH_SIZE);
+            cancellation.store(true, Ordering::Relaxed);
+        });
+
+        assert!(matches!(result, Err(ScanError::Cancelled)));
+        assert_eq!(batches, 1);
         fs::remove_dir_all(&tmp).unwrap();
     }
 

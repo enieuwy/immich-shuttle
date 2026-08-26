@@ -33,7 +33,9 @@ vi.mock("$lib/api", () => ({
 import * as api from "$lib/api";
 import { autoImportState } from "./auto-import";
 import { deviceRulesState } from "./device-rules";
+import { errorsState } from "./errors";
 import { profilesState } from "./profiles";
+import { queueState } from "./queue";
 import { sourceState } from "./source";
 import type { RemovableDevice } from "$lib/types";
 
@@ -152,6 +154,30 @@ describe("autoImportState", () => {
       keep_files: true,
     });
     expect(get(autoImportState).candidate).toBeNull();
+  });
+
+  it("accept restores the candidate and raises a toast when starting fails", async () => {
+    const rule = {
+      profileId: "p1",
+      albumName: null,
+      keepFiles: true,
+      stackRawJpeg: true,
+      stackBurst: false,
+      organization: "single_album" as const,
+    };
+    deviceRulesState.saveRule(card, rule);
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+    vi.spyOn(queueState, "startImport").mockRejectedValueOnce(new Error("start failed"));
+
+    await autoImportState.accept();
+
+    expect(get(autoImportState).candidate).toEqual(card);
+    expect(get(autoImportState).candidateRule).toEqual(rule);
+    expect(get(errorsState)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ message: "start failed" })]),
+    );
   });
 
   it("dismiss suppresses re-prompt until the card is re-inserted", () => {

@@ -81,6 +81,26 @@ fn mark_worker_panic(job_id: &str) {
 
 static IMPORT_START_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static ACTIVE_SCAN: LazyLock<Mutex<Option<Arc<AtomicBool>>>> = LazyLock::new(|| Mutex::new(None));
+static ACTIVE_FORECAST: LazyLock<Mutex<Option<Arc<AtomicBool>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Clears the active forecast only when this forecast still owns the slot.
+struct ActiveForecastGuard {
+    cancellation: Arc<AtomicBool>,
+}
+
+impl Drop for ActiveForecastGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = ACTIVE_FORECAST.lock() {
+            if active
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.cancellation))
+            {
+                active.take();
+            }
+        }
+    }
+}
 
 struct PendingWipe {
     paths: Vec<String>,
@@ -1185,6 +1205,20 @@ pub async fn import_forecast(
     include_extensions: Vec<String>,
     exclude_extensions: Vec<String>,
 ) -> Result<wipe::ForecastResult, String> {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let previous = {
+        let mut active = ACTIVE_FORECAST
+            .lock()
+            .map_err(|_| "Could not lock active forecast state".to_string())?;
+        active.replace(cancellation.clone())
+    };
+    if let Some(previous) = previous {
+        previous.store(true, Ordering::Relaxed);
+    }
+    let _forecast_guard = ActiveForecastGuard {
+        cancellation: cancellation.clone(),
+    };
+
     // Same path scope the preview commands enforce. This command opens and
     // SHA-1s every path the renderer names, then sends those hashes and the
     // absolute paths to the configured server. The approved-root set is
@@ -1248,7 +1282,14 @@ pub async fn import_forecast(
         }
         None => {
             let paths = collapse_overlapping_roots(source_paths);
+            let scan_roots =
+                media_scanner::acquire_scan_roots(media_scanner::ScanPurpose::Forecast, &paths)?;
+            let scan_cancellation = cancellation.clone();
             tauri::async_runtime::spawn_blocking(move || {
+                // This guard must drop on the walking task. Abandoning a blocked
+                // `WalkDir` call is inherent, so one hung source can leak one
+                // blocking-pool thread but cannot stack a thread per forecast.
+                let _scan_roots = scan_roots;
                 let deadline = Instant::now() + SCAN_DEADLINE;
                 let mut files: Vec<String> = Vec::new();
                 let mut seen = 0usize;
@@ -1259,7 +1300,7 @@ pub async fn import_forecast(
                     // partial (often empty) set as if it were complete.
                     let scan_skipped = media_scanner::scan_directory_streaming(
                         &source_path,
-                        None,
+                        Some(scan_cancellation.as_ref()),
                         Some(deadline),
                         &mut |batch| {
                             for file in batch {
@@ -1284,7 +1325,13 @@ pub async fn import_forecast(
         }
     };
 
-    let mut result = wipe::forecast_upload(&server_url, &api_key, &candidates).await?;
+    let mut result = wipe::forecast_upload(
+        &server_url,
+        &api_key,
+        &candidates,
+        Some(cancellation.clone()),
+    )
+    .await?;
     result.truncated = result.truncated || truncated;
     result.unreadable += skipped_unreadable;
     Ok(result)
@@ -1491,6 +1538,7 @@ pub async fn scan_sources_stream(
     // it atomically so a concurrent path-scoped read never observes an empty
     // scope between clearing and recording the selected roots.
     crate::services::source_guard::replace_roots(&paths);
+    let paths = collapse_overlapping_roots(paths);
 
     let cancellation = Arc::new(AtomicBool::new(false));
     let previous = {
@@ -1499,9 +1547,12 @@ pub async fn scan_sources_stream(
             .map_err(|_| "Could not lock active scan state".to_string())?;
         active.replace(cancellation.clone())
     };
+    // Stop the previous walk BEFORE claiming its roots. The claim waits for that
+    // walk to return, and a walk that has not been told to stop never will.
     if let Some(previous) = previous {
         previous.store(true, Ordering::Relaxed);
     }
+    let scan_roots = media_scanner::acquire_scan_roots(media_scanner::ScanPurpose::Scan, &paths)?;
 
     let deadline = Instant::now() + SCAN_DEADLINE;
     let scan_cancellation = cancellation.clone();
@@ -1514,7 +1565,10 @@ pub async fn scan_sources_stream(
     }));
     let scan_progress = progress.clone();
     let mut scan_task = tauri::async_runtime::spawn_blocking(move || {
-        let paths = collapse_overlapping_roots(paths);
+        // This guard must drop on the walking task. Abandoning a blocked
+        // `WalkDir` call is inherent, so one hung source can leak one
+        // blocking-pool thread but cannot stack a thread per scan.
+        let _scan_roots = scan_roots;
         let mut seen_file_paths = HashSet::new();
 
         for path in paths {
@@ -1648,11 +1702,21 @@ pub async fn scan_sources_stream(
 
 #[tauri::command]
 pub async fn scan_cancel() -> Result<(), String> {
-    let active = ACTIVE_SCAN
-        .lock()
-        .map_err(|_| "Could not lock active scan state".to_string())?;
-    if let Some(cancellation) = active.as_ref() {
-        cancellation.store(true, Ordering::Relaxed);
+    {
+        let active = ACTIVE_SCAN
+            .lock()
+            .map_err(|_| "Could not lock active scan state".to_string())?;
+        if let Some(cancellation) = active.as_ref() {
+            cancellation.store(true, Ordering::Relaxed);
+        }
+    }
+    {
+        let active = ACTIVE_FORECAST
+            .lock()
+            .map_err(|_| "Could not lock active forecast state".to_string())?;
+        if let Some(cancellation) = active.as_ref() {
+            cancellation.store(true, Ordering::Relaxed);
+        }
     }
     Ok(())
 }

@@ -63,15 +63,8 @@ impl StderrBuffer {
         self.lines.push_back(line);
     }
 
-    /// Render the retained diagnostics for appending to a runner error.
-    fn render_suffix(&self) -> String {
-        self.lines
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
+    /// The retained lines, newest last. The import command shows the last few
+    /// of these in the job's failure message, so they must stay separate lines.
     fn into_vec(self) -> Vec<String> {
         self.lines.into_iter().collect()
     }
@@ -272,7 +265,11 @@ fn emit_progress(
 
 /// Stop a sidecar and wait for the plugin's background waiter to confirm that
 /// it reaped the process. `CommandChild` exposes no `wait`; its `Terminated`
-/// event is the lifecycle acknowledgement.
+/// event is the lifecycle acknowledgement. If the event channel closes, the
+/// plugin API provides no way to positively confirm termination.
+///
+/// The timeout and event-error paths remain distinct because they provide
+/// different evidence about the sidecar lifecycle.
 async fn kill_and_reap(
     child: &mut Option<CommandChild>,
     rx: &mut Receiver<CommandEvent>,
@@ -296,7 +293,10 @@ async fn kill_and_reap(
 
         Err(match event_error {
             Some(error) => format!("sidecar failed while waiting to terminate: {error}"),
-            None => "sidecar event channel closed before termination was reported".to_string(),
+            None => {
+                "sidecar kill issued, but termination could not be confirmed because the event channel closed"
+                    .to_string()
+            }
         })
     })
     .await
@@ -464,16 +464,16 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
             maybe_event = rx.recv() => {
                 match maybe_event {
                     None => {
+                        // A closed channel gives no exit code, so let the completed
+                        // run log decide the verdict rather than failing a run whose
+                        // upload may have finished. The reap diagnostic is recorded
+                        // as a stderr line so it reaches the failure message and the
+                        // run log through the same path as immich-go's own output.
                         let reap_error = kill_and_reap(&mut child, &mut rx).await.err();
-                        let detail = reap_error
-                            .unwrap_or_else(|| "sidecar stopped without a termination event".to_string());
-                        let stderr_suffix = error_lines.render_suffix();
-                        let detail = if stderr_suffix.is_empty() {
-                            detail
-                        } else {
-                            format!("{detail}; recent stderr:\n{stderr_suffix}")
-                        };
-                        return Err(format!("immich-go event channel closed unexpectedly: {detail}"));
+                        error_lines.push(&reap_error.unwrap_or_else(|| {
+                            "sidecar stopped without a termination event".to_string()
+                        }));
+                        break false;
                     }
 
                     Some(CommandEvent::Stderr(line_bytes)) => {
@@ -656,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn stderr_buffer_keeps_recent_bounded_lines_and_renders_error_suffix() {
+    fn stderr_buffer_keeps_recent_bounded_lines_as_separate_entries() {
         let mut buffer = StderrBuffer::new();
         for index in 0..=MAX_STDERR_LINES {
             buffer.push(&format!("line-{index}"));
@@ -665,18 +665,23 @@ mod tests {
         let long_line = "x".repeat(MAX_STDERR_LINE_CHARS + 1);
         buffer.push(&long_line);
 
-        let rendered = buffer.render_suffix();
-        let expected_lines = (2..=MAX_STDERR_LINES)
+        let lines = buffer.into_vec();
+        // Separate entries, because the import command renders only the last few
+        // of them into the job's failure message. Collapsing them into one entry
+        // would put the whole bounded buffer in front of the user.
+        let expected = (2..=MAX_STDERR_LINES)
             .map(|index| format!("line-{index}"))
             .chain(std::iter::once("x".repeat(MAX_STDERR_LINE_CHARS)))
             .collect::<Vec<_>>();
-        assert_eq!(rendered, expected_lines.join("\n"));
-        assert!(!rendered.contains("line-0"));
-        assert!(!rendered.ends_with(&long_line));
-
-        let error = format!(
-            "immich-go event channel closed unexpectedly: sidecar stopped; recent stderr:\n{rendered}"
-        );
-        assert!(error.ends_with(&format!("recent stderr:\n{rendered}")));
+        assert_eq!(lines, expected);
+        assert_eq!(lines.len(), MAX_STDERR_LINES);
+        assert!(!lines.iter().any(|line| line == "line-0"));
+        assert!(!lines.iter().any(|line| line == &long_line));
     }
+
+    // The closed-channel arm of `run_upload` is not unit-testable: it needs a
+    // plugin-spawned `CommandChild` and an `AppHandle`, and `CommandChild`
+    // exposes no constructor. Its behaviour (fall through to log classification,
+    // record the reap diagnostic as a stderr line) is covered by the Playwright
+    // scenarios that drive a real run, not by a fabricated `SidecarResult`.
 }

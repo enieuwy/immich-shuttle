@@ -43,6 +43,8 @@
     forecastToken++;
     forecast = null;
     forecastError = "";
+    // A superseded request must release the button because its own finally no longer matches the token.
+    forecasting = false;
   });
 
   async function checkServer() {

@@ -143,10 +143,20 @@ function handle(cmd: string, args: InvokeArgs): unknown {
       return undefined;
     case "history_source_last_import":
       return scenario === "onboarding" || scenario === "empty" ? null : fixtures.lastImportMs;
-    case "import_forecast":
-      return scenario === "onboarding" || scenario === "empty"
-        ? { new: 0, already_present: 0, unreadable: 0, truncated: false }
-        : { new: 128, already_present: 342, unreadable: 1, truncated: false };
+    case "import_forecast": {
+      const result =
+        scenario === "onboarding" || scenario === "empty"
+          ? { new: 0, already_present: 0, unreadable: 0, truncated: false }
+          : { new: 128, already_present: 342, unreadable: 1, truncated: false };
+      const slowForecast = Number(
+        new URLSearchParams(window.location.search).get("slowForecast"),
+      );
+      if (!Number.isFinite(slowForecast) || slowForecast <= 0) return result;
+      return (async () => {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, slowForecast));
+        return result;
+      })();
+    }
     case "discover_immich_servers":
       return scenario === "onboarding" ? ["http://192.168.1.10:2283"] : [];
     case "get_recent_logs":

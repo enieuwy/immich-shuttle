@@ -165,6 +165,76 @@ describe("replayImport", () => {
     expect(errors.some((e) => /album/i.test(e.message))).toBe(true);
   });
 
+  it("falls back to the recorded album name when the recorded id no longer resolves", async () => {
+    await saveProfile("p1", "https://one.example.com");
+
+    // The album was deleted and recreated, so its id changed. immich-go targets
+    // albums by name, so the destination the user chose still exists.
+    vi.mocked(api.albumsList).mockResolvedValueOnce([
+      { id: "recreated-album", album_name: "Current", shared_with: [] },
+    ]);
+
+    const record = importRecord("stale-id-record", {
+      album_ids: ["deleted-album"],
+      into_album: "Current",
+    });
+    const errorCountBefore = get(errorsState).length;
+
+    expect(await replayImport(record)).toBe("staged");
+    expect(get(albumsState).selectedAlbumIds).toEqual(["recreated-album"]);
+    expect(get(errorsState).slice(errorCountBefore)).toHaveLength(0);
+  });
+
+  it("reports an unresolvable recorded album instead of staging into the library", async () => {
+    await saveProfile("p1", "https://one.example.com");
+
+    vi.mocked(api.albumsList).mockResolvedValueOnce([
+      { id: "unrelated-album", album_name: "Unrelated", shared_with: [] },
+    ]);
+
+    const record = importRecord("gone-album-record", {
+      album_ids: ["deleted-album"],
+      into_album: "Holiday",
+    });
+    const errorCountBefore = get(errorsState).length;
+
+    expect(await replayImport(record)).toBe("staged");
+    // No selection: startImport would turn the stale id into `into_album: null`
+    // and upload into the library without telling the user.
+    expect(get(albumsState).selectedAlbumIds).toEqual([]);
+    const addedErrors = get(errorsState).slice(errorCountBefore);
+    expect(addedErrors).toHaveLength(1);
+    expect(addedErrors[0]?.message).toMatch(/couldn't restore.*"Holiday".*no longer exists/i);
+  });
+
+  it("restores a resolvable album id and an album matched by name", async () => {
+    await saveProfile("p1", "https://one.example.com");
+
+    vi.mocked(api.albumsList)
+      .mockResolvedValueOnce([{ id: "recorded-album", album_name: "Recorded", shared_with: [] }])
+      .mockResolvedValueOnce([{ id: "named-album", album_name: "Named", shared_with: [] }]);
+
+    expect(
+      await replayImport(
+        importRecord("resolvable-album-record", {
+          album_ids: ["recorded-album"],
+          into_album: "Named",
+        }),
+      ),
+    ).toBe("staged");
+    expect(get(albumsState).selectedAlbumIds).toEqual(["recorded-album"]);
+
+    expect(
+      await replayImport(
+        importRecord("named-album-record", {
+          album_ids: [],
+          into_album: "Named",
+        }),
+      ),
+    ).toBe("staged");
+    expect(get(albumsState).selectedAlbumIds).toEqual(["named-album"]);
+  });
+
   it("abandons the album selection if the active profile changes while albums are loading", async () => {
     await saveProfile("p1", "https://one.example.com");
     await saveProfile("p2", "https://two.example.com");

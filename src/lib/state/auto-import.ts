@@ -38,6 +38,8 @@ const state = writable<AutoImportState>({
 const seenMounts = new Set<string>();
 // Mounts the user explicitly declined; suppressed until the card is removed.
 const dismissedMounts = new Set<string>();
+// Changes whenever another action can invalidate an in-flight candidate prompt.
+let candidateRevision = 0;
 // The first device snapshot is the startup baseline — never prompt for cards
 // that were already plugged in when the app launched.
 let baselineSeeded = false;
@@ -64,6 +66,7 @@ export const autoImportState = {
     } catch {
       // Best-effort persistence; behavior still applies for the session.
     }
+    candidateRevision += 1;
     state.update((s) => ({
       ...s,
       enabled,
@@ -116,11 +119,12 @@ export const autoImportState = {
       // Only the card we actually surface is marked seen; sibling cards inserted
       // in the same batch stay unseen and prompt on a later poll.
       seenMounts.add(fresh.mount_path);
+      candidateRevision += 1;
       const rule = deviceRulesState.getRule(fresh);
       state.update((s) => ({ ...s, candidate: fresh, candidateRule: rule }));
     }
-  },
 
+  },
   /**
    * Start an import from the candidate card. When the card has a saved rule the
    * import replays it (profile / album / wipe policy / options); otherwise it
@@ -131,6 +135,7 @@ export const autoImportState = {
     if (!device) {
       return;
     }
+    const revision = candidateRevision;
     state.update((s) => ({ ...s, candidate: null, candidateRule: null }));
     try {
       // Reflect the selection in the source picker so progress is visible there.
@@ -150,6 +155,15 @@ export const autoImportState = {
           : { sourcePaths: [device.mount_path], keepFiles: true, albumIds: [] },
       );
     } catch (error) {
+      // Restore the prompt so a failed start can be retried; without this the
+      // card stays in seenMounts and is suppressed until it is re-inserted.
+      // `candidateRevision` moved if dismiss(), setEnabled(), _reset() or a
+      // newer observe() candidate happened while the start was in flight, and
+      // `seenMounts` no longer holds the mount if prune() saw it ejected. In
+      // either case the prompt is stale and must not come back.
+      if (candidateRevision === revision && seenMounts.has(device.mount_path)) {
+        state.update((s) => ({ ...s, candidate: device, candidateRule: rule }));
+      }
       errorsState.addError(
         error instanceof Error ? error.message : "Could not start auto-import.",
       );
@@ -158,6 +172,7 @@ export const autoImportState = {
 
   /** Decline the current candidate; it won't re-prompt until the card is re-inserted. */
   dismiss(): void {
+    candidateRevision += 1;
     const device = get(state).candidate;
     if (device) {
       dismissedMounts.add(device.mount_path);
@@ -165,8 +180,8 @@ export const autoImportState = {
     state.update((s) => ({ ...s, candidate: null, candidateRule: null }));
   },
 
-  /** Test/preview-only: reset internal detection bookkeeping. */
   _reset(): void {
+    candidateRevision += 1;
     seenMounts.clear();
     dismissedMounts.clear();
     baselineSeeded = false;

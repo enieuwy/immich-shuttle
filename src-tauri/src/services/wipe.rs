@@ -2,6 +2,10 @@ use std::{
     collections::HashSet,
     fs, io,
     path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
 
@@ -302,6 +306,7 @@ pub async fn forecast_upload(
     server_url: &str,
     api_key: &str,
     paths: &[String],
+    cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<ForecastResult, String> {
     if paths.is_empty() {
         return Ok(ForecastResult::default());
@@ -309,18 +314,12 @@ pub async fn forecast_upload(
 
     // Hashing reads files from (possibly slow) media; keep it off the async runtime.
     let owned: Vec<String> = paths.to_vec();
+    let cancellation_for_hash = cancellation.clone();
     let hashed: Vec<(String, Option<String>)> = tokio::task::spawn_blocking(move || {
-        owned
-            .into_iter()
-            .map(|path| {
-                // The forecast never deletes, so the identity is not needed here.
-                let checksum = hash_file(&path).ok().map(|(checksum, _)| checksum);
-                (path, checksum)
-            })
-            .collect()
+        hash_forecast_files(owned, cancellation_for_hash.as_deref())
     })
     .await
-    .map_err(|e| format!("Checksum task failed: {e}"))?;
+    .map_err(|e| format!("Checksum task failed: {e}"))??;
 
     let mut unreadable = 0usize;
     let mut to_check: Vec<(String, String)> = Vec::new();
@@ -329,6 +328,13 @@ pub async fn forecast_upload(
             Some(sum) => to_check.push((path, sum)),
             None => unreadable += 1,
         }
+    }
+
+    if cancellation
+        .as_ref()
+        .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+    {
+        return Err("Forecast was cancelled".to_string());
     }
 
     let client = ImmichClient::new(server_url, api_key);
@@ -345,6 +351,27 @@ pub async fn forecast_upload(
     })
 }
 
+/// SHA-1s each path, stopping between files when `cancellation` is raised.
+///
+/// The check sits at the loop head, so a cancelled forecast abandons the rest of
+/// the set instead of hashing thousands of files nobody is waiting for. A single
+/// blocked read cannot be interrupted; the bound is per file, not per read.
+fn hash_forecast_files(
+    paths: Vec<String>,
+    cancellation: Option<&AtomicBool>,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let mut hashed = Vec::with_capacity(paths.len());
+    for path in paths {
+        if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+            return Err("Forecast was cancelled".to_string());
+        }
+        // The forecast never deletes, so the identity is not needed here.
+        let checksum = hash_file(&path).ok().map(|(checksum, _)| checksum);
+        hashed.push((path, checksum));
+    }
+    Ok(hashed)
+}
+
 /// Splits `total` checked files into (new, already_present) from the positions
 /// the server reported as duplicates. Positions outside the request are ignored:
 /// a malformed response must not be able to inflate "already on the server",
@@ -357,10 +384,13 @@ fn partition_present(total: usize, present: &std::collections::HashSet<usize>) -
 
 #[cfg(test)]
 mod tests {
-    use super::{hash_file, partition_present, wipe_files, FileIdentity, VerifiedFile};
+    use super::{
+        hash_file, hash_forecast_files, partition_present, wipe_files, FileIdentity, VerifiedFile,
+    };
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::atomic::{AtomicBool, Ordering},
         time::Duration,
     };
 
@@ -527,5 +557,35 @@ mod tests {
         let (new, already_present) = partition_present(2, &present);
         assert_eq!(already_present, 1);
         assert_eq!(new, 1);
+    }
+
+    #[test]
+    fn forecast_hashing_stops_at_the_next_file_once_cancelled() {
+        let first = temp_file("forecast-first", "jpg");
+        fs::write(&first, b"first").expect("write first file");
+        let paths = vec![
+            first.to_string_lossy().into_owned(),
+            // Never reached once the flag is up, so it does not need to exist.
+            "/forecast-never-hashed.jpg".to_string(),
+        ];
+        let cancellation = AtomicBool::new(false);
+
+        let hashed = hash_forecast_files(paths.clone(), Some(&cancellation))
+            .expect("an uncancelled forecast hashes every path");
+        assert_eq!(hashed.len(), 2);
+        assert!(hashed[0].1.is_some(), "the readable file is hashed");
+        assert!(
+            hashed[1].1.is_none(),
+            "the missing file counts as unreadable"
+        );
+
+        cancellation.store(true, Ordering::Relaxed);
+        assert_eq!(
+            hash_forecast_files(paths, Some(&cancellation)),
+            Err("Forecast was cancelled".to_string()),
+            "a cancelled forecast must not hash the rest of the set"
+        );
+
+        let _ = fs::remove_file(first);
     }
 }

@@ -21,6 +21,23 @@ test('default scenario shows the main import workspace', async ({ page }) => {
   await captureScenario(page, 'default');
 });
 
+test('a changed profile re-enables a forecast in progress', async ({ page }) => {
+  await page.goto('/?scenario=default&slowForecast=5000');
+
+  const checkButton = page.getByRole('button', { name: /Check server|Checking…/ });
+  await expect(checkButton).toBeEnabled();
+  await checkButton.click();
+  await expect(checkButton).toHaveText('Checking…');
+
+  // Switching the active profile changes a tracked input while the forecast
+  // request remains in flight.
+  await page.getByRole('button', { name: /Switch profile/ }).click();
+  await page.getByRole('menuitemradio', { name: 'Studio archive' }).click();
+
+  await expect(checkButton).toBeEnabled();
+  await expect(checkButton).toHaveText('Check server');
+});
+
 test('onboarding scenario shows first-run connection fields', async ({ page }) => {
   await page.goto('/?scenario=onboarding');
 

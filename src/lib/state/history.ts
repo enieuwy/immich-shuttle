@@ -186,12 +186,29 @@ export async function replayImport(record: ImportRecord): Promise<ReplayOutcome>
       );
     } else {
       albumsState.clearSelection();
+      // immich-go assigns albums by NAME (--into-album), so the recorded name is
+      // the destination and the id is only a handle for it. Try the id first,
+      // then the recorded name: an album that was deleted and recreated, or whose
+      // id changed, is still the destination the user chose. Report only when
+      // neither resolves, because startImport turns an unresolvable id into
+      // `into_album: null` and would silently upload into the library instead.
+      const recordedAlbumId = request.album_ids[0];
       const targetId =
-        request.album_ids[0] ??
+        (recordedAlbumId !== undefined
+          ? albums.availableAlbums.find((a) => a.id === recordedAlbumId)?.id
+          : undefined) ??
         (request.into_album
           ? albums.availableAlbums.find((a) => a.album_name === request.into_album)?.id
           : undefined);
-      if (targetId) albumsState.selectAlbum(targetId);
+      if (targetId) {
+        albumsState.selectAlbum(targetId);
+      } else if (recordedAlbumId !== undefined || request.into_album) {
+        errorsState.addError(
+          `Couldn't restore this import's album -- ${
+            request.into_album ? `"${request.into_album}"` : "the recorded album"
+          } no longer exists on this server.`,
+        );
+      }
     }
 
     if (abandonIfProfileChanged()) return "staged";
