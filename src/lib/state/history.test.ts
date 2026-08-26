@@ -235,6 +235,28 @@ describe("replayImport", () => {
     expect(get(albumsState).selectedAlbumIds).toEqual(["named-album"]);
   });
 
+  it("replays where the run landed, not where the picker pointed", async () => {
+    await saveProfile("p1", "https://one.example.com");
+
+    // The record's own album_ids hold the id resolved from the album NAME after
+    // the run finished; the persisted request holds only what the picker sent
+    // beforehand. When they disagree -- the album was recreated mid-run, so the
+    // name now names a different id -- the replay must follow the destination.
+    const record = importRecord("landed-elsewhere", {
+      album_ids: ["picker-album"],
+      into_album: "Holiday",
+    });
+    record.album_ids = ["landed-album"];
+
+    vi.mocked(api.albumsList).mockResolvedValueOnce([
+      { id: "picker-album", album_name: "Stale Holiday", shared_with: [] },
+      { id: "landed-album", album_name: "Holiday", shared_with: [] },
+    ]);
+
+    expect(await replayImport(record)).toBe("staged");
+    expect(get(albumsState).selectedAlbumIds).toEqual(["landed-album"]);
+  });
+
   it("abandons the album selection if the active profile changes while albums are loading", async () => {
     await saveProfile("p1", "https://one.example.com");
     await saveProfile("p2", "https://two.example.com");

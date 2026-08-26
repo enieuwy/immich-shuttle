@@ -616,14 +616,29 @@ fn wipe_prompt_state(
     }
 }
 
+/// The album name a run can be deep-linked to, or `None` when it fans out.
+///
+/// "Open in Immich" may name one album only when the run targets exactly one:
+/// `SingleAlbum` mode with a non-empty `--into-album`. The folder and tag modes
+/// spread assets across many albums, and the picker still sends its selected
+/// album name in those modes, so gating on the name alone would offer a link to
+/// one arbitrary album the run never exclusively populated.
+fn album_link_target(organization: Organization, into_album: Option<&str>) -> Option<String> {
+    if organization != Organization::SingleAlbum {
+        return None;
+    }
+    let name = into_album?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 #[tauri::command]
 pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<String, String> {
     if input.source_paths.is_empty() {
         return Err("At least one source path is required".to_string());
     }
-
-    let profile = profile_store::get_profile(&input.profile_id)?;
-    let api_key = keychain::require_api_key(&input.profile_id)?;
 
     let source_paths = collapse_overlapping_roots(input.source_paths.clone());
     let record_source_paths = source_paths.clone();
@@ -676,18 +691,14 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             album_ids.len()
         ));
     }
-    // The "Open in Immich" deep-link points at a specific album only when the run
-    // actually targets one: SingleAlbum mode AND a non-empty --into-album name
-    // (folder/tag modes fan out; an unresolved selection sends no into_album, so
-    // the card must not claim an album the upload never populated).
-    let into_album_active = into_album
-        .as_deref()
-        .map(|a| !a.trim().is_empty())
-        .unwrap_or(false);
+    // The one album this run can be deep-linked to. Both the in-flight id and
+    // the resolution at finalization read it, so they cannot disagree about
+    // whether a link is warranted.
+    let album_link_name = album_link_target(organization, into_album.as_deref());
     // Provisional: the id the picker chose, shown while the run is in flight. The
     // album the upload actually populated is resolved from its name at
     // finalization, because the NAME is what immich-go targets.
-    let provisional_album_id = if organization == Organization::SingleAlbum && into_album_active {
+    let provisional_album_id = if album_link_name.is_some() {
         album_ids.first().cloned()
     } else {
         None
@@ -697,6 +708,11 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     if staging_requested {
         validate_selected_under_sources(&select_files, &source_paths)?;
     }
+    // Credentials are read only after every pure check on the input has passed.
+    // Reading the keychain first can raise an OS unlock prompt, and reports a
+    // missing key, for a request this command was always going to refuse.
+    let profile = profile_store::get_profile(&input.profile_id)?;
+    let api_key = keychain::require_api_key(&input.profile_id)?;
 
     let job_id = Uuid::new_v4().to_string();
     let log_path = logs::logs_dir()?.join(format!("run-{job_id}.log"));
@@ -1144,7 +1160,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 resolve_album_id_by_name(
                     &request.server_url,
                     &api_key_for_finalization,
-                    request.into_album.as_deref(),
+                    album_link_name.as_deref(),
                 )
                 .await
             };
@@ -1159,7 +1175,11 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 pending_wipe_count,
                 file_errors: file_errors.clone(),
                 profile_id: profile.id.clone(),
-                album_id: resolved_album_id.or_else(|| provisional_album_id.clone()),
+                // No fallback to the picker's id. That id is what goes stale when
+                // the album is deleted or recreated, so preferring it when the
+                // name did not resolve reinstates the wrong link this resolution
+                // exists to prevent: no link is honest, a stale link is not.
+                album_id: resolved_album_id,
             }
         };
 
@@ -1295,6 +1315,13 @@ pub async fn import_forecast(
         validate_selected_under_sources(files, &source_paths)?;
     }
 
+    // Same ordering rule as `import_start`: refuse an unusable filter before
+    // touching the keychain or probing the server, so "Check server" reports the
+    // offending value rather than a missing key.
+    let include_type = parse_include_type(include_type.as_deref())?;
+    let include_extensions = normalize_extensions(&include_extensions);
+    let exclude_extensions = normalize_extensions(&exclude_extensions);
+
     let profile = profile_store::get_profile(&profile_id)?;
     let api_key = keychain::require_api_key(&profile_id)?;
     let server_url = url_resolver::resolve_server_url(&profile).await;
@@ -1306,9 +1333,6 @@ pub async fn import_forecast(
     // counts the files that will actually upload (both filters are extension-based
     // on immich-go's side, so this matches). Date/only-new is intentionally NOT
     // applied here — it needs per-file EXIF — so the UI flags the estimate.
-    let include_type = parse_include_type(include_type.as_deref())?;
-    let include_extensions = normalize_extensions(&include_extensions);
-    let exclude_extensions = normalize_extensions(&exclude_extensions);
     let keep = move |path: &str| -> bool {
         let ext = media_scanner::extension_of(path);
         if let Some(kind) = include_type.as_deref() {
@@ -2701,6 +2725,34 @@ mod tests {
         assert!(
             err.contains("VIDO"),
             "the rejection must name the value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn only_a_single_album_run_can_be_deep_linked() {
+        // The picker sends its selected album name even in folder and tag modes,
+        // where immich-go ignores it and spreads assets across many albums. A
+        // link there would name one album the run never exclusively populated.
+        for organization in [
+            Organization::FolderName,
+            Organization::FolderPath,
+            Organization::FolderTags,
+        ] {
+            assert_eq!(
+                album_link_target(organization, Some("Holiday")),
+                None,
+                "{organization:?} fans out and must not claim one album"
+            );
+        }
+
+        assert_eq!(
+            album_link_target(Organization::SingleAlbum, Some(" Holiday ")),
+            Some("Holiday".to_string())
+        );
+        assert_eq!(album_link_target(Organization::SingleAlbum, None), None);
+        assert_eq!(
+            album_link_target(Organization::SingleAlbum, Some("  ")),
+            None
         );
     }
 }

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { BackendError } from "./backendErrors";
 import type {
   Album,
   AlbumShareLink,
@@ -21,9 +22,10 @@ async function invokeCommand<T>(command: string, args?: Record<string, unknown>)
     return await invoke<T>(command, args);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    // Keep the original rejection reachable as `cause`: the message stays the
-    // contract the UI shows, but a caller can still inspect what actually failed.
-    throw new Error(`${command} failed: ${message}`, { cause: error });
+    // Keep the original rejection reachable as `cause`, and the backend's own
+    // message reachable as `backendMessage`: the displayed text names the
+    // command, while `isBackendError` needs the unwrapped string to anchor on.
+    throw new BackendError(command, message, error);
   }
 }
 

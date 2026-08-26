@@ -169,10 +169,15 @@ export interface ImportRecord {
   album_ids: string[];
   /**
    * Mirrors the Rust `RecordStatus` enum, whose wire values are pinned by
-   * `record_status_serializes_to_the_frontend_union`. `"unknown"` is what a
-   * record written by a newer build degrades to, so it must stay renderable.
+   * `record_status_serializes_to_the_frontend_union`.
+   *
+   * The open `string` arm is deliberate: a record written by a newer build keeps
+   * its own status verbatim through a load and a rewrite, so this build reads
+   * values it does not know rather than a placeholder. Anything outside the
+   * three named values renders as an unknown outcome. Narrow with a comparison
+   * against a named value; never assume the set is closed.
    */
-  status: "completed" | "failed" | "cancelled" | "unknown";
+  status: "completed" | "failed" | "cancelled" | (string & {});
   total: number;
   uploaded: number;
   duplicates: number;

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::models::job::ImportInput;
 
@@ -6,27 +6,49 @@ use crate::models::job::ImportInput;
 ///
 /// Deserialization is deliberately lenient. History is JSON on disk that
 /// outlives any one build, so a value this build does not know must not fail
-/// the whole read and drop every row in the file. Unrecognized values load as
-/// `Unknown` and are rendered as such, which is why the frontend union carries
-/// `"unknown"` too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+/// the whole read and drop every row in the file.
+///
+/// `Unknown` keeps the value it was read from disk and writes it back verbatim.
+/// `append_history` reloads every record and rewrites the whole store, so a
+/// variant that serialized as a literal `"unknown"` would let this build erase a
+/// newer build's outcome from the user's history on the next import, with no way
+/// to recover it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordStatus {
     Completed,
     Failed,
     Cancelled,
-    Unknown,
+    Unknown(String),
+}
+
+impl RecordStatus {
+    /// The wire value, which for `Unknown` is whatever was read from disk.
+    pub fn as_wire(&self) -> &str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl Serialize for RecordStatus {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_wire())
+    }
 }
 
 impl<'de> Deserialize<'de> for RecordStatus {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // `#[serde(other)]` is rejected on an externally tagged enum, so the
-        // fallback is spelled out here rather than derived.
-        Ok(match String::deserialize(deserializer)?.as_str() {
+        // `#[serde(other)]` is rejected on an externally tagged enum, and it
+        // would discard the original value anyway, so this is spelled out.
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
             "completed" => Self::Completed,
             "failed" => Self::Failed,
             "cancelled" => Self::Cancelled,
-            _ => Self::Unknown,
+            _ => Self::Unknown(raw),
         })
     }
 }
@@ -61,16 +83,15 @@ mod tests {
         assert_eq!(wire(RecordStatus::Completed), "\"completed\"");
         assert_eq!(wire(RecordStatus::Failed), "\"failed\"");
         assert_eq!(wire(RecordStatus::Cancelled), "\"cancelled\"");
-        assert_eq!(wire(RecordStatus::Unknown), "\"unknown\"");
     }
 
     #[test]
     fn unknown_persisted_status_loads_instead_of_failing_the_history_read() {
         // A record written by a future build must not make this build drop every
-        // row in history.json, so an unrecognized value degrades to Unknown.
+        // row in the store, so an unrecognized value degrades to Unknown.
         let parsed: RecordStatus =
             serde_json::from_str("\"partially_uploaded\"").expect("unknown status must parse");
-        assert_eq!(parsed, RecordStatus::Unknown);
+        assert_eq!(parsed, RecordStatus::Unknown("partially_uploaded".into()));
 
         for known in ["completed", "failed", "cancelled"] {
             let parsed: RecordStatus = serde_json::from_str(&format!("\"{known}\""))
@@ -80,5 +101,20 @@ mod tests {
                 format!("\"{known}\"")
             );
         }
+    }
+
+    #[test]
+    fn a_newer_builds_status_survives_a_load_and_rewrite() {
+        // `append_history` reloads every record and rewrites the whole store, so
+        // a status this build cannot name still has to come back out verbatim.
+        // Writing a literal "unknown" here would erase the newer outcome from the
+        // user's history on their next import, unrecoverably.
+        let parsed: RecordStatus =
+            serde_json::from_str("\"partially_uploaded\"").expect("unknown status must parse");
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            "\"partially_uploaded\""
+        );
+        assert_eq!(parsed.as_wire(), "partially_uploaded");
     }
 }

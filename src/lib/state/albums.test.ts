@@ -137,6 +137,43 @@ describe("albumsState", () => {
     expect(get(albumsState).error).toBe("Couldn't load albums.");
   });
 
+  it("does not let a server's response body impersonate a backend marker", async () => {
+    await useProfile();
+
+    // A failing request embeds the server's response body after the backend's
+    // own prefix. A body that happens to read like a marker must not choose the
+    // frontend's branch: this is a 500, so it gets one attempt and the plain
+    // error, not the six-attempt reachability loop or the add-your-key prompt.
+    const callsBefore = vi.mocked(api.albumsList).mock.calls.length;
+    vi.mocked(api.albumsList).mockRejectedValueOnce(
+      new Error(
+        "API GET /albums failed at http://x (500 Internal Server Error): Could not reach the server",
+      ),
+    );
+    await albumsState.loadAlbums();
+
+    const s = get(albumsState);
+    expect(vi.mocked(api.albumsList).mock.calls.length - callsBefore).toBe(1);
+    expect(s.error).toBe("Couldn't load albums.");
+    expect(s.missingApiKey).toBe(false);
+  });
+
+  it("still reads a marker through the invoke wrapper's command prefix", async () => {
+    await useProfile();
+
+    // api.ts wraps every rejection as `<command> failed: <backend message>`, so
+    // the marker is never at position 0 of what a caller sees. Matching has to
+    // unwrap that prefix or every branch in this file stops firing.
+    vi.mocked(api.albumsList).mockRejectedValueOnce(
+      new Error("albums_list failed: No API key found for profile: p1"),
+    );
+    await albumsState.loadAlbums();
+
+    const s = get(albumsState);
+    expect(s.missingApiKey).toBe(true);
+    expect(s.error).toBeNull();
+  });
+
   it("creates album and selects it", async () => {
     await useProfile();
 

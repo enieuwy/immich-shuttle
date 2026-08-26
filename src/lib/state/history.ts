@@ -192,7 +192,11 @@ export async function replayImport(record: ImportRecord): Promise<ReplayOutcome>
       // id changed, is still the destination the user chose. Report only when
       // neither resolves, because startImport turns an unresolvable id into
       // `into_album: null` and would silently upload into the library instead.
-      const recordedAlbumId = request.album_ids[0];
+      //
+      // `record.album_ids` is where the run actually landed, resolved from the
+      // name after it finished; `request.album_ids` is only what the picker sent
+      // before the run and can name a different album. Prefer the destination.
+      const recordedAlbumId = record.album_ids[0] ?? request.album_ids[0];
       const targetId =
         (recordedAlbumId !== undefined
           ? albums.availableAlbums.find((a) => a.id === recordedAlbumId)?.id

@@ -24,10 +24,47 @@ const BACKEND_ERROR = {
   UNREACHABLE_SERVER: "Could not reach the server",
 } as const;
 
-/** True when `reason` is an Error whose message carries the named backend contract. */
+/** Prefix `invokeCommand` adds so a raw message can be recovered from the text. */
+const WRAPPER = /^[a-z_]+ failed: /;
+
+/**
+ * A rejected Tauri command, keeping the backend's own message intact.
+ *
+ * The displayed message names the command, but the marker test below must run
+ * against the unwrapped text: the markers are prefixes on the Rust side, and
+ * anchoring is what stops a server-supplied string from impersonating one.
+ */
+export class BackendError extends Error {
+  readonly backendMessage: string;
+
+  constructor(command: string, backendMessage: string, cause?: unknown) {
+    super(`${command} failed: ${backendMessage}`, { cause });
+    this.name = "BackendError";
+    this.backendMessage = backendMessage;
+  }
+}
+
+/**
+ * True when `reason` is an Error whose message carries the named backend
+ * contract.
+ *
+ * Matching is anchored at the start of the backend's own message, not a
+ * substring of the whole text. Every one of these markers is a prefix in Rust,
+ * while a failed HTTP request embeds the server's response body AFTER its own
+ * `API {method} {path} failed at {url} ({status}): ` prefix. An unanchored test
+ * therefore lets any server -- or anything that can influence a response body --
+ * choose the frontend's branch: a 500 whose body read "Could not reach the
+ * server" would drive the album loader's retry loop, and one reading "No API key
+ * found for profile" would raise the add-your-key prompt.
+ */
 export function isBackendError(
   reason: unknown,
   kind: keyof typeof BACKEND_ERROR,
 ): reason is Error {
-  return reason instanceof Error && reason.message.includes(BACKEND_ERROR[kind]);
+  if (!(reason instanceof Error)) return false;
+  const message =
+    reason instanceof BackendError
+      ? reason.backendMessage
+      : reason.message.replace(WRAPPER, "");
+  return message.startsWith(BACKEND_ERROR[kind]);
 }
