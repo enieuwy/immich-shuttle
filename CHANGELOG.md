@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.7.2 - 2026-08-26
 
 ### Import
 - **A crashed import worker now becomes a failed job instead of a phantom running job.** Panic cleanup updates the job record as well as the worker-liveness maps, so later imports and quit are not blocked by a worker that no longer exists.
