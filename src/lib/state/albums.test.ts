@@ -35,17 +35,29 @@ import { errorsState } from "./errors";
 import { profilesState } from "./profiles";
 import { albumsState } from "./albums";
 
+type TestProfile = Parameters<typeof profilesState.saveProfile>[0];
+
+const saveTestProfile = (id: string, overrides: Partial<TestProfile> = {}) =>
+  profilesState.saveProfile({
+    id,
+    display_name: "Ellis",
+    server_url: "https://immich.example.com",
+    api_key: null,
+    lan_server_url: null,
+    wan_server_url: null,
+    ...overrides,
+  });
+
+// Explicit per-test call, not a beforeEach hook: these cases share module state
+// deliberately, and later ones lean on profiles that earlier ones saved.
+const useProfile = async (id = "p1") => {
+  await saveTestProfile(id);
+  profilesState.setActiveProfile(id);
+};
+
 describe("albumsState", () => {
   it("selects and deselects albums", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
+    await useProfile();
 
     await albumsState.loadAlbums();
     albumsState.selectAlbum("a1");
@@ -62,15 +74,7 @@ describe("albumsState", () => {
   });
 
   it("flags a missing API key instead of raising an error", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
+    await useProfile();
 
     vi.mocked(api.albumsList).mockRejectedValueOnce(
       new Error("No API key found for profile: p1"),
@@ -83,15 +87,7 @@ describe("albumsState", () => {
   });
 
   it("loads albums even when usersList fails (non-admin 403)", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
+    await useProfile();
 
     vi.mocked(api.albumsList).mockResolvedValueOnce([
       { id: "a1", album_name: "Family", shared_with: [] },
@@ -106,15 +102,7 @@ describe("albumsState", () => {
   });
 
   it("auto-retries a connection error and recovers", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
+    await useProfile();
 
     vi.useFakeTimers();
     vi.mocked(api.albumsList)
@@ -132,15 +120,7 @@ describe("albumsState", () => {
   });
 
   it("creates album and selects it", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
+    await useProfile();
 
     await albumsState.loadAlbums();
     albumsState.selectAlbum("a1");
@@ -151,15 +131,7 @@ describe("albumsState", () => {
   });
 
   it("still registers the album when sharing fails after creation", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
+    await useProfile();
 
     vi.mocked(api.albumShareUsers).mockRejectedValueOnce(new Error("share failed"));
     // Creation succeeds but the follow-up share fails: the album must not be
@@ -176,15 +148,7 @@ describe("albumsState", () => {
   });
 
   it("forwards the share role (defaulting to viewer) to albumShareUsers", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
+    await useProfile();
 
     vi.mocked(api.albumShareUsers).mockClear();
     // Least-privilege default when the caller omits the role.
@@ -201,15 +165,7 @@ describe("albumsState", () => {
   });
 
   it("stores the public share link after creating a linked album", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
+    await useProfile();
 
     vi.mocked(api.albumShareLink).mockClear();
     await albumsState.createAlbum("Holiday", ["u1"], true);
@@ -219,15 +175,7 @@ describe("albumsState", () => {
   });
 
   it("leaves the public share link empty when no link is created", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
+    await useProfile();
 
     await albumsState.createAlbum("Holiday", ["u1"], true);
     expect(get(albumsState).shareLinkUrl).toBe("https://example.com/share/x");
@@ -239,21 +187,10 @@ describe("albumsState", () => {
   });
 
   it("does not add or select an album whose create resolves after the active profile changed", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    await profilesState.saveProfile({
-      id: "p2",
+    await saveTestProfile("p1");
+    await saveTestProfile("p2", {
       display_name: "Other",
       server_url: "https://other.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
     });
     profilesState.setActiveProfile("p1");
 

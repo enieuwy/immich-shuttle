@@ -55,22 +55,37 @@ import { importOptionsState } from "./import-options";
 import { get } from "svelte/store";
 import type { ImportJob } from "$lib/types";
 
+type TestProfile = Parameters<typeof profilesState.saveProfile>[0];
+
+const saveTestProfile = (id: string, overrides: Partial<TestProfile> = {}) =>
+  profilesState.saveProfile({
+    id,
+    display_name: "Ellis",
+    server_url: "https://immich.example.com",
+    api_key: null,
+    lan_server_url: null,
+    wan_server_url: null,
+    ...overrides,
+  });
+
+// Most cases start from the same ground: one saved profile, made active, with
+// one selected source. This stays an explicit per-test call rather than a
+// beforeEach hook because these cases share module state deliberately — later
+// cases lean on profiles that earlier ones saved, and on the absence of a
+// profile in the very first case.
+const activateProfileWithSource = async (id = "p1") => {
+  await saveTestProfile(id);
+  profilesState.setActiveProfile(id);
+  await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+};
+
 describe("queueState", () => {
   it("rejects startImport when profile/source not set", async () => {
     await expect(queueState.startImport()).rejects.toThrow("Select a profile before starting import");
   });
 
   it("reports an in-flight start and removes it after settling", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await activateProfileWithSource();
 
     const start = Promise.withResolvers<string>();
     vi.mocked(api.importStart).mockReturnValueOnce(start.promise);
@@ -83,16 +98,7 @@ describe("queueState", () => {
   });
 
   it("removes a rejected start from shutdown tracking", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await activateProfileWithSource();
 
     const start = Promise.withResolvers<string>();
     vi.mocked(api.importStart).mockReturnValueOnce(start.promise);
@@ -105,16 +111,7 @@ describe("queueState", () => {
   });
 
   it("forwards stack flags to importStart", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await activateProfileWithSource();
 
     await queueState.startImport();
 
@@ -136,16 +133,7 @@ describe("queueState", () => {
   });
 
   it("forwards a valid date range and rejects an invalid one", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await activateProfileWithSource();
 
     importOptionsState.setDateFrom("2026-01-01");
     importOptionsState.setDateTo("2026-01-31");
@@ -163,16 +151,7 @@ describe("queueState", () => {
   });
 
   it("forwards error-resilience and tag options to importStart", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await activateProfileWithSource();
 
     importOptionsState.setKeepGoingOnErrors(true);
     importOptionsState.setOverwrite(true);
@@ -198,16 +177,7 @@ describe("queueState", () => {
   });
 
   it("derives a date-range floor from last import when only-new is on", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await activateProfileWithSource();
     importOptionsState.clearDateRange();
     importOptionsState.setOnlyNewSinceLastImport(true);
 
@@ -232,16 +202,7 @@ describe("queueState", () => {
   });
 
   it("treats an explicit selection as the import: coarse filters do not compose", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await activateProfileWithSource();
 
     // Coarse filters set (as History replay would), but a hand-picked selection
     // is provided: the selection must win, and type/date/include/exclude must
@@ -311,16 +272,7 @@ describe("queueState", () => {
   });
 
   it("forwards selectFiles override as select_files to importStart", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await activateProfileWithSource();
 
     await queueState.startImport({ selectFiles: ["/Volumes/SD/DCIM/IMG_1.JPG"] });
 
@@ -329,16 +281,7 @@ describe("queueState", () => {
   });
 
   it("resolves the selected album id to a name in into_album", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await activateProfileWithSource();
     await albumsState.loadAlbums();
     albumsState.selectAlbum("a1");
 
@@ -350,16 +293,7 @@ describe("queueState", () => {
   });
 
   it("defaults organization to single_album", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await activateProfileWithSource();
 
     await queueState.startImport();
 
@@ -368,16 +302,7 @@ describe("queueState", () => {
   });
 
   it("forwards the selected folder organization mode to importStart", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await activateProfileWithSource();
 
     importOptionsState.setOrganization("folder_path");
     await queueState.startImport();
@@ -391,22 +316,8 @@ describe("queueState", () => {
   });
 
   it("honors profileId, intoAlbum, and stack overrides (device rules)", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    await profilesState.saveProfile({
-      id: "p2",
-      display_name: "Family",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
+    await saveTestProfile("p1");
+    await saveTestProfile("p2", { display_name: "Family" });
     profilesState.setActiveProfile("p1");
 
     await queueState.startImport({
@@ -432,16 +343,7 @@ describe("queueState", () => {
   });
 
   it("does not import into another profile's album selection", async () => {
-    await profilesState.saveProfile({
-      id: "p1",
-      display_name: "Ellis",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-    await sourceState.selectSources(["/Volumes/SD/DCIM"]);
+    await activateProfileWithSource();
     await albumsState.loadAlbums();
     albumsState.selectAlbum("a1");
 
@@ -449,14 +351,7 @@ describe("queueState", () => {
     // sibling concern) or may not have reloaded yet — either way
     // loadedProfileId no longer equals the new profile's id, so this is the
     // hard gate startImport must enforce regardless of that timing.
-    await profilesState.saveProfile({
-      id: "p2",
-      display_name: "Family",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
+    await saveTestProfile("p2", { display_name: "Family" });
     profilesState.setActiveProfile("p2");
 
     await queueState.startImport();
