@@ -18,6 +18,7 @@
 ### Maintenance
 - **A new advisory against a dependency now fails CI instead of scrolling past.** `cargo audit` fails only on a vulnerability; an unmaintained, unsound or yanked crate was a warning, and there were 25 of them permanently on screen. Every warning is now a failure, with the accepted ones listed one by one in `src-tauri/.cargo/audit.toml` alongside which upstream crate pulls it in and why it cannot be fixed here. Anything not on that list fails the run.
 - **Took the four dependency fixes that were actually available.** `anyhow`, `event-listener` and both live `rand` lines had published fixes for the unsoundness advisories against them, and the `wasm-bindgen` family had been yanked; all are updated. The graph has no vulnerabilities and 19 accepted warnings, down from 25. The rest are the archived GTK3 bindings and Unicode tables that Tauri pulls in, which clear only when Tauri moves off them.
+- **Transitive dependency drift now has an owner.** Renovate updates what `Cargo.toml` and `package.json` declare, and its vulnerability alerts are direct-only, so a crate pulled in by Tauri or `keyring` was nobody's job — which is why all four fixes above had to be found by hand. Weekly lock-file maintenance is enabled, and the config now extends `config:recommended` for the dependency dashboard it was missing. A refresh that pulls in an unlisted advisory fails the audit job rather than merging quietly.
 
 ## v0.7.2 - 2026-08-26
 
