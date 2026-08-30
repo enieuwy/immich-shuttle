@@ -925,4 +925,53 @@ mod tests {
         // Public links must not expose capture/location metadata by default.
         assert_eq!(payload["showMetadata"], false);
     }
+    // Collaborator badges show a useful name, avatar state, and no badge for malformed users.
+    #[test]
+    fn parses_collaborator_user_display_and_avatar_metadata() {
+        use super::parse_album_user;
+        use serde_json::json;
+
+        let fully_populated = parse_album_user(&json!({
+            "id": "user-1",
+            "name": "Ada Lovelace",
+            "email": "ada@example.com",
+            "avatarColor": "blue",
+            "profileImagePath": "avatars/ada.jpg"
+        }))
+        .expect("an id makes the collaborator user valid");
+        assert_eq!(fully_populated.id, "user-1");
+        assert_eq!(fully_populated.name, "Ada Lovelace");
+        assert_eq!(fully_populated.email.as_deref(), Some("ada@example.com"));
+        assert_eq!(fully_populated.avatar_color.as_deref(), Some("blue"));
+        assert!(fully_populated.has_profile_image);
+
+        let email_fallback = parse_album_user(&json!({
+            "id": "user-2",
+            "email": "grace@example.com"
+        }))
+        .expect("an id makes the collaborator user valid");
+        assert_eq!(email_fallback.name, "grace@example.com");
+
+        let null_name_fallback = parse_album_user(&json!({
+            "id": "user-3",
+            "name": null,
+            "email": "linus@example.com"
+        }))
+        .expect("an id makes the collaborator user valid");
+        assert_eq!(null_name_fallback.name, "linus@example.com");
+
+        let generic_fallback = parse_album_user(&json!({ "id": "user-4" }))
+            .expect("an id makes the collaborator user valid");
+        assert_eq!(generic_fallback.name, "Immich User");
+
+        let empty_image = parse_album_user(&json!({
+            "id": "user-5",
+            "profileImagePath": ""
+        }))
+        .expect("an id makes the collaborator user valid");
+        assert!(!empty_image.has_profile_image);
+
+        let missing_id = parse_album_user(&json!({ "name": "No Id" }));
+        assert!(missing_id.is_none());
+    }
 }

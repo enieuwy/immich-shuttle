@@ -18,6 +18,21 @@ pub(crate) fn preview_session_cancelled(token: u64) -> bool {
     token != 0 && token <= PREVIEW_CANCEL.load(Relaxed)
 }
 
+/// Keep log sanitization pure so its safety boundary can be tested without Tauri
+/// or the real app log.
+fn log_safe_reason(reason: &str) -> String {
+    reason
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Generate (or fetch cached) thumbnails for a batch of files. The frontend grid
 /// calls this lazily for the tiles entering the viewport. Work runs on blocking
 /// threads, bounded to a small pool so a large card can't saturate the runtime.
@@ -109,20 +124,9 @@ pub async fn preview_thumbnails(
     }
 
     if failed_count > 0 {
-        // The reason can carry an OS error string with spaces or newlines, which
-        // would break the one-line `key=value` shape every other entry in
-        // app.log uses. Collapse anything outside that shape.
-        let reason = representative_reason
-            .unwrap_or_else(|| "unknown_thumbnail_failure".to_string())
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/') {
-                    ch
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
+        let reason = log_safe_reason(
+            &representative_reason.unwrap_or_else(|| "unknown_thumbnail_failure".to_string()),
+        );
         let _ = crate::services::logs::append_log(
             "app.log",
             &format!(
@@ -385,5 +389,14 @@ mod tests {
     fn epoch_known_dates() {
         assert_eq!(civil_to_epoch(1970, 1, 1, 0, 0, 0), 0);
         assert_eq!(civil_to_epoch(2000, 1, 1, 0, 0, 0), 946_684_800);
+    }
+
+    #[test]
+    fn log_safe_reason_keeps_key_value_safe_characters_only() {
+        // Preview failure logs stay on one line and preserve safe filename-style characters.
+        assert_eq!(
+            log_safe_reason("alpha beta\nline\t\"quoted\"=value_-./09"),
+            "alpha_beta_line__quoted__value_-./09"
+        );
     }
 }

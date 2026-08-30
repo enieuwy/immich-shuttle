@@ -626,4 +626,35 @@ mod tests {
 
         fs::remove_dir_all(&tmp).unwrap();
     }
+    // A selected media file streams to the preview, while a selected document stays hidden.
+    #[test]
+    fn streaming_scan_handles_single_media_and_non_media_files() {
+        let tmp = std::env::temp_dir().join(format!("scan-stream-single-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let video = tmp.join("clip.MOV");
+        let document = tmp.join("notes.txt");
+        fs::write(&video, b"video").unwrap();
+        fs::write(&document, b"document").unwrap();
+
+        let mut media_batches = Vec::new();
+        let skipped = scan_directory_streaming(&video, None, None, &mut |batch| {
+            media_batches.extend(batch);
+        })
+        .unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(media_batches.len(), 1);
+        assert_eq!(media_batches[0].name, "clip.MOV");
+        assert_eq!(media_batches[0].extension, ".mov");
+        assert!(media_batches[0].is_video);
+
+        let mut non_media_batches = Vec::new();
+        let skipped = scan_directory_streaming(&document, None, None, &mut |batch| {
+            non_media_batches.extend(batch);
+        })
+        .unwrap();
+        assert_eq!(skipped, 0);
+        assert!(non_media_batches.is_empty());
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
 }

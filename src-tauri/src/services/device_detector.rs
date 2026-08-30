@@ -280,4 +280,33 @@ mod tests {
         let _ = release_tx.send(());
         thread::sleep(Duration::from_millis(50));
     }
+
+    /// `removable` comes from the OS, so a removable disk is a card wherever it
+    /// is mounted; the path rules exist only for disks the OS does not flag.
+    #[test]
+    fn removable_mounts_are_always_included() {
+        assert!(should_include_mount("/any/path", true));
+    }
+
+    /// The filter that keeps the boot volume out of the card list. A regression
+    /// here offers the post-import delete prompt for the system disk.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mount_filter_excludes_system_and_home_volumes() {
+        assert!(should_include_mount("/Volumes/SD_CARD", false));
+        assert!(!should_include_mount("/Volumes/Macintosh HD", false));
+        assert!(!should_include_mount("/Volumes/Macintosh HD - Data", false));
+        assert!(!should_include_mount("/Users/ellis/Pictures", false));
+        assert!(!should_include_mount("/", false));
+    }
+
+    /// Same rule on Linux, where only the removable-media mount points count.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_mount_filter_excludes_system_and_home_volumes() {
+        assert!(should_include_mount("/media/ellis/SD_CARD", false));
+        assert!(should_include_mount("/mnt/card", false));
+        assert!(!should_include_mount("/", false));
+        assert!(!should_include_mount("/home/ellis", false));
+    }
 }

@@ -1383,4 +1383,68 @@ mod tests {
         let _ = fs::remove_file(&src);
         let _ = fs::remove_file(&jpg);
     }
+
+    #[test]
+    fn supported_formats_cover_portable_raw_and_platform_extensions() {
+        // Supported image files render as grid tiles, while unsupported files and platform
+        // limits stay explicit.
+        for ext in ["jpg", "jpeg", "png", "tif", "tiff", "webp", "gif", "bmp"] {
+            assert!(is_supported_format(ext), "portable extension {ext}");
+        }
+        for ext in [
+            "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "rw2", "orf", "dng", "pef",
+            "rwl", "raw", "3fr", "erf", "kdc", "mrw", "iiq", "cap", "mef",
+        ] {
+            assert!(is_supported_format(ext), "RAW extension {ext}");
+        }
+        for ext in ["txt", "pdf", ""] {
+            assert!(!is_supported_format(ext), "unsupported extension {ext:?}");
+        }
+
+        #[cfg(any(target_os = "macos", windows))]
+        for ext in ["mp4", "mov", "m4v", "avi", "mkv", "heic", "heif"] {
+            assert!(is_supported_format(ext), "platform extension {ext}");
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        for ext in ["mp4", "mov", "m4v", "avi", "mkv", "heic", "heif"] {
+            assert!(
+                !is_supported_format(ext),
+                "unsupported platform extension {ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn thumbnail_data_urls_use_png_and_jpeg_mime_types() {
+        // Rendered tiles identify their actual image format so browsers decode each preview
+        // correctly.
+        let dir = std::env::temp_dir().join(format!("immich_shuttle_mime_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("tile.png");
+        let jpg = dir.join("tile.jpg");
+        image::RgbImage::from_pixel(2, 3, image::Rgb([20, 40, 80]))
+            .save(&png)
+            .unwrap();
+        fs::write(&jpg, jpeg_of(2, 3)).unwrap();
+
+        let png_result = to_result("tile.png", &png).unwrap();
+        let jpg_result = to_result("tile.jpg", &jpg).unwrap();
+        assert!(png_result
+            .data_url
+            .as_deref()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        assert!(jpg_result
+            .data_url
+            .as_deref()
+            .unwrap()
+            .starts_with("data:image/jpeg;base64,"));
+        // The grid sizes each tile from these, so they must come from the image
+        // itself rather than the requested bound.
+        assert_eq!((png_result.width, png_result.height), (2, 3));
+        assert_eq!((jpg_result.width, jpg_result.height), (2, 3));
+        assert_eq!(png_result.path, "tile.png");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

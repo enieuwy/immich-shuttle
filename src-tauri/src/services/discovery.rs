@@ -304,4 +304,18 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn subnet_hosts_skips_networks_without_usable_addresses_but_scans_a_slash_30() {
+        // Point-to-point and host-route interfaces produce no sweep, while a small LAN still
+        // scans its usable hosts.
+        let local = Ipv4Addr::new(192, 168, 1, 2);
+
+        assert!(subnet_hosts(local, Ipv4Addr::new(255, 255, 255, 254)).is_empty());
+        assert!(subnet_hosts(local, Ipv4Addr::new(255, 255, 255, 255)).is_empty());
+        assert_eq!(
+            subnet_hosts(local, Ipv4Addr::new(255, 255, 255, 252)),
+            vec![Ipv4Addr::new(192, 168, 1, 1)]
+        );
+    }
 }

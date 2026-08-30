@@ -524,14 +524,25 @@ fn insert_initial_job(
     cancel_flag: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let evicted_ids = {
+        // The same decision as `import_admission_block`, taken again with the
+        // maps held. That check runs before the fallible setup this insert
+        // follows, so it cannot also be the one that serializes two racing
+        // starts. Both refusals come from `admission_block_reason` so their
+        // wording cannot drift: a caller that got past the first check only to
+        // lose the race here reads the same sentence it would have read there.
         let mut running = RUNNING_IMPORTS
             .lock()
             .map_err(|_| "Could not lock running imports state".to_string())?;
         let mut jobs = JOBS
             .lock()
             .map_err(|_| "Could not lock import job state".to_string())?;
-        if !running.is_empty() || jobs.iter().any(|existing| is_active(&existing.status)) {
-            return Err("An import is already running".to_string());
+        let run_live = !running.is_empty() || jobs.iter().any(|job| is_active(&job.status));
+        let finalizing_live = !FINALIZING_IMPORTS
+            .lock()
+            .map_err(|_| "Could not lock finalizing imports state".to_string())?
+            .is_empty();
+        if let Some(reason) = admission_block_reason(run_live, finalizing_live) {
+            return Err(reason.to_string());
         }
         let mut inputs = JOB_INPUTS
             .lock()
@@ -3485,6 +3496,44 @@ mod tests {
         assert!(
             blocked.is_some(),
             "a registered finalizing worker must block a new import"
+        );
+    }
+
+    /// The last line of defence for the single-active-import invariant. The
+    /// check in `import_admission_block` runs before the keychain read and the
+    /// forecast, so two starts can both pass it; only this insert, holding the
+    /// maps, can refuse the second. Asserts the refusal AND that nothing was
+    /// published: a partially admitted job would leave a card in the queue with
+    /// no worker behind it. Sibling tests publish their own jobs in parallel, so
+    /// which of the two sentences comes back is not this test's business.
+    #[test]
+    fn a_racing_insert_is_refused_without_publishing_the_job() {
+        let job_id = format!("insert-race-{}", Uuid::new_v4());
+        let blocker = format!("insert-race-blocker-{}", Uuid::new_v4());
+        lock_finalizing().insert(blocker.clone());
+
+        let refused = insert_initial_job(
+            terminal_job(&job_id, false),
+            replayable_input("p1"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        lock_finalizing().remove(&blocker);
+
+        let err = refused.expect_err("a live finalizing worker must refuse the insert");
+        assert!(
+            err == IMPORT_RUNNING_ERROR || err == IMPORT_FINISHING_ERROR,
+            "the insert must refuse with an admission sentence, got: {err}"
+        );
+        assert!(
+            !lock_jobs().iter().any(|job| job.id == job_id),
+            "a refused insert must not publish the job"
+        );
+        assert!(
+            !JOB_INPUTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&job_id),
+            "a refused insert must not retain the request"
         );
     }
 

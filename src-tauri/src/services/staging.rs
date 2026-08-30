@@ -633,6 +633,72 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    // A mixed selection stages each real file and ignores missing or directory entries.
+    #[test]
+    fn mixed_selection_stages_only_existing_files() {
+        let tmp = std::env::temp_dir().join(format!("stage-mixed-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let first = tmp.join("first.jpg");
+        let second = tmp.join("second.jpg");
+        let directory = tmp.join("album");
+        let missing = tmp.join("missing.jpg");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        fs::create_dir_all(&directory).unwrap();
+
+        let selected = vec![
+            first.to_string_lossy().to_string(),
+            missing.to_string_lossy().to_string(),
+            directory.to_string_lossy().to_string(),
+            second.to_string_lossy().to_string(),
+        ];
+        let staged = create_staging_dir(&selected, None, None, &AtomicU64::new(0)).unwrap();
+
+        assert_eq!(staged.links().entries().len(), 2);
+        assert_eq!(
+            staged
+                .links()
+                .entries()
+                .iter()
+                .filter(|(_, original)| original == &first || original == &second)
+                .count(),
+            2
+        );
+        assert!(staged
+            .links()
+            .entries()
+            .iter()
+            .all(|(_, original)| original != &missing && original != &directory));
+
+        cleanup_staging_dir(staged);
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    // An all-invalid selection reports that no selected file can be staged.
+    #[test]
+    fn selection_with_only_missing_files_returns_staging_error() {
+        let tmp = std::env::temp_dir().join(format!("stage-missing-{}", Uuid::new_v4()));
+        let first = tmp.join("one.jpg");
+        let second = tmp.join("two.jpg");
+        let error = match create_staging_dir(
+            &[
+                first.to_string_lossy().to_string(),
+                second.to_string_lossy().to_string(),
+            ],
+            None,
+            None,
+            &AtomicU64::new(0),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("an all-missing selection must fail"),
+        };
+
+        assert!(
+            error.contains("None of the selected files could be staged"),
+            "unexpected staging error: {error}"
+        );
+    }
+
     fn walkdir_files(root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];

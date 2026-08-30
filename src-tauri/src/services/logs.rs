@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
 
@@ -104,9 +104,9 @@ fn trim_to_trailing_lines(path: &std::path::Path, keep: usize) -> Result<(), Str
     fs::write(path, trimmed).map_err(|e| format!("Could not trim log file: {e}"))
 }
 
-pub fn rotate_recent_logs(max_files: usize) -> Result<(), String> {
-    let dir = logs_dir()?;
-    let mut entries = fs::read_dir(&dir)
+// Keep directory traversal separate from `logs_dir()` so tests can rotate an isolated directory.
+fn rotate_dir(dir: &Path, max_files: usize) -> Result<(), String> {
+    let mut entries = fs::read_dir(dir)
         .map_err(|e| format!("Could not list logs directory: {e}"))?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().is_file())
@@ -128,10 +128,16 @@ pub fn rotate_recent_logs(max_files: usize) -> Result<(), String> {
     Ok(())
 }
 
+pub fn rotate_recent_logs(max_files: usize) -> Result<(), String> {
+    rotate_dir(&logs_dir()?, max_files)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{tail_lines, trim_to_trailing_lines};
+    use super::{rotate_dir, tail_lines, trim_to_trailing_lines};
     use std::io::Write;
+    use std::{fs, thread, time::Duration};
+    use uuid::Uuid;
 
     #[test]
     fn tail_lines_returns_recent_lines() {
@@ -200,5 +206,36 @@ mod tests {
         assert_eq!(lines.last().copied(), Some("line 999"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Users can always read the durable app log after rotation, while only the newest run logs remain.
+    #[test]
+    fn log_rotation_keeps_durable_app_log_and_newest_run_logs() {
+        let dir = std::env::temp_dir().join(format!("logs-rotate-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let app_log = dir.join("app.log");
+        fs::write(&app_log, "durable app log\n").unwrap();
+        thread::sleep(Duration::from_millis(5));
+
+        for run_number in 1..=3 {
+            fs::write(
+                dir.join(format!("run-{run_number}.log")),
+                format!("run {run_number}\n"),
+            )
+            .unwrap();
+            if run_number < 3 {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        rotate_dir(&dir, 2).unwrap();
+
+        assert!(app_log.exists());
+        assert!(!dir.join("run-1.log").exists());
+        assert!(dir.join("run-2.log").exists());
+        assert!(dir.join("run-3.log").exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

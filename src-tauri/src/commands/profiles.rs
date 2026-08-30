@@ -168,4 +168,41 @@ mod tests {
             Some("https://wan.example.com")
         );
     }
+    // Profile editing keeps the default name and ignores empty optional endpoints.
+    #[test]
+    fn profile_builder_defaults_name_and_discards_empty_optional_urls() {
+        let profile = profile_from_input(
+            &ProfileInput {
+                id: None,
+                display_name: None,
+                server_url: "https://immich.example.com".to_string(),
+                lan_server_url: Some("   ".to_string()),
+                wan_server_url: None,
+                api_key: None,
+            },
+            "profile-id".to_string(),
+        );
+
+        assert_eq!(profile.display_name, "Immich User");
+        assert_eq!(profile.lan_server_url, None);
+        assert_eq!(profile.wan_server_url, None);
+
+        let empty_url_profile = profile_from_input(
+            &ProfileInput {
+                id: None,
+                display_name: None,
+                server_url: "https://immich.example.com".to_string(),
+                lan_server_url: Some(String::new()),
+                wan_server_url: Some("  https://wan.example.com/api/  ".to_string()),
+                api_key: None,
+            },
+            "profile-id".to_string(),
+        );
+
+        assert_eq!(empty_url_profile.lan_server_url, None);
+        assert_eq!(
+            empty_url_profile.wan_server_url.as_deref(),
+            Some("https://wan.example.com")
+        );
+    }
 }
