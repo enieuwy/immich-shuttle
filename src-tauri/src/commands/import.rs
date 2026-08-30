@@ -1904,20 +1904,19 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
         return Err(format!("Job does not need wipe confirmation: {job_id}"));
     }
 
-    // Taking the payload and marking the wipe live happen under one hold of the
-    // payload lock. Split apart, a quit landing between them would see no live
-    // work for a delete whose file list is already consumed. Holding the lock
-    // also means only the caller that actually took the payload registers, so
-    // one mark can never be released by a second, payload-less call.
-    let (pending, _wipe_guard) = {
-        let mut payloads = PENDING_WIPE
-            .lock()
-            .map_err(|_| "Could not lock pending wipe state".to_string())?;
-        let pending = payloads
-            .remove(&job_id)
-            .ok_or_else(|| format!("No pending wipe payload for job: {job_id}"))?;
-        (pending, ActiveWipeGuard::new(job_id.clone()))
-    };
+    // Marked live BEFORE the payload is consumed. The quit path reads only
+    // `ACTIVE_WIPES`, so holding the payload lock across both steps would not
+    // order them against a quit: a Cmd-Q landing between a payload removal and
+    // the mark would see terminal job, no live work, and exit with the delete
+    // list already gone. Marking first is safe because the mark is counted — a
+    // second, payload-less call registers and immediately releases its own
+    // count, leaving the winner's intact.
+    let _wipe_guard = ActiveWipeGuard::new(job_id.clone());
+    let pending = PENDING_WIPE
+        .lock()
+        .map_err(|_| "Could not lock pending wipe state".to_string())?
+        .remove(&job_id)
+        .ok_or_else(|| format!("No pending wipe payload for job: {job_id}"))?;
 
     let pending_count = pending.paths.len();
     // When verification fails we keep every file AND leave the job actionable so
