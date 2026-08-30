@@ -31,6 +31,20 @@ serde_json = "1"
 sha1 = "0.10"
 dirs = "6"
 keyring = { version = "4", default-features = false, features = ["v1"] }
+# Held on 0.12 deliberately. The lockfile also carries reqwest 0.13, but that
+# copy belongs to `tauri` under a target gate for Android and non-macOS Apple,
+# so it is absent from every desktop graph and is in no binary this project
+# ships: `cargo tree -i reqwest@0.13 --target <any desktop triple>` prints
+# nothing. A reqwest/hyper/http advisory therefore only has to be checked
+# against this entry.
+#
+# Converging is not free. reqwest 0.13 drops the webpki-roots option, so trust
+# anchors move from the bundled Mozilla roots to the OS store, and ring is
+# replaced by aws-lc-rs, which needs NASM on Windows x86-64. That is a
+# user-visible TLS decision for self-hosted servers, worth taking on its own
+# merits against a real private-CA server rather than as a side effect of
+# removing a lockfile entry that costs nothing. No source change is required
+# when that day comes: 0.13 compiles as-is with features ["json", "rustls"].
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
 sysinfo = "0.33"
