@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, LazyLock, Mutex,
     },
     time::{Duration, Instant},
@@ -34,15 +34,21 @@ static RUNNING_IMPORTS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
 /// does not cover. `import_await_terminal` must observe this set as clear too.
 static FINALIZING_IMPORTS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
-/// Jobs whose confirmed wipe is running right now.
+/// How many confirmed wipes are running per job right now.
 ///
 /// The delete runs inside `import_confirm_wipe`, on a job that is already
 /// terminal, so neither `RUNNING_IMPORTS` nor `FINALIZING_IMPORTS` covers it.
-/// Without this set the app answers "nothing is live" while it hashes a whole
-/// card and moves originals to the Trash, and a quit abandons that delete
-/// halfway with the payload already consumed.
-static ACTIVE_WIPES: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+/// Without this the app answers "nothing is live" while it hashes a whole card
+/// and moves originals to the Trash, and a quit abandons that delete halfway
+/// with the payload already consumed.
+///
+/// Counted rather than a set of ids: a partly failed delete puts its retry
+/// payload back before the first call returns, so a second confirmation can be
+/// in flight for the SAME job while the first still runs. A plain set would let
+/// whichever finishes first clear the only mark and wave a quit through the
+/// other's delete.
+static ACTIVE_WIPES: LazyLock<Mutex<HashMap<String, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static JOB_INPUTS: LazyLock<Mutex<HashMap<String, ImportInput>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -54,6 +60,9 @@ const SCAN_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// `Instant`'s `Add` overflow panic.
 const MAX_AWAIT_TERMINAL_TIMEOUT_MS: u64 = 600_000;
 const IMPORT_WORKER_PANIC_ERROR: &str = "Import worker stopped unexpectedly.";
+/// Summary published for every cancelled run, by `import_cancel` and by a worker
+/// that observes the raised flag. Pinned here so the two cannot drift.
+const CANCELLED_SUMMARY: &str = "Import cancelled by user.";
 const PENDING_WIPE_STORE_ERROR: &str =
     "Could not prepare wipe confirmation; source files were kept on disk. Import the source again to retry the delete.";
 /// Returned when a forecast's walk stops answering.
@@ -65,24 +74,29 @@ const PENDING_WIPE_STORE_ERROR: &str =
 const FORECAST_UNRESPONSIVE_ERROR: &str =
     "The source stopped responding, so the server check timed out. Check the drive or network share, then try again.";
 
-/// Ceiling for the staging step of a hand-picked import. Shorter than
-/// `SCAN_DEADLINE` because staging only stats each selected file and links it
-/// into a temp dir: half an hour is far above any healthy card, and a bound
-/// this side of "forever" is what lets the app quit when a mount dies.
-const STAGING_DEADLINE: Duration = Duration::from_secs(30 * 60);
+/// How long the staging step may make no progress at all before the worker stops
+/// waiting for it.
+///
+/// A stall, not a duration cap: staging copies whole files when neither a
+/// symlink nor a hard link is possible (Windows without developer mode, or
+/// across volumes), so a healthy large selection can legitimately run for hours.
+/// One staged file, or one copied chunk, resets it. A minute of complete silence
+/// from a card or share is not something a working source does.
+const STAGING_STALL: Duration = Duration::from_secs(60);
 /// How long a cancelled blocking walk may take to notice the flag before the
 /// worker abandons it. Staging checks the flag between files, so a responsive
 /// source releases well inside this; a dead mount never does.
 const CANCEL_ABANDON_GRACE: Duration = Duration::from_secs(5);
 /// Poll step for `join_bounded`. Blocking joins are not hot paths; this only
-/// decides how promptly a cancel or a deadline is noticed.
+/// decides how promptly a cancel or a stall is noticed.
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// What became of a bounded blocking task.
 enum BoundedJoin<T> {
     /// The task returned on its own.
     Finished(T),
-    /// The bound passed first. The task was abandoned and the cancel flag set.
+    /// The bound passed with the task neither returning nor making progress, so
+    /// it was abandoned.
     TimedOut,
     /// The task was cancelled but did not return within the grace, so it was
     /// abandoned.
@@ -100,13 +114,25 @@ enum BoundedJoin<T> {
 /// the same trade `scan_sources_stream` already takes. The alternative is worse:
 /// the command never resolves, and a worker holding a liveness marker refuses
 /// app quit forever.
+///
+/// `bound` is measured from the last observed progress when the task reports any
+/// through `progress`, and from the start of the wait when it does not. That
+/// distinction is what keeps a legitimately long job — staging that has to copy
+/// gigabytes — from being called unresponsive.
+///
+/// `cancel` is only ever READ here. It is the user's cancellation, and callers
+/// publish a cancelled run when it is set, so raising it on a timeout would
+/// report a dead mount as something the user asked for. Stopping a merely slow
+/// walk is the task's own business.
 async fn join_bounded<T>(
     mut task: tauri::async_runtime::JoinHandle<T>,
     bound: Duration,
     cancel: &AtomicBool,
     cancel_grace: Duration,
+    progress: Option<&AtomicU64>,
 ) -> Result<BoundedJoin<T>, String> {
-    let bound_deadline = Instant::now() + bound;
+    let mut bound_deadline = Instant::now() + bound;
+    let mut seen_progress = progress.map(|counter| counter.load(Ordering::Relaxed));
     let mut abandon_after: Option<Instant> = None;
     loop {
         if let Ok(joined) = tokio::time::timeout(JOIN_POLL_INTERVAL, &mut task).await {
@@ -115,10 +141,14 @@ async fn join_bounded<T>(
                 .map_err(|error| error.to_string());
         }
         let now = Instant::now();
+        if let (Some(counter), Some(seen)) = (progress, seen_progress.as_mut()) {
+            let current = counter.load(Ordering::Relaxed);
+            if current != *seen {
+                *seen = current;
+                bound_deadline = now + bound;
+            }
+        }
         if now >= bound_deadline {
-            // Tell the walk to stop, in case it is merely slow rather than
-            // blocked: then it drops its own guard and cleans up after itself.
-            cancel.store(true, Ordering::Relaxed);
             return Ok(BoundedJoin::TimedOut);
         }
         if cancel.load(Ordering::Relaxed) {
@@ -239,20 +269,26 @@ struct ActiveWipeGuard {
 
 impl ActiveWipeGuard {
     fn new(job_id: String) -> Self {
-        ACTIVE_WIPES
+        *ACTIVE_WIPES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(job_id.clone());
+            .entry(job_id.clone())
+            .or_insert(0) += 1;
         Self { job_id }
     }
 }
 
 impl Drop for ActiveWipeGuard {
     fn drop(&mut self) {
-        ACTIVE_WIPES
+        let mut wipes = ACTIVE_WIPES
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.job_id);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = wipes.get_mut(&self.job_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                wipes.remove(&self.job_id);
+            }
+        }
     }
 }
 
@@ -502,16 +538,38 @@ fn insert_initial_job(
 }
 
 fn set_job(job: ImportJob) -> Result<(), String> {
+    store_job(job, false).map(|_| ())
+}
+
+/// Publish `job` only while the stored status is still active, reporting whether
+/// the write landed.
+///
+/// The check and the write share one `JOBS` hold, so a worker that publishes its
+/// terminal state in the same instant cannot be overwritten from a stale
+/// snapshot. `import_cancel` needs that: it reads the job, sets the cancel flag,
+/// and only then writes `Cancelled`, and a run that finished in that gap must
+/// keep the outcome it published — otherwise the card says `Cancelled` while the
+/// history record, written by the worker, says something else.
+fn set_job_if_active(job: ImportJob) -> Result<bool, String> {
+    store_job(job, true)
+}
+
+fn store_job(job: ImportJob, require_active: bool) -> Result<bool, String> {
+    let wrote;
     let evicted_ids = {
         let mut jobs = JOBS
             .lock()
             .map_err(|_| "Could not lock import job state".to_string())?;
         let Some(index) = jobs.iter().position(|existing| existing.id == job.id) else {
-            return Ok(());
+            return Ok(false);
         };
+        if require_active && !is_active(&jobs[index].status) {
+            return Ok(false);
+        }
 
         let terminal = is_terminal(&job.status);
         jobs[index] = job;
+        wrote = true;
         // Terminal jobs are ordered by their last state transition so eviction
         // keeps the most recently completed/cancelled/failed jobs.
         if terminal {
@@ -521,7 +579,27 @@ fn set_job(job: ImportJob) -> Result<(), String> {
         evict_old_terminal_jobs(&mut jobs)
     };
     remove_job_state(&evicted_ids);
-    Ok(())
+    Ok(wrote)
+}
+
+/// The one shape a cancelled run is published in, wherever the cancel is
+/// observed. `import_cancel` and a worker that reads the raised flag must agree,
+/// or the card and the history record disagree about the same run.
+///
+/// The counts are cleared with the status, matching what `import_cancel` and the
+/// worker's own cancel branch have always published: a cancelled run reports the
+/// cancellation, not a partial tally the user cannot act on.
+fn cancelled_state(job: ImportJob) -> ImportJob {
+    ImportJob {
+        status: JobStatus::Cancelled,
+        error: None,
+        summary: Some(CANCELLED_SUMMARY.to_string()),
+        awaiting_wipe_confirmation: false,
+        pending_wipe_count: 0,
+        progress: JobProgress::default(),
+        file_errors: Vec::new(),
+        ..job
+    }
 }
 
 /// Commit a worker's terminal state for a job, refusing to move it out of
@@ -533,7 +611,14 @@ fn set_job(job: ImportJob) -> Result<(), String> {
 /// wipe payload in place, offering the user's originals for deletion after they
 /// asked the run to stop. The status check and the write share one lock hold so a
 /// cancellation cannot slip between them.
-fn finalize_job(update: ImportJob) -> ImportJob {
+///
+/// `cancel` is the run's cancel flag, read inside that same hold. A cancel is
+/// raised before it is published, so a worker finalizing in that gap would
+/// otherwise publish its own outcome, persist a history record from it, and only
+/// then be overwritten as `Cancelled` on the card. Reading the flag here decides
+/// the stored state and the record together. Callers with no flag to offer pass
+/// `None`.
+fn finalize_job(update: ImportJob, cancel: Option<&AtomicBool>) -> ImportJob {
     let mut cancelled_id: Option<String> = None;
     let mut evicted_ids: Vec<String> = Vec::new();
 
@@ -543,6 +628,15 @@ fn finalize_job(update: ImportJob) -> ImportJob {
         };
         let Some(index) = jobs.iter().position(|existing| existing.id == update.id) else {
             return update;
+        };
+        // Only while the stored job is still active: a run that already
+        // published its own terminal state keeps it, exactly as the two guards
+        // below insist, so a late cancel cannot relabel a finished run.
+        let update = match cancel {
+            Some(flag) if is_active(&jobs[index].status) && flag.load(Ordering::Relaxed) => {
+                cancelled_state(update)
+            }
+            _ => update,
         };
 
         if matches!(jobs[index].status, JobStatus::Cancelled)
@@ -797,6 +891,14 @@ fn album_link_target(organization: Organization, into_album: Option<&str>) -> Op
     Some(name.to_string())
 }
 
+/// The run-scoped inputs a history receipt needs that the job itself does not
+/// carry. They are decided once at admission and always travel together.
+struct RunRecord {
+    started_at: i64,
+    source_paths: Vec<String>,
+    request: ImportInput,
+}
+
 /// The history receipt for one terminal run.
 ///
 /// Pure, so the status mapping and the replayable request are testable without
@@ -804,16 +906,14 @@ fn album_link_target(organization: Organization, into_album: Option<&str>) -> Op
 /// a wrong mapping here misreports the run in History forever.
 fn run_history_record(
     update: &ImportJob,
-    started_at: i64,
-    source_paths: Vec<String>,
-    request: ImportInput,
+    record: RunRecord,
 ) -> crate::models::history::ImportRecord {
     crate::models::history::ImportRecord {
         id: update.id.clone(),
-        started_at,
+        started_at: record.started_at,
         finished_at: now_ms(),
         profile_id: update.profile_id.clone(),
-        source_paths,
+        source_paths: record.source_paths,
         // The album this run actually landed in, resolved from the name
         // immich-go targeted, rather than whatever id the picker sent.
         album_ids: update.album_id.clone().into_iter().collect(),
@@ -827,7 +927,7 @@ fn run_history_record(
         duplicates: update.progress.duplicates,
         errors: update.progress.errors,
         // Persist the request (source/options) so History can replay it.
-        request: Some(request),
+        request: Some(record.request),
     }
 }
 
@@ -839,15 +939,13 @@ fn run_history_record(
 fn persist_run_history(
     app: &tauri::AppHandle,
     update: &ImportJob,
-    started_at: i64,
-    source_paths: Vec<String>,
-    request: ImportInput,
+    record: RunRecord,
     checkpoint_eligible: bool,
 ) {
     let checkpoint_eligible = checkpoint_eligible && matches!(update.status, JobStatus::Completed);
     if let Err(err) = crate::services::store::append_history(
         app,
-        run_history_record(update, started_at, source_paths, request),
+        run_history_record(update, record),
         checkpoint_eligible,
     ) {
         let _ = logs::append_log(
@@ -875,17 +973,20 @@ fn persist_run_history(
 /// `FINALIZING_IMPORTS` marker is registered before `RUNNING_IMPORTS` is
 /// released so shutdown never sees a gap in which no map names this worker,
 /// and it covers the history write the same way the normal tail does.
-/// `finalize_job` decides the published status: a cancellation already written
-/// by `import_cancel` wins over the `Failed` candidate built here, and the
-/// record then reports what the user was actually shown.
+///
+/// `cancel` is the run's own cancel flag, and `finalize_job` reads it inside the
+/// `JOBS` hold that publishes the state, so the stored state and the history
+/// record below always agree about whether the run was cancelled. A cancel is
+/// raised before it is published: without that shared hold, a staging failure
+/// landing in the gap would publish `Failed`, persist a `Failed` record, and
+/// only then be overwritten as `Cancelled` on the card.
 fn finish_staging_exit(
     app: &tauri::AppHandle,
     job_id: &str,
     profile_id: &str,
     error: String,
-    started_at: i64,
-    source_paths: Vec<String>,
-    request: ImportInput,
+    cancel: &AtomicBool,
+    record: RunRecord,
 ) {
     if let Ok(mut finalizing) = FINALIZING_IMPORTS.lock() {
         finalizing.insert(job_id.to_string());
@@ -893,24 +994,27 @@ fn finish_staging_exit(
     if let Ok(mut running) = RUNNING_IMPORTS.lock() {
         running.remove(job_id);
     }
-    let update = finalize_job(ImportJob {
-        id: job_id.to_string(),
-        status: JobStatus::Failed,
-        progress: JobProgress {
-            total: 0,
-            uploaded: 0,
-            duplicates: 0,
-            errors: 1,
+    let update = finalize_job(
+        ImportJob {
+            id: job_id.to_string(),
+            status: JobStatus::Failed,
+            progress: JobProgress {
+                total: 0,
+                uploaded: 0,
+                duplicates: 0,
+                errors: 1,
+            },
+            error: Some(error),
+            summary: None,
+            awaiting_wipe_confirmation: false,
+            pending_wipe_count: 0,
+            file_errors: Vec::new(),
+            profile_id: profile_id.to_string(),
+            album_id: None,
         },
-        error: Some(error),
-        summary: None,
-        awaiting_wipe_confirmation: false,
-        pending_wipe_count: 0,
-        file_errors: Vec::new(),
-        profile_id: profile_id.to_string(),
-        album_id: None,
-    });
-    persist_run_history(app, &update, started_at, source_paths, request, false);
+        Some(cancel),
+    );
+    persist_run_history(app, &update, record, false);
     if let Ok(mut finalizing) = FINALIZING_IMPORTS.lock() {
         finalizing.remove(job_id);
     }
@@ -1056,23 +1160,41 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let mut staging_dir = if staging_requested {
             let selected_files = select_files.clone();
             let cancel_flag_for_staging = cancel_flag.clone();
-            let staging_deadline = Instant::now() + STAGING_DEADLINE;
+            let claim_roots = source_paths.clone();
+            // One counter, written by the staging walk and read by the waiter.
+            // Both apply the same test — has this source done anything lately —
+            // to the two halves of the problem: the walk sees the gap between
+            // files, and only the waiter can see a call stuck inside the kernel.
+            let staging_progress = Arc::new(AtomicU64::new(0));
+            let staging_progress_for_walk = staging_progress.clone();
             let staging_task = tauri::async_runtime::spawn_blocking(move || {
+                // Claimed on the walking task, and dropped there, so an
+                // abandoned staging walk keeps its claim until the filesystem
+                // answers. Without it every retry against a dead mount spawns
+                // another permanently blocked thread; with it the second attempt
+                // is refused by name, capping the leak at one thread per source
+                // exactly as the scan and forecast walks already are.
+                let _staging_roots = media_scanner::acquire_scan_roots(
+                    media_scanner::ScanPurpose::Stage,
+                    &claim_roots,
+                )?;
                 staging::create_staging_dir(
                     &selected_files,
                     Some(cancel_flag_for_staging.as_ref()),
-                    Some(staging_deadline),
+                    Some(STAGING_STALL),
+                    staging_progress_for_walk.as_ref(),
                 )
             });
             // Staging is the one filesystem walk in this worker, and the worker
             // holds the liveness markers app quit waits on. An unbounded join
             // here means a dead mount refuses shutdown forever, so the join is
-            // bounded and a cancel may abandon it.
+            // bounded by the same stall and a cancel may abandon it.
             let staged = join_bounded(
                 staging_task,
-                STAGING_DEADLINE,
+                STAGING_STALL,
                 cancel_flag.as_ref(),
                 CANCEL_ABANDON_GRACE,
+                Some(staging_progress.as_ref()),
             )
             .await;
             let staged_dir = match staged {
@@ -1100,9 +1222,12 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                         &job_id_clone,
                         &profile.id,
                         error,
-                        started_at,
-                        record_source_paths,
-                        history_request,
+                        cancel_flag.as_ref(),
+                        RunRecord {
+                            started_at,
+                            source_paths: record_source_paths,
+                            request: history_request,
+                        },
                     );
                     return;
                 }
@@ -1482,13 +1607,18 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // Cancelled; finalize_job refuses to move the job back out of it and
         // returns what is actually stored, so the log/history below record the
         // outcome the user was shown rather than the one this task computed.
-        let update = finalize_job(update);
+        // No cancel flag here: `cancelled` above was already re-read from it
+        // before the wipe payload was built, and the stored-`Cancelled` guard
+        // inside `finalize_job` covers a cancel that lands later.
+        let update = finalize_job(update, None);
         persist_run_history(
             &app_clone,
             &update,
-            started_at,
-            record_source_paths,
-            history_request,
+            RunRecord {
+                started_at,
+                source_paths: record_source_paths,
+                request: history_request,
+            },
             checkpoint_eligible,
         );
         // Finalization is complete only after the history write and warning
@@ -1646,6 +1776,7 @@ pub async fn import_forecast(
                 SCAN_DEADLINE,
                 cancellation.as_ref(),
                 CANCEL_ABANDON_GRACE,
+                None,
             )
             .await
             .map_err(|e| format!("Scan task failed: {e}"))?
@@ -1750,17 +1881,20 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
         return Err(format!("Job does not need wipe confirmation: {job_id}"));
     }
 
-    let pending = PENDING_WIPE
-        .lock()
-        .map_err(|_| "Could not lock pending wipe state".to_string())?
-        .remove(&job_id)
-        .ok_or_else(|| format!("No pending wipe payload for job: {job_id}"))?;
-
-    // From here the payload is consumed and originals are about to move to the
-    // Trash, so the app must count this as live work: hashing a full card and
-    // deleting file by file takes minutes, and a quit in the middle leaves the
-    // card half deleted with nothing left to retry from.
-    let _wipe_guard = ActiveWipeGuard::new(job_id.clone());
+    // Taking the payload and marking the wipe live happen under one hold of the
+    // payload lock. Split apart, a quit landing between them would see no live
+    // work for a delete whose file list is already consumed. Holding the lock
+    // also means only the caller that actually took the payload registers, so
+    // one mark can never be released by a second, payload-less call.
+    let (pending, _wipe_guard) = {
+        let mut payloads = PENDING_WIPE
+            .lock()
+            .map_err(|_| "Could not lock pending wipe state".to_string())?;
+        let pending = payloads
+            .remove(&job_id)
+            .ok_or_else(|| format!("No pending wipe payload for job: {job_id}"))?;
+        (pending, ActiveWipeGuard::new(job_id.clone()))
+    };
 
     let pending_count = pending.paths.len();
     // When verification fails we keep every file AND leave the job actionable so
@@ -2112,7 +2246,7 @@ pub async fn scan_cancel() -> Result<(), String> {
 
 #[tauri::command]
 pub async fn import_cancel(job_id: String) -> Result<(), String> {
-    let mut job = get_job(&job_id)?;
+    let job = get_job(&job_id)?;
     match &job.status {
         JobStatus::Running => {
             let running = RUNNING_IMPORTS
@@ -2129,15 +2263,22 @@ pub async fn import_cancel(job_id: String) -> Result<(), String> {
         }
     }
 
-    job.status = JobStatus::Cancelled;
-    job.awaiting_wipe_confirmation = false;
-    job.pending_wipe_count = 0;
-    job.error = None;
-    job.summary = Some("Import cancelled by user.".to_string());
+    // Published only while the job is still active. The worker can finalize in
+    // the gap between the status read above and this write, and its history
+    // record is written from the state it published; overwriting that state from
+    // this stale snapshot would leave the card and History disagreeing about the
+    // same run. A run that finished first keeps its outcome, and the caller is
+    // told the cancel was too late — the wording the frontend already treats as
+    // a won race rather than a failure.
+    if !set_job_if_active(cancelled_state(job))? {
+        return Err(format!("{TERMINAL_CANCEL_ERROR}: {job_id}"));
+    }
+    // Dropped only once the cancellation is the stored state, so a run that
+    // published a wipe prompt instead keeps the payload behind it.
     if let Ok(mut pending) = PENDING_WIPE.lock() {
         pending.remove(&job_id);
     }
-    set_job(job)
+    Ok(())
 }
 
 /// Wait for a job to reach a terminal status, for its run to exit, and for
@@ -2385,7 +2526,8 @@ mod tests {
         let source = tmp.join("photo.jpg");
         std::fs::write(&source, b"photo").unwrap();
         let selected = vec![source.to_string_lossy().into_owned()];
-        let mut staged = staging::create_staging_dir(&selected, None, None).unwrap();
+        let mut staged =
+            staging::create_staging_dir(&selected, None, None, &AtomicU64::new(0)).unwrap();
         let invocation_root = staged.path().to_path_buf();
         let links = staged.take_links();
         let run = crate::services::stdout_parser::parse_run_progress(
@@ -2422,7 +2564,8 @@ mod tests {
                 path.to_string_lossy().into_owned()
             })
             .collect();
-        let mut staged = staging::create_staging_dir(&selected, None, None).unwrap();
+        let mut staged =
+            staging::create_staging_dir(&selected, None, None, &AtomicU64::new(0)).unwrap();
         let invocation_root = staged.path().to_path_buf();
         let links = staged.take_links();
         let log = links
@@ -2466,7 +2609,8 @@ mod tests {
         let source = tmp.join("failed.jpg");
         std::fs::write(&source, b"failed").unwrap();
         let selected = vec![source.to_string_lossy().into_owned()];
-        let mut staged = staging::create_staging_dir(&selected, None, None).unwrap();
+        let mut staged =
+            staging::create_staging_dir(&selected, None, None, &AtomicU64::new(0)).unwrap();
         let invocation_root = staged.path().to_path_buf();
         let links = staged.take_links();
         let (destination, _) = &links.entries()[0];
@@ -2696,7 +2840,7 @@ mod tests {
         let mut late_completion = failed.clone();
         late_completion.status = JobStatus::Completed;
         late_completion.error = None;
-        let preserved = finalize_job(late_completion);
+        let preserved = finalize_job(late_completion, None);
         assert!(matches!(preserved.status, JobStatus::Failed));
         assert!(JOB_INPUTS.lock().unwrap().contains_key(&job_id));
         lock_jobs().retain(|job| job.id != job_id);
@@ -2919,7 +3063,7 @@ mod tests {
         let mut failed = terminal_job(&job_id, false);
         failed.status = JobStatus::Failed;
         failed.error = Some("Staging task failed".to_string());
-        let returned = finalize_job(failed);
+        let returned = finalize_job(failed, None);
         assert!(matches!(returned.status, JobStatus::Cancelled));
         let stored = get_job(&job_id).expect("the cancelled job must remain stored");
         assert!(matches!(stored.status, JobStatus::Cancelled));
@@ -2972,13 +3116,18 @@ mod tests {
             Duration::from_millis(150),
             cancel.as_ref(),
             CANCEL_ABANDON_GRACE,
+            None,
         ))
         .expect("an abandoned join is not a join failure");
 
         assert!(matches!(outcome, BoundedJoin::TimedOut));
+        // The bound must NOT raise the user's cancel flag: callers publish a
+        // cancelled run when it is set, so a dead mount would be reported as
+        // something the user asked for. The caller's own walk deadline is what
+        // stops a merely slow walk.
         assert!(
-            cancel.load(Ordering::Relaxed),
-            "the bound must also ask a merely slow walk to stop"
+            !cancel.load(Ordering::Relaxed),
+            "a timeout is not a user cancellation"
         );
         // Let the leaked thread finish so it does not outlive the test binary.
         release.store(true, Ordering::Relaxed);
@@ -3004,6 +3153,7 @@ mod tests {
             Duration::from_secs(60),
             cancel.as_ref(),
             Duration::from_millis(120),
+            None,
         ))
         .expect("an abandoned join is not a join failure");
 
@@ -3013,6 +3163,77 @@ mod tests {
             "the cancel, not the bound, must release the caller"
         );
         release.store(true, Ordering::Relaxed);
+    }
+
+    /// `import_cancel` raises the cancel flag before it writes `Cancelled`, so a
+    /// staging failure can land in that gap. The worker must publish the cancel
+    /// it observed rather than a `Failed` that the cancel then overwrites: the
+    /// history record is written from this state and cannot be corrected later.
+    #[test]
+    fn a_staging_exit_that_saw_the_cancel_flag_records_a_cancelled_run() {
+        // Still `Running` in JOBS, exactly as it is before `import_cancel`'s
+        // `set_job` lands, so `finalize_job` cannot preserve anything.
+        let job_id = format!("staging-cancel-race-{}", Uuid::new_v4());
+        let mut running = terminal_job(&job_id, false);
+        running.status = JobStatus::Running;
+        lock_jobs().push(running);
+
+        // The worker's own candidate is `Failed`; the raised cancel flag, read
+        // under the `JOBS` lock, is what turns it into the published cancel.
+        let cancel = AtomicBool::new(true);
+        let published = finalize_job(
+            ImportJob {
+                status: JobStatus::Failed,
+                error: Some("Could not stage selected files".to_string()),
+                progress: JobProgress {
+                    total: 0,
+                    uploaded: 0,
+                    duplicates: 0,
+                    errors: 1,
+                },
+                ..terminal_job(&job_id, false)
+            },
+            Some(&cancel),
+        );
+        let record = run_history_record(
+            &published,
+            RunRecord {
+                started_at: 0,
+                source_paths: Vec::new(),
+                request: replayable_input("p1"),
+            },
+        );
+
+        assert!(matches!(published.status, JobStatus::Cancelled));
+        assert_eq!(record.status.as_wire(), "cancelled");
+        assert_eq!(record.errors, 0, "a cancelled run reports no error count");
+
+        lock_jobs().retain(|job| job.id != job_id);
+    }
+
+    /// A staging walk claims its source roots on the walking task, so a walk
+    /// abandoned on a dead mount keeps the claim. Without it, every retry spawns
+    /// another permanently blocked thread.
+    #[test]
+    fn a_second_staging_walk_of_a_held_root_is_refused_by_name() {
+        let root = format!("/Volumes/CARD-{}", Uuid::new_v4());
+        let roots = vec![root.clone()];
+        let held = media_scanner::acquire_scan_roots(media_scanner::ScanPurpose::Stage, &roots)
+            .expect("the first staging walk claims the root");
+
+        let refused = media_scanner::acquire_scan_roots(media_scanner::ScanPurpose::Stage, &roots)
+            .expect_err("a held staging root must refuse the next walk");
+        assert!(
+            refused.contains(&root),
+            "the refusal names the source: {refused}"
+        );
+
+        // A scan of the same root claims a different namespace and is unaffected.
+        let scanning = media_scanner::acquire_scan_roots(media_scanner::ScanPurpose::Scan, &roots)
+            .expect("a scan must not be blocked by a staging claim");
+
+        drop(scanning);
+        drop(held);
     }
 
     /// The delete runs on an already terminal job, so neither worker map covers
@@ -3031,15 +3252,88 @@ mod tests {
             assert!(ACTIVE_WIPES
                 .lock()
                 .expect("wipe state is readable")
-                .contains(&job_id));
+                .contains_key(&job_id));
         }
         assert!(
             !ACTIVE_WIPES
                 .lock()
                 .expect("wipe state is readable")
-                .contains(&job_id),
+                .contains_key(&job_id),
             "every exit from the wipe, including an error return, must release the mark"
         );
+    }
+
+    /// A partly failed delete puts its retry payload back before the first call
+    /// returns, so a second confirmation for the SAME job can be in flight while
+    /// the first still runs. Whichever finishes first must not clear the mark the
+    /// other one is relying on.
+    #[test]
+    fn overlapping_wipes_for_one_job_keep_the_mark_until_the_last_finishes() {
+        let job_id = format!("wipe-overlap-{}", Uuid::new_v4());
+        let first = ActiveWipeGuard::new(job_id.clone());
+        let second = ActiveWipeGuard::new(job_id.clone());
+
+        drop(first);
+        assert!(
+            ACTIVE_WIPES
+                .lock()
+                .expect("wipe state is readable")
+                .contains_key(&job_id),
+            "the second delete is still running, so the job stays live work"
+        );
+
+        drop(second);
+        assert!(!ACTIVE_WIPES
+            .lock()
+            .expect("wipe state is readable")
+            .contains_key(&job_id));
+    }
+
+    /// A cancel that loses the race to the worker's own terminal write must not
+    /// relabel the run. The worker has already written a history record from the
+    /// state it published, and that record cannot be corrected afterwards, so the
+    /// card has to keep agreeing with it.
+    #[test]
+    fn a_cancel_cannot_relabel_a_run_that_already_finished() {
+        let job_id = format!("cancel-too-late-{}", Uuid::new_v4());
+        let mut finished = terminal_job(&job_id, false);
+        finished.status = JobStatus::Completed;
+        finished.summary = Some("Upload completed.".to_string());
+        lock_jobs().push(finished);
+
+        let published = set_job_if_active(cancelled_state(terminal_job(&job_id, false)))
+            .expect("job state is readable");
+
+        assert!(!published, "a finished run must refuse the late cancel");
+        let stored = get_job(&job_id).expect("the finished job must remain stored");
+        assert!(matches!(stored.status, JobStatus::Completed));
+        assert_eq!(stored.summary.as_deref(), Some("Upload completed."));
+
+        lock_jobs().retain(|job| job.id != job_id);
+    }
+
+    /// The same publish over a live run lands, so a cancel of an import that is
+    /// still working keeps its authority.
+    #[test]
+    fn a_cancel_publishes_over_a_running_job() {
+        let job_id = format!("cancel-running-{}", Uuid::new_v4());
+        let mut running = terminal_job(&job_id, true);
+        running.status = JobStatus::Running;
+        lock_jobs().push(running);
+
+        let published = set_job_if_active(cancelled_state(terminal_job(&job_id, true)))
+            .expect("job state is readable");
+
+        assert!(published);
+        let stored = get_job(&job_id).expect("the cancelled job must remain stored");
+        assert!(matches!(stored.status, JobStatus::Cancelled));
+        assert_eq!(stored.summary.as_deref(), Some(CANCELLED_SUMMARY));
+        assert!(
+            !stored.awaiting_wipe_confirmation,
+            "a cancelled run must never offer a delete prompt"
+        );
+
+        lock_jobs().retain(|job| job.id != job_id);
     }
 
     /// A responsive task still wins: a cancel it notices returns its own error,
@@ -3060,6 +3354,7 @@ mod tests {
             Duration::from_secs(60),
             cancel.as_ref(),
             CANCEL_ABANDON_GRACE,
+            None,
         ))
         .expect("a returning task is not a join failure");
 
@@ -3086,12 +3381,14 @@ mod tests {
         // run the user already cancelled.
         let mut failed = terminal_job(&job_id, false);
         failed.status = JobStatus::Failed;
-        let published = finalize_job(failed);
+        let published = finalize_job(failed, None);
         let record = run_history_record(
             &published,
-            1_000,
-            vec!["/Volumes/CARD".to_string()],
-            replayable_input("p1"),
+            RunRecord {
+                started_at: 1_000,
+                source_paths: vec!["/Volumes/CARD".to_string()],
+                request: replayable_input("p1"),
+            },
         );
 
         assert_eq!(record.status.as_wire(), "cancelled");
@@ -3110,7 +3407,14 @@ mod tests {
     fn a_failed_staging_exit_records_a_failed_run() {
         let mut failed = terminal_job("staging-failed-record", false);
         failed.status = JobStatus::Failed;
-        let record = run_history_record(&failed, 0, Vec::new(), replayable_input("p1"));
+        let record = run_history_record(
+            &failed,
+            RunRecord {
+                started_at: 0,
+                source_paths: Vec::new(),
+                request: replayable_input("p1"),
+            },
+        );
 
         assert_eq!(record.status.as_wire(), "failed");
     }

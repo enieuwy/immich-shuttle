@@ -16,6 +16,7 @@ import {
   importRetry,
   importStart,
 } from "$lib/api";
+import { BackendError } from "$lib/backendErrors";
 import { errorsState } from "$lib/state/errors";
 import { historyState } from "$lib/state/history";
 import type { ImportJob, ImportOrganization } from "$lib/types";
@@ -480,8 +481,14 @@ export const queueState = {
     try {
       await importRetry(jobId);
       await refreshJobs();
-    } catch {
-      errorsState.addError("Could not retry import.");
+    } catch (error) {
+      // Admission refuses a retry for the moment a cancelled run needs to finish
+      // writing its history, and says so. Replacing that with a generic failure
+      // turns "try again in a moment" into a dead end, so the backend's own
+      // sentence is shown when there is one.
+      errorsState.addError(
+        error instanceof BackendError ? error.backendMessage : "Could not retry import.",
+      );
     }
   },
   async dismiss(jobId: string) {

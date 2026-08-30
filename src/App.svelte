@@ -190,9 +190,14 @@
       void (async () => {
         try {
           // Nothing is cancelled when only a delete is live: it has no cancel
-          // path, so the honest offer is to wait for it, not to stop it.
+          // path, so the honest offer is to wait for it, not to stop it. A
+          // retained id from an earlier timed-out attempt still gets re-awaited,
+          // so it counts as import work and keeps the import wording.
           const deletingOnly =
-            pendingWipes.length > 0 && runningJobIds.length === 0 && pendingStarts.length === 0;
+            pendingWipes.length > 0 &&
+            runningJobIds.length === 0 &&
+            pendingStarts.length === 0 &&
+            shutdownPendingJobIds.size === 0;
           const shouldQuit = await confirm(
             deletingOnly
               ? "A verified delete is still running. Quit once it finishes?"

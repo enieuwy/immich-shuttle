@@ -12,9 +12,10 @@ use fs4::fs_std::FileExt;
 use std::{
     collections::HashSet,
     fs,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
-    time::Instant,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -114,24 +115,29 @@ impl Drop for StagingDir {
     }
 }
 
-/// Returned when `deadline` passes before staging finished.
+/// Returned when the source stops making progress before staging finished.
 ///
-/// The worker maps this to a terminal run, so the text is what the user reads
-/// on the queue card when a card or share stops answering mid-staging.
+/// The worker maps this to a terminal run, so the text is what the user reads on
+/// the queue card when a card or share stops answering mid-staging.
 pub const STAGING_TIMED_OUT_ERROR: &str = "Staging timed out: the source stopped responding";
 
 /// Build a staging directory linking to `selected`. The returned guard removes
 /// the directory if it is not explicitly cleaned up. If `cancel` is set, staging
 /// stops before linking the next selected file and drops its partial directory.
 ///
-/// `deadline` bounds the whole walk the way `scan_directory_streaming` bounds a
-/// scan: it is checked before each selected file, so it caps a slow source but
-/// cannot interrupt a single `is_file`/`link_file` call already blocked in the
-/// kernel. Only abandoning the join bounds that case; see `join_bounded`.
+/// `stall` bounds how long the source may make NO progress, not how long staging
+/// may take. A total-duration cap would be wrong here: `link_file` falls back to
+/// copying whole files when neither a symlink nor a hard link is possible — on
+/// Windows without developer mode, or across volumes — so a healthy large
+/// selection can legitimately run for hours. Progress is one staged file, or one
+/// chunk of one file being copied, and `progress` reports it to the caller so it
+/// can apply the same test to a call blocked inside the kernel, which this loop
+/// cannot see.
 pub fn create_staging_dir(
     selected: &[String],
     cancel: Option<&AtomicBool>,
-    deadline: Option<Instant>,
+    stall: Option<Duration>,
+    progress: &AtomicU64,
 ) -> Result<StagingDir, String> {
     if selected.is_empty() {
         return Err("No files selected to stage".to_string());
@@ -155,11 +161,18 @@ pub fn create_staging_dir(
     let base = common_ancestor(selected);
     let mut linked = 0_usize;
     let mut used: HashSet<PathBuf> = HashSet::new();
+    let mut last_progress = Instant::now();
+    let mut seen_progress = progress.load(Ordering::Relaxed);
     for entry in selected {
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Err("Staging cancelled".to_string());
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        let now_progress = progress.load(Ordering::Relaxed);
+        if now_progress != seen_progress {
+            seen_progress = now_progress;
+            last_progress = Instant::now();
+        }
+        if stall.is_some_and(|stall| last_progress.elapsed() >= stall) {
             return Err(STAGING_TIMED_OUT_ERROR.to_string());
         }
         let src = Path::new(entry);
@@ -198,12 +211,16 @@ pub fn create_staging_dir(
         // A single unreadable/locked/failed file must not abort the whole batch;
         // skip it and keep staging the rest. The `linked == 0` check below still
         // fails the run when nothing could be staged at all.
-        if link_file(src, &dest).is_err() {
+        if link_file(src, &dest, progress).is_err() {
             continue;
         }
         guard.links.push(dest.clone(), PathBuf::from(entry));
         used.insert(dest);
         linked += 1;
+        // A staged file is progress even when it cost one symlink syscall, which
+        // is the whole cost on a healthy card. Without this tick, a run of many
+        // small files would look stalled to the watchdog above.
+        progress.fetch_add(1, Ordering::Relaxed);
     }
 
     if linked == 0 {
@@ -236,7 +253,14 @@ pub(crate) fn acquire_dir_lock(dir: &Path) -> std::io::Result<fs::File> {
     }
 }
 
-fn link_file(src: &Path, dest: &Path) -> Result<(), String> {
+/// Link `src` into `dest`, falling back to a copy, and report bytes moved.
+///
+/// The copy is chunked rather than `fs::copy` so a single large file still ticks
+/// `progress`. Callers use that tick to tell a source that is working from one
+/// that has stopped answering; a whole-file `fs::copy` looks identical to a dead
+/// mount for as long as it runs, which on Windows or across volumes — the only
+/// cases that reach the fallback — can be minutes per file.
+fn link_file(src: &Path, dest: &Path, progress: &AtomicU64) -> Result<(), String> {
     #[cfg(unix)]
     {
         if std::os::unix::fs::symlink(src, dest).is_ok() {
@@ -252,9 +276,26 @@ fn link_file(src: &Path, dest: &Path) -> Result<(), String> {
     if fs::hard_link(src, dest).is_ok() {
         return Ok(());
     }
-    fs::copy(src, dest)
-        .map(|_| ())
+    copy_reporting_progress(src, dest, progress)
         .map_err(|e| format!("Could not stage {}: {e}", src.display()))
+}
+
+/// Chunk size for the copy fallback. Large enough that the read/write syscalls
+/// dominate the loop, small enough that a working source ticks progress often.
+const COPY_CHUNK: usize = 1024 * 1024;
+
+fn copy_reporting_progress(src: &Path, dest: &Path, progress: &AtomicU64) -> std::io::Result<()> {
+    let mut reader = fs::File::open(src)?;
+    let mut writer = fs::File::create(dest)?;
+    let mut buf = vec![0u8; COPY_CHUNK];
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            return Ok(());
+        }
+        writer.write_all(&buf[..read])?;
+        progress.fetch_add(read as u64, Ordering::Relaxed);
+    }
 }
 
 /// Longest common directory prefix of the parents of all paths.
@@ -325,6 +366,7 @@ mod tests {
             ],
             None,
             None,
+            &AtomicU64::new(0),
         )
         .unwrap();
 
@@ -354,7 +396,7 @@ mod tests {
 
     #[test]
     fn empty_selection_errors() {
-        assert!(create_staging_dir(&[], None, None).is_err());
+        assert!(create_staging_dir(&[], None, None, &AtomicU64::new(0)).is_err());
     }
 
     #[test]
@@ -374,6 +416,7 @@ mod tests {
             ],
             Some(&cancel),
             None,
+            &AtomicU64::new(0),
         ) {
             Err(error) => error,
             Ok(_) => panic!("pre-cancelled staging must fail"),
@@ -383,26 +426,61 @@ mod tests {
         fs::remove_dir_all(&tmp).unwrap();
     }
 
-    /// A source that answers too slowly must end the run instead of holding the
+    /// A source that has gone silent must end the run instead of holding the
     /// import worker — and its liveness markers — forever. The originals stay
     /// untouched, and the partial staging directory drops with the guard.
     #[test]
-    fn an_expired_deadline_stops_staging_and_keeps_the_originals() {
-        let tmp = std::env::temp_dir().join(format!("stage-deadline-{}", Uuid::new_v4()));
+    fn a_stalled_source_stops_staging_and_keeps_the_originals() {
+        let tmp = std::env::temp_dir().join(format!("stage-stall-{}", Uuid::new_v4()));
         fs::create_dir_all(&tmp).unwrap();
         let a = tmp.join("a.jpg");
         fs::write(&a, b"a").unwrap();
-        // Already passed: the check runs before the first file is linked.
-        let deadline = Instant::now() - std::time::Duration::from_secs(1);
-
-        let error =
-            match create_staging_dir(&[a.to_string_lossy().to_string()], None, Some(deadline)) {
-                Err(error) => error,
-                Ok(_) => panic!("staging past its deadline must fail"),
-            };
+        // Zero tolerance for silence: the check runs before the first file is
+        // staged, when nothing has reported progress yet.
+        let error = match create_staging_dir(
+            &[a.to_string_lossy().to_string()],
+            None,
+            Some(Duration::ZERO),
+            &AtomicU64::new(0),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a stalled source must fail the run"),
+        };
 
         assert_eq!(error, STAGING_TIMED_OUT_ERROR);
         assert!(a.exists(), "a timed-out staging run must not touch sources");
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The bound is silence, not duration: a source that keeps staging files is
+    /// never called unresponsive, however long the whole selection takes. This is
+    /// what a large hand-picked import looks like when `link_file` has to copy.
+    #[test]
+    fn a_source_that_keeps_working_is_never_called_stalled() {
+        let tmp = std::env::temp_dir().join(format!("stage-progress-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let selected: Vec<String> = (0..12)
+            .map(|index| {
+                let file = tmp.join(format!("IMG_{index}.jpg"));
+                fs::write(&file, b"x").unwrap();
+                file.to_string_lossy().to_string()
+            })
+            .collect();
+        let progress = AtomicU64::new(0);
+
+        // Short enough that a total-duration bound of this size would fire part
+        // way through; each staged file resets it instead.
+        let staged =
+            create_staging_dir(&selected, None, Some(Duration::from_millis(50)), &progress)
+                .expect("a source making progress must stage every file");
+
+        assert_eq!(staged.links().entries().len(), 12);
+        assert_eq!(
+            progress.load(Ordering::Relaxed),
+            12,
+            "each staged file reports progress, symlink or copy"
+        );
+        cleanup_staging_dir(staged);
         fs::remove_dir_all(&tmp).unwrap();
     }
 
@@ -424,6 +502,7 @@ mod tests {
             ],
             None,
             None,
+            &AtomicU64::new(0),
         )
         .unwrap();
 
@@ -477,9 +556,13 @@ mod tests {
 
         // Craft the first entry with literal `..` segments relative to the second.
         let crafted = format!("{}/album/../evilfile.jpg", tmp.to_string_lossy());
-        let staged =
-            create_staging_dir(&[crafted, normal.to_string_lossy().to_string()], None, None)
-                .unwrap();
+        let staged = create_staging_dir(
+            &[crafted, normal.to_string_lossy().to_string()],
+            None,
+            None,
+            &AtomicU64::new(0),
+        )
+        .unwrap();
 
         for entry in walkdir_files(staged.path()) {
             assert!(
@@ -503,8 +586,13 @@ mod tests {
         fs::write(&source, b"x").unwrap();
 
         let staged_path = {
-            let staged =
-                create_staging_dir(&[source.to_string_lossy().to_string()], None, None).unwrap();
+            let staged = create_staging_dir(
+                &[source.to_string_lossy().to_string()],
+                None,
+                None,
+                &AtomicU64::new(0),
+            )
+            .unwrap();
             let path = staged.path().to_path_buf();
             assert!(path.exists());
             path

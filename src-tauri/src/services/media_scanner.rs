@@ -29,13 +29,15 @@ pub(crate) const CLAIM_GRACE: Duration = Duration::from_secs(5);
 static IN_FLIGHT_SCAN_ROOTS: LazyLock<(Mutex<HashSet<String>>, Condvar)> =
     LazyLock::new(|| (Mutex::new(HashSet::new()), Condvar::new()));
 
-/// Which walk owns a claim. The grid scan and the preflight forecast walk the
-/// same roots for different answers and legitimately run at the same time, so
-/// they claim in separate namespaces and never block each other.
+/// Which walk owns a claim. The grid scan, the preflight forecast, and the
+/// staging step of a hand-picked import walk the same roots for different
+/// answers and legitimately run at the same time, so they claim in separate
+/// namespaces and never block each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScanPurpose {
     Scan,
     Forecast,
+    Stage,
 }
 
 impl fmt::Display for ScanPurpose {
@@ -43,6 +45,7 @@ impl fmt::Display for ScanPurpose {
         match self {
             ScanPurpose::Scan => f.write_str("scan"),
             ScanPurpose::Forecast => f.write_str("forecast"),
+            ScanPurpose::Stage => f.write_str("stage"),
         }
     }
 }

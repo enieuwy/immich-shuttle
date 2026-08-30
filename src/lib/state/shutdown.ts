@@ -118,12 +118,17 @@ export async function runImportShutdown(deps: ShutdownDeps): Promise<ShutdownOut
 
   await Promise.allSettled(deps.pendingStarts);
 
+  // Retained before anything can return early. A worker whose status has gone
+  // terminal may still be finalizing, and only `awaitTerminal` can see that
+  // phase; without the id, a later attempt finds no running job, no retained
+  // id, and quits straight through the run's history write.
+  for (const jobId of deps.runningJobIds) {
+    deps.retainedJobIds.add(jobId);
+  }
+
   // Waited on before anything is cancelled: this quit may still be refused, and
   // a refused quit must not have stopped a running import on the way.
-  if (
-    deps.pendingWipes.length > 0 &&
-    !(await settledWithin(deps.pendingWipes, timeoutMs))
-  ) {
+  if (deps.pendingWipes.length > 0 && !(await settledWithin(deps.pendingWipes, timeoutMs))) {
     return { kind: "incomplete", message: WIPE_INCOMPLETE_MESSAGE };
   }
 

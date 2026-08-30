@@ -221,14 +221,38 @@ describe("runImportShutdown", () => {
   it("refuses the quit when a wipe outlives the timeout", async () => {
     const wipe = Promise.withResolvers<void>();
     const cancelImport = vi.fn(() => Promise.resolve());
+    const retainedJobIds = new Set<string>();
 
     const outcome = await runImportShutdown(
-      deps({ pendingWipes: [wipe.promise], timeoutMs: 20, cancelImport, runningJobIds: ["job-1"] }),
+      deps({
+        pendingWipes: [wipe.promise],
+        timeoutMs: 20,
+        cancelImport,
+        runningJobIds: ["job-1"],
+        retainedJobIds,
+      }),
     );
 
     expect(outcome).toEqual({ kind: "incomplete", message: WIPE_INCOMPLETE_MESSAGE });
     // A refused quit must not have cancelled the running import on the way.
     expect(cancelImport).not.toHaveBeenCalled();
+    // The refused attempt must still carry the worker forward: its status can go
+    // terminal while finalization runs, and only awaitTerminal sees that phase,
+    // so a second attempt with no retained id would quit through the history write.
+    expect([...retainedJobIds]).toEqual(["job-1"]);
     wipe.resolve();
+  });
+
+  /** The retained id from a refused attempt is awaited by the next one. */
+  it("re-awaits a job retained by a wipe-refused attempt", async () => {
+    const awaitTerminal = vi.fn(() => Promise.resolve({}));
+    const retainedJobIds = new Set<string>(["job-1"]);
+
+    const outcome = await runImportShutdown(
+      deps({ retainedJobIds, awaitTerminal, runningJobIds: [] }),
+    );
+
+    expect(outcome).toEqual({ kind: "complete" });
+    expect(awaitTerminal).toHaveBeenCalledWith("job-1", 1_000);
   });
 });

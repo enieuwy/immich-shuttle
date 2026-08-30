@@ -53,6 +53,7 @@ import { historyState } from "./history";
 import { errorsState } from "./errors";
 import { importOptionsState } from "./import-options";
 import { get } from "svelte/store";
+import { BackendError } from "$lib/backendErrors";
 import type { ImportJob } from "$lib/types";
 
 type TestProfile = Parameters<typeof profilesState.saveProfile>[0];
@@ -234,6 +235,19 @@ describe("queueState", () => {
   it("confirmWipe forwards args to importConfirmWipe", async () => {
     await queueState.confirmWipe("job-1", true);
     expect(vi.mocked(api.importConfirmWipe)).toHaveBeenCalledWith("job-1", true);
+  });
+
+  it("shows the backend's own reason when a retry is refused", async () => {
+    // Admission refuses for the moment a cancelled run finishes writing history,
+    // and that sentence tells the user to try again; a generic message would not.
+    const reason = "An import is still finishing; try again in a moment.";
+    vi.mocked(api.importRetry).mockRejectedValueOnce(new BackendError("import_retry", reason));
+
+    await queueState.retry("job-1");
+
+    const shown = get(errorsState).find((error) => error.message === reason);
+    expect(shown, "the refusal reason must reach the user").toBeDefined();
+    errorsState.dismissError(shown!.id);
   });
 
   it("dismiss removes a job and replaces state.jobs with the returned list", async () => {
