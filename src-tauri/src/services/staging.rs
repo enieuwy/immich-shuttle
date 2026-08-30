@@ -475,9 +475,12 @@ mod tests {
                 .expect("a source making progress must stage every file");
 
         assert_eq!(staged.links().entries().len(), 12);
-        assert_eq!(
-            progress.load(Ordering::Relaxed),
-            12,
+        // At least one tick per staged file. Not an equality: where a symlink is
+        // impossible the copy fallback also ticks per chunk, so the exact count
+        // is platform-dependent while the invariant the watchdog relies on — a
+        // working source keeps ticking — is not.
+        assert!(
+            progress.load(Ordering::Relaxed) >= 12,
             "each staged file reports progress, symlink or copy"
         );
         cleanup_staging_dir(staged);
