@@ -231,29 +231,64 @@ fn is_terminal(status: &JobStatus) -> bool {
     )
 }
 
-fn has_active_import() -> Result<bool, String> {
+/// Text `import_start` returns while a run is still uploading.
+const IMPORT_RUNNING_ERROR: &str = "An import is already running";
+/// Text `import_start` returns while the previous worker is still finalizing.
+///
+/// Kept distinct from `IMPORT_RUNNING_ERROR` because the two ask different
+/// things of the user: the first means "stop that import first", the second
+/// means "wait a moment and retry". Cancel publishes a terminal status while
+/// the worker still writes history, so a fast Retry click lands here.
+const IMPORT_FINISHING_ERROR: &str = "An import is still finishing; try again in a moment.";
+
+/// Pure admission decision, so the ordering of the two refusals is testable
+/// without the process-global job maps.
+fn admission_block_reason(run_live: bool, finalizing_live: bool) -> Option<&'static str> {
+    if run_live {
+        Some(IMPORT_RUNNING_ERROR)
+    } else if finalizing_live {
+        Some(IMPORT_FINISHING_ERROR)
+    } else {
+        None
+    }
+}
+
+/// Why a new import may not start right now, or `None` when one may.
+///
+/// `FINALIZING_IMPORTS` is part of the answer, not an afterthought: the worker
+/// leaves `RUNNING_IMPORTS` before it reads the run log, writes the terminal
+/// state, and appends history, and `import_cancel` has already published
+/// `Cancelled` by then. Without the finalizing half, a cancel followed by a
+/// fast Retry admits a second run while the first still owns those writes.
+/// `import_await_terminal` and `has_live_import_worker` observe both maps for
+/// the same reason, so admission must not answer the question differently.
+fn import_admission_block() -> Result<Option<&'static str>, String> {
     let jobs = JOBS
         .lock()
         .map_err(|_| "Could not lock import job state".to_string())?;
     let has_active_job = jobs.iter().any(|job| is_active(&job.status));
     drop(jobs);
-    let running = RUNNING_IMPORTS
+    let run_live = {
+        let running = RUNNING_IMPORTS
+            .lock()
+            .map_err(|_| "Could not lock running imports state".to_string())?;
+        has_active_job || !running.is_empty()
+    };
+    let finalizing_live = !FINALIZING_IMPORTS
         .lock()
-        .map_err(|_| "Could not lock running imports state".to_string())?;
-    Ok(has_active_job || !running.is_empty())
+        .map_err(|_| "Could not lock finalizing imports state".to_string())?
+        .is_empty();
+    Ok(admission_block_reason(run_live, finalizing_live))
 }
+
 #[cfg(target_os = "macos")]
 /// Reports whether an import worker or its post-run finalization is still live.
 ///
 /// A poisoned lock fails safe: shutdown must not proceed while the worker state
 /// cannot be read with confidence.
 pub fn has_live_import_worker() -> bool {
-    if has_active_import().unwrap_or(true) {
-        return true;
-    }
-    FINALIZING_IMPORTS
-        .lock()
-        .map(|finalizing| !finalizing.is_empty())
+    import_admission_block()
+        .map(|reason| reason.is_some())
         .unwrap_or(true)
 }
 
@@ -634,6 +669,125 @@ fn album_link_target(organization: Organization, into_album: Option<&str>) -> Op
     Some(name.to_string())
 }
 
+/// The history receipt for one terminal run.
+///
+/// Pure, so the status mapping and the replayable request are testable without
+/// an `AppHandle`: this is the only place a run's outcome becomes a record, and
+/// a wrong mapping here misreports the run in History forever.
+fn run_history_record(
+    update: &ImportJob,
+    started_at: i64,
+    source_paths: Vec<String>,
+    request: ImportInput,
+) -> crate::models::history::ImportRecord {
+    crate::models::history::ImportRecord {
+        id: update.id.clone(),
+        started_at,
+        finished_at: now_ms(),
+        profile_id: update.profile_id.clone(),
+        source_paths,
+        // The album this run actually landed in, resolved from the name
+        // immich-go targeted, rather than whatever id the picker sent.
+        album_ids: update.album_id.clone().into_iter().collect(),
+        status: match &update.status {
+            JobStatus::Completed => RecordStatus::Completed,
+            JobStatus::Cancelled => RecordStatus::Cancelled,
+            _ => RecordStatus::Failed,
+        },
+        total: update.progress.total,
+        uploaded: update.progress.uploaded,
+        duplicates: update.progress.duplicates,
+        errors: update.progress.errors,
+        // Persist the request (source/options) so History can replay it.
+        request: Some(request),
+    }
+}
+
+/// Persist one terminal run to the history store.
+///
+/// Every worker exit routes through here, so a run that ends during staging
+/// leaves the same receipt as one that ends during upload: History can replay
+/// it, and the per-source checkpoint decision is taken once, in one place.
+fn persist_run_history(
+    app: &tauri::AppHandle,
+    update: &ImportJob,
+    started_at: i64,
+    source_paths: Vec<String>,
+    request: ImportInput,
+    checkpoint_eligible: bool,
+) {
+    let checkpoint_eligible = checkpoint_eligible && matches!(update.status, JobStatus::Completed);
+    if let Err(err) = crate::services::store::append_history(
+        app,
+        run_history_record(update, started_at, source_paths, request),
+        checkpoint_eligible,
+    ) {
+        let _ = logs::append_log(
+            "app.log",
+            &format!(
+                "import_history_persist_failed job_id={} error={err}",
+                update.id
+            ),
+        );
+        let mut job_with_warning = update.clone();
+        let warning = "Warning: import history could not be saved.";
+        job_with_warning.summary = Some(match job_with_warning.summary.take() {
+            Some(summary) => format!("{summary} {warning}"),
+            None => warning.to_string(),
+        });
+        let _ = set_job(job_with_warning);
+    }
+}
+
+/// Close out a worker that exits during staging, before the shared
+/// finalization tail can run.
+///
+/// Staging failures and a cancel raised while staging are terminal outcomes
+/// like any other, so they publish a terminal state AND a history record. The
+/// `FINALIZING_IMPORTS` marker is registered before `RUNNING_IMPORTS` is
+/// released so shutdown never sees a gap in which no map names this worker,
+/// and it covers the history write the same way the normal tail does.
+/// `finalize_job` decides the published status: a cancellation already written
+/// by `import_cancel` wins over the `Failed` candidate built here, and the
+/// record then reports what the user was actually shown.
+fn finish_staging_exit(
+    app: &tauri::AppHandle,
+    job_id: &str,
+    profile_id: &str,
+    error: String,
+    started_at: i64,
+    source_paths: Vec<String>,
+    request: ImportInput,
+) {
+    if let Ok(mut finalizing) = FINALIZING_IMPORTS.lock() {
+        finalizing.insert(job_id.to_string());
+    }
+    if let Ok(mut running) = RUNNING_IMPORTS.lock() {
+        running.remove(job_id);
+    }
+    let update = finalize_job(ImportJob {
+        id: job_id.to_string(),
+        status: JobStatus::Failed,
+        progress: JobProgress {
+            total: 0,
+            uploaded: 0,
+            duplicates: 0,
+            errors: 1,
+        },
+        error: Some(error),
+        summary: None,
+        awaiting_wipe_confirmation: false,
+        pending_wipe_count: 0,
+        file_errors: Vec::new(),
+        profile_id: profile_id.to_string(),
+        album_id: None,
+    });
+    persist_run_history(app, &update, started_at, source_paths, request, false);
+    if let Ok(mut finalizing) = FINALIZING_IMPORTS.lock() {
+        finalizing.remove(job_id);
+    }
+}
+
 #[tauri::command]
 pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<String, String> {
     if input.source_paths.is_empty() {
@@ -741,8 +895,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let _start_lock = IMPORT_START_LOCK
             .lock()
             .map_err(|_| "Could not lock import start state".to_string())?;
-        if has_active_import()? {
-            return Err("An import is already running".to_string());
+        if let Some(reason) = import_admission_block()? {
+            return Err(reason.to_string());
         }
         logs::append_log(
             "app.log",
@@ -781,56 +935,27 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             {
                 Ok(Ok(dir)) => Some(dir),
                 Ok(Err(e)) => {
-                    if let Ok(mut running) = RUNNING_IMPORTS.lock() {
-                        running.remove(&job_id_clone);
-                    }
-                    if cancel_flag.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    // `finalize_job` preserves a cancellation published while
-                    // staging reported its failure.
-                    let _ = finalize_job(ImportJob {
-                        id: job_id_clone.clone(),
-                        status: JobStatus::Failed,
-                        progress: JobProgress {
-                            total: 0,
-                            uploaded: 0,
-                            duplicates: 0,
-                            errors: 1,
-                        },
-                        error: Some(format!("Could not stage selected files: {e}")),
-                        summary: None,
-                        awaiting_wipe_confirmation: false,
-                        pending_wipe_count: 0,
-                        file_errors: Vec::new(),
-                        profile_id: profile.id.clone(),
-                        album_id: None,
-                    });
+                    finish_staging_exit(
+                        &app_clone,
+                        &job_id_clone,
+                        &profile.id,
+                        format!("Could not stage selected files: {e}"),
+                        started_at,
+                        record_source_paths,
+                        history_request,
+                    );
                     return;
                 }
                 Err(e) => {
-                    if let Ok(mut running) = RUNNING_IMPORTS.lock() {
-                        running.remove(&job_id_clone);
-                    }
-                    // A staging task that fails to join must not revive a
-                    // cancelled run as `Failed`, so use `finalize_job`.
-                    let _ = finalize_job(ImportJob {
-                        id: job_id_clone.clone(),
-                        status: JobStatus::Failed,
-                        progress: JobProgress {
-                            total: 0,
-                            uploaded: 0,
-                            duplicates: 0,
-                            errors: 1,
-                        },
-                        error: Some(format!("Staging task failed: {e}")),
-                        summary: None,
-                        awaiting_wipe_confirmation: false,
-                        pending_wipe_count: 0,
-                        file_errors: Vec::new(),
-                        profile_id: profile.id.clone(),
-                        album_id: None,
-                    });
+                    finish_staging_exit(
+                        &app_clone,
+                        &job_id_clone,
+                        &profile.id,
+                        format!("Staging task failed: {e}"),
+                        started_at,
+                        record_source_paths,
+                        history_request,
+                    );
                     return;
                 }
             }
@@ -1210,49 +1335,14 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // returns what is actually stored, so the log/history below record the
         // outcome the user was shown rather than the one this task computed.
         let update = finalize_job(update);
-        let checkpoint_eligible =
-            checkpoint_eligible && matches!(update.status, JobStatus::Completed);
-        let status = match &update.status {
-            JobStatus::Completed => RecordStatus::Completed,
-            JobStatus::Cancelled => RecordStatus::Cancelled,
-            _ => RecordStatus::Failed,
-        };
-        if let Err(err) = crate::services::store::append_history(
+        persist_run_history(
             &app_clone,
-            crate::models::history::ImportRecord {
-                id: update.id.clone(),
-                started_at,
-                finished_at: now_ms(),
-                profile_id: profile.id.clone(),
-                source_paths: record_source_paths.clone(),
-                // The album this run actually landed in, resolved from the name
-                // immich-go targeted, rather than whatever id the picker sent.
-                album_ids: update.album_id.clone().into_iter().collect(),
-                status,
-                total: update.progress.total,
-                uploaded: update.progress.uploaded,
-                duplicates: update.progress.duplicates,
-                errors: update.progress.errors,
-                // Persist the request (source/options) so History can replay it.
-                request: Some(history_request),
-            },
+            &update,
+            started_at,
+            record_source_paths,
+            history_request,
             checkpoint_eligible,
-        ) {
-            let _ = logs::append_log(
-                "app.log",
-                &format!(
-                    "import_history_persist_failed job_id={} error={err}",
-                    update.id
-                ),
-            );
-            let mut job_with_warning = update.clone();
-            let warning = "Warning: import history could not be saved.";
-            job_with_warning.summary = Some(match job_with_warning.summary.take() {
-                Some(summary) => format!("{summary} {warning}"),
-                None => warning.to_string(),
-            });
-            let _ = set_job(job_with_warning);
-        }
+        );
         // Finalization is complete only after the history write and warning
         // update above, so shutdown may now observe both maps as clear.
         if let Ok(mut finalizing) = FINALIZING_IMPORTS.lock() {
@@ -2665,6 +2755,110 @@ mod tests {
         if let Ok(mut pending) = PENDING_WIPE.lock() {
             pending.remove(&job_id);
         }
+    }
+
+    fn replayable_input(profile_id: &str) -> ImportInput {
+        ImportInput {
+            profile_id: profile_id.to_string(),
+            source_paths: vec!["/Volumes/CARD".to_string()],
+            album_ids: Vec::new(),
+            keep_files: true,
+            stack_raw_jpeg: false,
+            stack_burst: false,
+            date_range: None,
+            concurrent_tasks: None,
+            select_files: None,
+            into_album: None,
+            organization: Organization::SingleAlbum,
+            on_errors: None,
+            overwrite: false,
+            tags: Vec::new(),
+            session_tag: false,
+            include_type: None,
+            include_extensions: Vec::new(),
+            exclude_extensions: Vec::new(),
+        }
+    }
+
+    /// A run cancelled or failed during staging must still leave a receipt, and
+    /// that receipt must report the status the user was shown. Before this,
+    /// staging exits returned without appending history at all, so the run was
+    /// invisible in History and had no request to replay.
+    #[test]
+    fn a_staging_exit_records_the_published_status_and_keeps_the_request() {
+        let job_id = format!("staging-history-{}", Uuid::new_v4());
+        let mut cancelled = terminal_job(&job_id, false);
+        cancelled.status = JobStatus::Cancelled;
+        lock_jobs().push(cancelled);
+
+        // What `finish_staging_exit` publishes for a staging failure raised on a
+        // run the user already cancelled.
+        let mut failed = terminal_job(&job_id, false);
+        failed.status = JobStatus::Failed;
+        let published = finalize_job(failed);
+        let record = run_history_record(
+            &published,
+            1_000,
+            vec!["/Volumes/CARD".to_string()],
+            replayable_input("p1"),
+        );
+
+        assert_eq!(record.status.as_wire(), "cancelled");
+        assert_eq!(record.id, job_id);
+        assert_eq!(record.started_at, 1_000);
+        assert!(
+            record.request.is_some(),
+            "History replays a run from its persisted request"
+        );
+
+        lock_jobs().retain(|job| job.id != job_id);
+    }
+
+    /// A staging failure on a run nobody cancelled is recorded as failed.
+    #[test]
+    fn a_failed_staging_exit_records_a_failed_run() {
+        let mut failed = terminal_job("staging-failed-record", false);
+        failed.status = JobStatus::Failed;
+        let record = run_history_record(&failed, 0, Vec::new(), replayable_input("p1"));
+
+        assert_eq!(record.status.as_wire(), "failed");
+    }
+
+    /// Admission and shutdown must answer "is an import live?" the same way.
+    /// A cancel publishes a terminal status while the worker still writes
+    /// history, so only the finalizing half of the answer keeps a second run
+    /// out during that window.
+    #[test]
+    fn admission_refuses_while_a_worker_is_only_finalizing() {
+        assert_eq!(admission_block_reason(false, false), None);
+        assert_eq!(
+            admission_block_reason(false, true),
+            Some(IMPORT_FINISHING_ERROR),
+            "a finalizing worker must still block a new import"
+        );
+        // A live run outranks finalization: the user is told to stop that run,
+        // not to wait a moment.
+        assert_eq!(
+            admission_block_reason(true, true),
+            Some(IMPORT_RUNNING_ERROR)
+        );
+    }
+
+    /// The process-global check must observe `FINALIZING_IMPORTS` too. Only the
+    /// blocking direction is asserted: sibling tests publish their own jobs in
+    /// parallel, so "not blocked" is never this test's answer to give.
+    #[test]
+    fn a_finalizing_worker_blocks_admission_process_wide() {
+        let job_id = format!("admission-finalizing-{}", Uuid::new_v4());
+        lock_finalizing().insert(job_id.clone());
+
+        let blocked = import_admission_block().expect("admission state is readable");
+        lock_finalizing().remove(&job_id);
+
+        assert!(
+            blocked.is_some(),
+            "a registered finalizing worker must block a new import"
+        );
     }
 
     #[test]
