@@ -15,7 +15,7 @@
     "test": "vitest run",
     "tauri": "tauri",
     "audit:npm": "npm audit --audit-level=high",
-    "audit:cargo": "cargo audit --file src-tauri/Cargo.lock",
+    "audit:cargo": "cd src-tauri && cargo audit",
     "audit": "npm run audit:npm && npm run audit:cargo",
     "secrets": "betterleaks git . --no-banner --redact || echo 'betterleaks not installed or findings present; CI still checks'",
     "verify:fast": "npm run check && npm run test && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check",

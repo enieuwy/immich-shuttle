@@ -1,0 +1,95 @@
+# cargo-audit configuration for the Rust dependency graph in `src-tauri/`.
+#
+# Why this file exists: `cargo audit` fails the build on a *vulnerability*, but
+# only prints a warning for an advisory it classes as informational
+# (unmaintained, unsound, yanked). That default made a wall of 19 permanent
+# warnings that nobody reads, so a genuinely new advisory would have scrolled
+# past unnoticed.
+#
+# So `[output] deny = ["warnings"]` promotes every warning to a failure, and the
+# list below names the ones we have accepted. The effect is a ratchet: the known
+# set is silent, anything new fails CI. An entry may only be added here with a
+# reason and an owner, and an entry whose crate leaves the graph must be
+# removed — a stale ignore hides the next advisory for that crate.
+#
+# cargo-audit reads `.cargo/audit.toml` relative to the working directory, and
+# it does not search parent directories. That is why this file sits beside the
+# lockfile it describes: a bare `cargo audit` inside `src-tauri/` picks it up,
+# and `npm run audit:cargo` changes into this directory for the same reason. Run
+# from the repository root instead and the ignore list is silently not applied.
+#
+# Not one of these crates is a direct dependency of immich-shuttle; every one
+# arrives through `tauri`, a Tauri plugin, or `keyring`. That is also why none
+# is fixable here: the fix is an upstream major version bump.
+#
+# Reviewed 2026-08-30 against cargo-audit 0.22.1, tauri 2.11.5. There are zero
+# vulnerabilities in the graph.
+
+[advisories]
+ignore = [
+  # ---------------------------------------------------------------------------
+  # gtk3-rs bindings: archived upstream in favour of gtk4-rs.
+  #
+  # Owner: tauri. Reached through `tauri -> muda -> gtk` and
+  # `tauri -> tauri-runtime-wry -> wry -> gdkx11`. Tauri 2 is built on
+  # webkit2gtk/GTK3, so this clears only when Tauri itself moves to GTK4.
+  #
+  # Linux only. These crates are absent from the macOS and Windows dependency
+  # graphs, so they are not in those shipped binaries.
+  "RUSTSEC-2024-0411", # gdkwayland-sys
+  "RUSTSEC-2024-0412", # gdk
+  "RUSTSEC-2024-0413", # atk
+  "RUSTSEC-2024-0414", # gdkx11-sys
+  "RUSTSEC-2024-0415", # gtk
+  "RUSTSEC-2024-0416", # atk-sys
+  "RUSTSEC-2024-0417", # gdkx11
+  "RUSTSEC-2024-0418", # gdk-sys
+  "RUSTSEC-2024-0419", # gtk3-macros
+  "RUSTSEC-2024-0420", # gtk-sys
+  "RUSTSEC-2024-0429", # glib 0.18 — unsound Iterator impls for glib::VariantIter.
+                       # Patched in glib 0.20, which is the gtk4-rs generation;
+                       # unreachable while Tauri pins the GTK3 stack. Linux only.
+
+  # ---------------------------------------------------------------------------
+  # unic: unmaintained Unicode tables.
+  #
+  # Owner: tauri. Reached through `tauri-utils -> urlpattern -> unic-ucd-ident`,
+  # used to validate URL patterns in the capability files. Present on every
+  # platform. Read-only table lookups over data compiled into the crate; no
+  # untrusted input reaches them beyond the pattern strings in
+  # `src-tauri/capabilities/`, which we author.
+  "RUSTSEC-2025-0075", # unic-char-range
+  "RUSTSEC-2025-0080", # unic-common
+  "RUSTSEC-2025-0081", # unic-char-property
+  "RUSTSEC-2025-0098", # unic-ucd-version
+  "RUSTSEC-2025-0100", # unic-ucd-ident
+
+  # ---------------------------------------------------------------------------
+  # Remaining single crates, all upstream-owned.
+
+  # fxhash — unmaintained. Owner: tauri, through
+  # `tauri-utils -> kuchikiki -> selectors`. A non-cryptographic hasher for the
+  # HTML rewriting Tauri does to the bundled frontend at build time.
+  "RUSTSEC-2025-0057",
+
+  # proc-macro-error — unmaintained. Owner: tauri, through
+  # `gtk -> glib -> glib-macros`. A proc macro: it runs in the compiler and is
+  # never linked into the app. Linux only.
+  "RUSTSEC-2024-0370",
+
+  # rand 0.7.3 — unsound with a custom logger calling rand::rng(). Owner: tauri,
+  # through `tauri-utils -> kuchikiki -> selectors -> phf_codegen 0.8` as a
+  # build-dependency of a build-dependency. The patch is rand 0.8.6, a major bump
+  # phf 0.8 will never take. Runs in build scripts at compile time, not in the
+  # app, and nothing there installs a custom logger.
+  "RUSTSEC-2026-0097",
+]
+
+[output]
+# Any advisory not listed above fails the run — including a new `yanked` crate,
+# which carries no advisory id and therefore cannot be ignored individually.
+deny = ["warnings"]
+# `quiet` and `format` have no defaults in this schema; cargo-audit rejects the
+# file without them.
+quiet = false
+format = "terminal"

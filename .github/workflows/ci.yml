@@ -34,12 +34,16 @@ jobs:
         with:
           node-version: '22'
           cache: npm
+      # Both steps go through the npm scripts so the invocation lives in one
+      # place. `audit:cargo` changes into src-tauri/ because cargo-audit only
+      # reads .cargo/audit.toml from its working directory; running it from here
+      # would drop the accepted-advisory list and pass everything silently.
       - name: npm audit (high+)
-        run: npm audit --audit-level=high
+        run: npm run audit:npm
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: cargo audit
-        run: cargo audit --file src-tauri/Cargo.lock
+        run: npm run audit:cargo
 
   secrets:
     runs-on: ubuntu-latest

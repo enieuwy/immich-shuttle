@@ -15,6 +15,10 @@
 ### Safety
 - **Quitting during a confirmed delete now waits for it.** Verifying a full card against the server and moving the originals to the Trash takes minutes, and the app counted that as no work at all: a quit in the middle left some originals in the Trash, the rest on the card, and no record of which was which — and the delete could not be retried, because its file list had already been consumed. Both quit paths now wait for the delete, and refuse the quit with a clear message if it is still running after thirty seconds. The delete itself keeps running, so retrying the quit is safe. A partly failed delete that is retried while the first attempt is still finishing also keeps the app from quitting through either one.
 
+### Maintenance
+- **A new advisory against a dependency now fails CI instead of scrolling past.** `cargo audit` fails only on a vulnerability; an unmaintained, unsound or yanked crate was a warning, and there were 25 of them permanently on screen. Every warning is now a failure, with the accepted ones listed one by one in `src-tauri/.cargo/audit.toml` alongside which upstream crate pulls it in and why it cannot be fixed here. Anything not on that list fails the run.
+- **Took the four dependency fixes that were actually available.** `anyhow`, `event-listener` and both live `rand` lines had published fixes for the unsoundness advisories against them, and the `wasm-bindgen` family had been yanked; all are updated. The graph has no vulnerabilities and 19 accepted warnings, down from 25. The rest are the archived GTK3 bindings and Unicode tables that Tauri pulls in, which clear only when Tauri moves off them.
+
 ## v0.7.2 - 2026-08-26
 
 ### Import
