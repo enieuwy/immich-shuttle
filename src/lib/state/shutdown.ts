@@ -21,6 +21,10 @@ import { isBackendError } from "$lib/backendErrors";
 export const SHUTDOWN_INCOMPLETE_MESSAGE =
   "The import is still shutting down. Keep this window open and retry quitting.";
 
+/** Shown when a confirmed delete is still running; the window must stay open. */
+export const WIPE_INCOMPLETE_MESSAGE =
+  "A verified delete is still running. Keep this window open and retry quitting.";
+
 /** How long to wait for one worker to exit. The sidecar alone can take five
  *  seconds, and staging cleanup on a full card is slower. */
 export const SHUTDOWN_TIMEOUT_MS = 30_000;
@@ -36,6 +40,14 @@ export type ShutdownDeps = {
    * cancel until its post-admission refresh commits.
    */
   pendingStarts: readonly Promise<unknown>[];
+  /**
+   * Confirmed wipes that have not settled. A wipe runs on an already terminal
+   * job, so it has no id to cancel and no worker to await: the app can only
+   * wait for it. It cannot be cancelled either — the payload is consumed and
+   * the originals are already moving to the Trash — so shutdown waits rather
+   * than trying to stop it.
+   */
+  pendingWipes: readonly Promise<unknown>[];
   /** Running job ids as of the moment the user confirmed the prompt. */
   runningJobIds: readonly string[];
   /** Re-read running job ids after `pendingStarts` settle, to pick up any job
@@ -75,10 +87,45 @@ function isJobAlreadyGone(reason: unknown): boolean {
   return isBackendError(reason, "JOB_NOT_FOUND");
 }
 
+/**
+ * Whether `work` all settled inside `timeoutMs`.
+ *
+ * A confirmed wipe has no cancel path, so shutdown can only wait for it — but
+ * hashing and deleting a full card takes minutes, and a quit that silently
+ * hangs is worse than one that says "not yet". Refusing keeps the delete
+ * running untouched, so a retry is safe.
+ */
+async function settledWithin(
+  work: readonly Promise<unknown>[],
+  timeoutMs: number,
+): Promise<boolean> {
+  // The executor runs synchronously, so `expire` is assigned before the timer
+  // below can ever fire.
+  let expire = () => {};
+  const expired = new Promise<boolean>((resolve) => {
+    expire = () => resolve(false);
+  });
+  const timer = setTimeout(expire, timeoutMs);
+  try {
+    return await Promise.race([Promise.allSettled(work).then(() => true), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function runImportShutdown(deps: ShutdownDeps): Promise<ShutdownOutcome> {
   const timeoutMs = deps.timeoutMs ?? SHUTDOWN_TIMEOUT_MS;
 
   await Promise.allSettled(deps.pendingStarts);
+
+  // Waited on before anything is cancelled: this quit may still be refused, and
+  // a refused quit must not have stopped a running import on the way.
+  if (
+    deps.pendingWipes.length > 0 &&
+    !(await settledWithin(deps.pendingWipes, timeoutMs))
+  ) {
+    return { kind: "incomplete", message: WIPE_INCOMPLETE_MESSAGE };
+  }
 
   const jobIdsToCancel = new Set(deps.runningJobIds);
   for (const jobId of deps.currentRunningJobIds()) {

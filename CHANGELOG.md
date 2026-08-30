@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Import
+- **A cancelled import can no longer let the next one start on top of it.** Cancelling publishes the outcome immediately, while the run's own bookkeeping — reading the run log, writing the final state, saving the History record — is still in progress. Starting or retrying an import inside that window admitted a second run alongside that bookkeeping. The app now refuses for those few moments and says the previous import is still finishing, rather than treating a cancelled run as gone.
+- **An import cancelled or failed while staging a hand-picked selection now appears in History.** Both outcomes ended the run without saving a record, so the queue card was the only trace: nothing to replay with "Import again", and nothing in the run history.
+- **A card or network share that stops responding while staging a hand-picked import no longer freezes the app.** The staging step had no time limit and could not be interrupted, so a dead mount held the import worker forever — and with it the app, which refuses to quit while a worker is live. Staging is now bounded, and cancelling releases the worker within a few seconds even when the source never answers again.
+- **"Check server" now gives up on a source that stops responding.** The scan behind it had no outer time limit, so a dead mount left the check spinning for the rest of the session. It now reports the source as unresponsive.
+
+### Safety
+- **Quitting during a confirmed delete now waits for it.** Verifying a full card against the server and moving the originals to the Trash takes minutes, and the app counted that as no work at all: a quit in the middle left some originals in the Trash, the rest on the card, and no record of which was which — and the delete could not be retried, because its file list had already been consumed. Both quit paths now wait for the delete, and refuse the quit with a clear message if it is still running after thirty seconds. The delete itself keeps running, so retrying the quit is safe.
+
 ## v0.7.2 - 2026-08-26
 
 ### Import

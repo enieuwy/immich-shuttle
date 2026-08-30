@@ -34,6 +34,15 @@ static RUNNING_IMPORTS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
 /// does not cover. `import_await_terminal` must observe this set as clear too.
 static FINALIZING_IMPORTS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+/// Jobs whose confirmed wipe is running right now.
+///
+/// The delete runs inside `import_confirm_wipe`, on a job that is already
+/// terminal, so neither `RUNNING_IMPORTS` nor `FINALIZING_IMPORTS` covers it.
+/// Without this set the app answers "nothing is live" while it hashes a whole
+/// card and moves originals to the Trash, and a quit abandons that delete
+/// halfway with the payload already consumed.
+static ACTIVE_WIPES: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 static JOB_INPUTS: LazyLock<Mutex<HashMap<String, ImportInput>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -218,6 +227,35 @@ impl Drop for ImportWorkerGuard {
     }
 }
 
+/// Marks a confirmed wipe as live for as long as it runs.
+///
+/// Every exit from `import_confirm_wipe` releases the mark, including an early
+/// `?` return, so a failed verification cannot leave the app permanently
+/// unquittable. Unlike `ImportWorkerGuard` this never rewrites the job: the run
+/// itself already finished, and the wipe reports its own outcome.
+struct ActiveWipeGuard {
+    job_id: String,
+}
+
+impl ActiveWipeGuard {
+    fn new(job_id: String) -> Self {
+        ACTIVE_WIPES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job_id.clone());
+        Self { job_id }
+    }
+}
+
+impl Drop for ActiveWipeGuard {
+    fn drop(&mut self) {
+        ACTIVE_WIPES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.job_id);
+    }
+}
+
 fn collapse_overlapping_roots(paths: Vec<String>) -> Vec<String> {
     let roots: Vec<(String, Option<PathBuf>)> = paths
         .into_iter()
@@ -355,15 +393,31 @@ fn import_admission_block() -> Result<Option<&'static str>, String> {
     Ok(admission_block_reason(run_live, finalizing_live))
 }
 
+#[cfg(any(target_os = "macos", test))]
+/// Reports whether a confirmed wipe is running right now.
+///
+/// A poisoned lock fails safe: shutdown must not proceed while this cannot be
+/// read with confidence.
+fn has_active_wipe() -> bool {
+    ACTIVE_WIPES
+        .lock()
+        .map(|wipes| !wipes.is_empty())
+        .unwrap_or(true)
+}
+
 #[cfg(target_os = "macos")]
-/// Reports whether an import worker or its post-run finalization is still live.
+/// Reports whether an import worker, its post-run finalization, or a confirmed
+/// wipe is still live.
 ///
 /// A poisoned lock fails safe: shutdown must not proceed while the worker state
-/// cannot be read with confidence.
+/// cannot be read with confidence. A wipe counts because it hashes the card and
+/// moves originals to the Trash after the run is already terminal; quitting
+/// through it leaves the card half deleted with no record of which files went.
 pub fn has_live_import_worker() -> bool {
     import_admission_block()
         .map(|reason| reason.is_some())
         .unwrap_or(true)
+        || has_active_wipe()
 }
 
 /// Register a fake finalizing worker so another module can exercise a guard that
@@ -1702,6 +1756,12 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
         .remove(&job_id)
         .ok_or_else(|| format!("No pending wipe payload for job: {job_id}"))?;
 
+    // From here the payload is consumed and originals are about to move to the
+    // Trash, so the app must count this as live work: hashing a full card and
+    // deleting file by file takes minutes, and a quit in the middle leaves the
+    // card half deleted with nothing left to retry from.
+    let _wipe_guard = ActiveWipeGuard::new(job_id.clone());
+
     let pending_count = pending.paths.len();
     // When verification fails we keep every file AND leave the job actionable so
     // the user can retry once the server is reachable again (previously the
@@ -2953,6 +3013,33 @@ mod tests {
             "the cancel, not the bound, must release the caller"
         );
         release.store(true, Ordering::Relaxed);
+    }
+
+    /// The delete runs on an already terminal job, so neither worker map covers
+    /// it. Without this mark the app reports "nothing is live" while it hashes a
+    /// card and moves originals to the Trash, and a quit abandons the delete
+    /// with the payload already consumed.
+    #[test]
+    fn a_running_wipe_counts_as_live_work() {
+        let job_id = format!("wipe-live-{}", Uuid::new_v4());
+        {
+            let _guard = ActiveWipeGuard::new(job_id.clone());
+            assert!(
+                has_active_wipe(),
+                "a wipe in flight must keep shutdown waiting"
+            );
+            assert!(ACTIVE_WIPES
+                .lock()
+                .expect("wipe state is readable")
+                .contains(&job_id));
+        }
+        assert!(
+            !ACTIVE_WIPES
+                .lock()
+                .expect("wipe state is readable")
+                .contains(&job_id),
+            "every exit from the wipe, including an error return, must release the mark"
+        );
     }
 
     /// A responsive task still wins: a cancel it notices returns its own error,

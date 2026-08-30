@@ -51,6 +51,10 @@ let progressPending: Promise<UnlistenFn> | null = null;
 // Starts remain visible to shutdown until their admission and the following
 // queue refresh settle, including starts that reject validation or IPC.
 const pendingImportStarts = new Set<Promise<void>>();
+// Confirmed wipes that have not settled. The backend has already consumed the
+// delete payload by then, and the job itself is terminal, so shutdown cannot
+// find this work through the queue snapshot: it has to be tracked here.
+const pendingWipes = new Set<Promise<void>>();
 
 type ImportProgressEvent = {
   job_id: string;
@@ -259,6 +263,11 @@ export const queueState = {
   // so later starts cannot mutate the sequence's fixed pending-start list.
   pendingStarts() {
     return [...pendingImportStarts];
+  },
+  // Confirmed wipes still hashing or deleting. Shutdown must wait for these:
+  // the payload is consumed, so an abandoned wipe cannot be retried.
+  pendingWipes() {
+    return [...pendingWipes];
   },
   async loadJobs() {
     state.update((s) => ({ ...s, loading: true }));
@@ -490,12 +499,26 @@ export const queueState = {
     }
   },
   async confirmWipe(jobId: string, proceed: boolean) {
+    // Tracked for shutdown before the first await: the backend consumes the
+    // delete payload as soon as this call lands, so a quit that races it would
+    // abandon a verified delete with nothing left to retry.
+    const wipe = (async () => {
+      try {
+        await importConfirmWipe(jobId, proceed);
+        await refreshJobs();
+      } catch (error) {
+        errorsState.addError("Could not complete wipe confirmation.");
+        state.update((s) => ({
+          ...s,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      }
+    })();
+    pendingWipes.add(wipe);
     try {
-      await importConfirmWipe(jobId, proceed);
-      await refreshJobs();
-    } catch (error) {
-      errorsState.addError("Could not complete wipe confirmation.");
-      state.update((s) => ({ ...s, error: error instanceof Error ? error.message : String(error) }));
+      await wipe;
+    } finally {
+      pendingWipes.delete(wipe);
     }
   },
 };

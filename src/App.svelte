@@ -167,12 +167,17 @@
     // this function, so they ask, cancel, and await under the same contract.
     const requestShutdown = (finish: () => Promise<unknown>): boolean => {
       const pendingStarts = queueState.pendingStarts();
+      // A confirmed wipe runs on an already terminal job, so the queue snapshot
+      // below cannot see it. Its payload is consumed and originals are moving
+      // to the Trash, so quitting through it leaves the card half deleted.
+      const pendingWipes = queueState.pendingWipes();
       const runningJobIds = $queueState.jobs
         .filter((job) => job.status === "running")
         .map((job) => job.id);
       if (
         runningJobIds.length === 0 &&
         pendingStarts.length === 0 &&
+        pendingWipes.length === 0 &&
         shutdownPendingJobIds.size === 0
       ) {
         return false;
@@ -184,13 +189,19 @@
       confirmingShutdown = true;
       void (async () => {
         try {
+          // Nothing is cancelled when only a delete is live: it has no cancel
+          // path, so the honest offer is to wait for it, not to stop it.
+          const deletingOnly =
+            pendingWipes.length > 0 && runningJobIds.length === 0 && pendingStarts.length === 0;
           const shouldQuit = await confirm(
-            "An import is in progress. Quit now and cancel the running import?",
+            deletingOnly
+              ? "A verified delete is still running. Quit once it finishes?"
+              : "An import is in progress. Quit now and cancel the running import?",
             {
-              title: "Cancel import and quit?",
+              title: deletingOnly ? "Wait for the delete?" : "Cancel import and quit?",
               kind: "warning",
-              okLabel: "Quit",
-              cancelLabel: "Keep importing",
+              okLabel: deletingOnly ? "Wait and quit" : "Quit",
+              cancelLabel: deletingOnly ? "Stay open" : "Keep importing",
             },
           );
           if (!shouldQuit) {
@@ -200,6 +211,7 @@
           cancellingForClose = true;
           const outcome = await runImportShutdown({
             pendingStarts,
+            pendingWipes,
             runningJobIds,
             currentRunningJobIds: () =>
               $queueState.jobs

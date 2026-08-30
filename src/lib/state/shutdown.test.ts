@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   runImportShutdown,
   SHUTDOWN_INCOMPLETE_MESSAGE,
+  WIPE_INCOMPLETE_MESSAGE,
   type ShutdownDeps,
 } from "./shutdown";
 
@@ -18,6 +19,7 @@ const alreadyTerminal = () =>
 function deps(overrides: Partial<ShutdownDeps> = {}): ShutdownDeps {
   return {
     pendingStarts: [],
+    pendingWipes: [],
     runningJobIds: [],
     currentRunningJobIds: () => [],
     retainedJobIds: new Set<string>(),
@@ -186,5 +188,47 @@ describe("runImportShutdown", () => {
     );
 
     expect(cancelImport).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * A confirmed wipe has already consumed its delete payload and is moving
+   * originals to the Trash, so quitting through it leaves the card half deleted
+   * with nothing left to retry. It cannot be cancelled, so shutdown waits.
+   */
+  it("waits for a confirmed wipe before closing", async () => {
+    const wipe = Promise.withResolvers<void>();
+    let closed = false;
+
+    const shutdown = runImportShutdown(deps({ pendingWipes: [wipe.promise] })).then(
+      (outcome) => {
+        closed = true;
+        return outcome;
+      },
+    );
+    await Promise.resolve();
+    expect(closed).toBe(false);
+
+    wipe.resolve();
+
+    expect(await shutdown).toEqual({ kind: "complete" });
+  });
+
+  /**
+   * Hashing and deleting a full card takes minutes. Refusing the quit keeps the
+   * delete running untouched and tells the user to retry, which beats a quit
+   * that appears to hang.
+   */
+  it("refuses the quit when a wipe outlives the timeout", async () => {
+    const wipe = Promise.withResolvers<void>();
+    const cancelImport = vi.fn(() => Promise.resolve());
+
+    const outcome = await runImportShutdown(
+      deps({ pendingWipes: [wipe.promise], timeoutMs: 20, cancelImport, runningJobIds: ["job-1"] }),
+    );
+
+    expect(outcome).toEqual({ kind: "incomplete", message: WIPE_INCOMPLETE_MESSAGE });
+    // A refused quit must not have cancelled the running import on the way.
+    expect(cancelImport).not.toHaveBeenCalled();
+    wipe.resolve();
   });
 });
