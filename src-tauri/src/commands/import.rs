@@ -47,6 +47,80 @@ const MAX_AWAIT_TERMINAL_TIMEOUT_MS: u64 = 600_000;
 const IMPORT_WORKER_PANIC_ERROR: &str = "Import worker stopped unexpectedly.";
 const PENDING_WIPE_STORE_ERROR: &str =
     "Could not prepare wipe confirmation; source files were kept on disk. Import the source again to retry the delete.";
+/// Returned when a forecast's walk stops answering.
+///
+/// The claim on that source root is held by the abandoned walk until the
+/// filesystem answers, so the next forecast of the same source will report it
+/// as unresponsive too. Naming the source's state is therefore honest, where
+/// "the scan failed" would invite a pointless retry.
+const FORECAST_UNRESPONSIVE_ERROR: &str =
+    "The source stopped responding, so the server check timed out. Check the drive or network share, then try again.";
+
+/// Ceiling for the staging step of a hand-picked import. Shorter than
+/// `SCAN_DEADLINE` because staging only stats each selected file and links it
+/// into a temp dir: half an hour is far above any healthy card, and a bound
+/// this side of "forever" is what lets the app quit when a mount dies.
+const STAGING_DEADLINE: Duration = Duration::from_secs(30 * 60);
+/// How long a cancelled blocking walk may take to notice the flag before the
+/// worker abandons it. Staging checks the flag between files, so a responsive
+/// source releases well inside this; a dead mount never does.
+const CANCEL_ABANDON_GRACE: Duration = Duration::from_secs(5);
+/// Poll step for `join_bounded`. Blocking joins are not hot paths; this only
+/// decides how promptly a cancel or a deadline is noticed.
+const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// What became of a bounded blocking task.
+enum BoundedJoin<T> {
+    /// The task returned on its own.
+    Finished(T),
+    /// The bound passed first. The task was abandoned and the cancel flag set.
+    TimedOut,
+    /// The task was cancelled but did not return within the grace, so it was
+    /// abandoned.
+    Abandoned,
+}
+
+/// Await a blocking filesystem task under a bound, abandoning it when the bound
+/// or a cancel outlives it.
+///
+/// A deadline checked inside a walk cannot bound a call already blocked in the
+/// kernel — a dead SMB/NFS mount or a sleeping USB drive never returns, so
+/// nothing checks that deadline again. Only abandoning the join bounds it. The
+/// cost of abandoning is one blocking-pool thread and one temp directory held
+/// until the filesystem answers (or until the next startup prunes it), which is
+/// the same trade `scan_sources_stream` already takes. The alternative is worse:
+/// the command never resolves, and a worker holding a liveness marker refuses
+/// app quit forever.
+async fn join_bounded<T>(
+    mut task: tauri::async_runtime::JoinHandle<T>,
+    bound: Duration,
+    cancel: &AtomicBool,
+    cancel_grace: Duration,
+) -> Result<BoundedJoin<T>, String> {
+    let bound_deadline = Instant::now() + bound;
+    let mut abandon_after: Option<Instant> = None;
+    loop {
+        if let Ok(joined) = tokio::time::timeout(JOIN_POLL_INTERVAL, &mut task).await {
+            return joined
+                .map(BoundedJoin::Finished)
+                .map_err(|error| error.to_string());
+        }
+        let now = Instant::now();
+        if now >= bound_deadline {
+            // Tell the walk to stop, in case it is merely slow rather than
+            // blocked: then it drops its own guard and cleans up after itself.
+            cancel.store(true, Ordering::Relaxed);
+            return Ok(BoundedJoin::TimedOut);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            match abandon_after {
+                Some(deadline) if now >= deadline => return Ok(BoundedJoin::Abandoned),
+                Some(_) => {}
+                None => abandon_after = Some(now + cancel_grace),
+            }
+        }
+    }
+}
 
 fn mark_worker_panic(job_id: &str) {
     let marked = {
@@ -928,30 +1002,50 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let mut staging_dir = if staging_requested {
             let selected_files = select_files.clone();
             let cancel_flag_for_staging = cancel_flag.clone();
-            match tauri::async_runtime::spawn_blocking(move || {
-                staging::create_staging_dir(&selected_files, Some(cancel_flag_for_staging.as_ref()))
-            })
-            .await
-            {
-                Ok(Ok(dir)) => Some(dir),
-                Ok(Err(e)) => {
-                    finish_staging_exit(
-                        &app_clone,
-                        &job_id_clone,
-                        &profile.id,
-                        format!("Could not stage selected files: {e}"),
-                        started_at,
-                        record_source_paths,
-                        history_request,
-                    );
-                    return;
+            let staging_deadline = Instant::now() + STAGING_DEADLINE;
+            let staging_task = tauri::async_runtime::spawn_blocking(move || {
+                staging::create_staging_dir(
+                    &selected_files,
+                    Some(cancel_flag_for_staging.as_ref()),
+                    Some(staging_deadline),
+                )
+            });
+            // Staging is the one filesystem walk in this worker, and the worker
+            // holds the liveness markers app quit waits on. An unbounded join
+            // here means a dead mount refuses shutdown forever, so the join is
+            // bounded and a cancel may abandon it.
+            let staged = join_bounded(
+                staging_task,
+                STAGING_DEADLINE,
+                cancel_flag.as_ref(),
+                CANCEL_ABANDON_GRACE,
+            )
+            .await;
+            let staged_dir = match staged {
+                Ok(BoundedJoin::Finished(Ok(dir))) => Ok(dir),
+                Ok(BoundedJoin::Finished(Err(e))) => {
+                    Err(format!("Could not stage selected files: {e}"))
                 }
-                Err(e) => {
+                Ok(BoundedJoin::TimedOut) => Err(format!("{}.", staging::STAGING_TIMED_OUT_ERROR)),
+                // The walk is blocked inside a filesystem call and cannot be
+                // interrupted. Report the run as terminal and release the
+                // liveness markers so the user can quit; the abandoned task
+                // drops its own staging directory if the source ever answers,
+                // and startup pruning removes it if it never does.
+                Ok(BoundedJoin::Abandoned) => Err(
+                    "Staging did not stop when cancelled: the source stopped responding."
+                        .to_string(),
+                ),
+                Err(e) => Err(format!("Staging task failed: {e}")),
+            };
+            match staged_dir {
+                Ok(dir) => Some(dir),
+                Err(error) => {
                     finish_staging_exit(
                         &app_clone,
                         &job_id_clone,
                         &profile.id,
-                        format!("Staging task failed: {e}"),
+                        error,
                         started_at,
                         record_source_paths,
                         history_request,
@@ -1454,7 +1548,7 @@ pub async fn import_forecast(
             let scan_roots =
                 media_scanner::acquire_scan_roots(media_scanner::ScanPurpose::Forecast, &paths)?;
             let scan_cancellation = cancellation.clone();
-            tauri::async_runtime::spawn_blocking(move || {
+            let scan_task = tauri::async_runtime::spawn_blocking(move || {
                 // This guard must drop on the walking task. Abandoning a blocked
                 // `WalkDir` call is inherent, so one hung source can leak one
                 // blocking-pool thread but cannot stack a thread per forecast.
@@ -1488,9 +1582,28 @@ pub async fn import_forecast(
                 }
                 // Truncated only when the cap actually discarded a candidate.
                 Ok::<_, String>((files, seen > FORECAST_MAX_FILES, skipped))
-            })
+            });
+            // The per-entry deadline inside the walk cannot bound a call already
+            // blocked on a dead mount, so bound the join too — exactly as
+            // `scan_sources_stream` does. Without this the IPC never resolves
+            // and the forecast spinner never stops.
+            match join_bounded(
+                scan_task,
+                SCAN_DEADLINE,
+                cancellation.as_ref(),
+                CANCEL_ABANDON_GRACE,
+            )
             .await
-            .map_err(|e| format!("Scan task failed: {e}"))??
+            .map_err(|e| format!("Scan task failed: {e}"))?
+            {
+                BoundedJoin::Finished(result) => result?,
+                // The claimed root stays claimed until the filesystem answers,
+                // so say the source is unresponsive rather than pretending the
+                // forecast merely failed.
+                BoundedJoin::TimedOut | BoundedJoin::Abandoned => {
+                    return Err(FORECAST_UNRESPONSIVE_ERROR.to_string())
+                }
+            }
         }
     };
 
@@ -2212,7 +2325,7 @@ mod tests {
         let source = tmp.join("photo.jpg");
         std::fs::write(&source, b"photo").unwrap();
         let selected = vec![source.to_string_lossy().into_owned()];
-        let mut staged = staging::create_staging_dir(&selected, None).unwrap();
+        let mut staged = staging::create_staging_dir(&selected, None, None).unwrap();
         let invocation_root = staged.path().to_path_buf();
         let links = staged.take_links();
         let run = crate::services::stdout_parser::parse_run_progress(
@@ -2249,7 +2362,7 @@ mod tests {
                 path.to_string_lossy().into_owned()
             })
             .collect();
-        let mut staged = staging::create_staging_dir(&selected, None).unwrap();
+        let mut staged = staging::create_staging_dir(&selected, None, None).unwrap();
         let invocation_root = staged.path().to_path_buf();
         let links = staged.take_links();
         let log = links
@@ -2293,7 +2406,7 @@ mod tests {
         let source = tmp.join("failed.jpg");
         std::fs::write(&source, b"failed").unwrap();
         let selected = vec![source.to_string_lossy().into_owned()];
-        let mut staged = staging::create_staging_dir(&selected, None).unwrap();
+        let mut staged = staging::create_staging_dir(&selected, None, None).unwrap();
         let invocation_root = staged.path().to_path_buf();
         let links = staged.take_links();
         let (destination, _) = &links.entries()[0];
@@ -2777,6 +2890,97 @@ mod tests {
             include_type: None,
             include_extensions: Vec::new(),
             exclude_extensions: Vec::new(),
+        }
+    }
+
+    /// A blocking task that cannot be interrupted must not hold the caller.
+    /// This is the shape of a dead SMB/NFS mount: the walk never returns, so
+    /// only abandoning the join bounds the wait.
+    #[test]
+    fn a_blocked_task_is_abandoned_when_its_bound_passes() {
+        let release = Arc::new(AtomicBool::new(false));
+        let release_in_task = release.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task = tauri::async_runtime::spawn_blocking(move || {
+            while !release_in_task.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let outcome = tauri::async_runtime::block_on(join_bounded(
+            task,
+            Duration::from_millis(150),
+            cancel.as_ref(),
+            CANCEL_ABANDON_GRACE,
+        ))
+        .expect("an abandoned join is not a join failure");
+
+        assert!(matches!(outcome, BoundedJoin::TimedOut));
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the bound must also ask a merely slow walk to stop"
+        );
+        // Let the leaked thread finish so it does not outlive the test binary.
+        release.store(true, Ordering::Relaxed);
+    }
+
+    /// A cancel must free the caller even when the task cannot notice it. The
+    /// import worker holds the liveness markers app quit waits on, so "cancel
+    /// then quit" has to work in seconds, not at the staging deadline.
+    #[test]
+    fn a_cancelled_task_that_never_returns_is_abandoned_after_the_grace() {
+        let release = Arc::new(AtomicBool::new(false));
+        let release_in_task = release.clone();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let task = tauri::async_runtime::spawn_blocking(move || {
+            while !release_in_task.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let started = Instant::now();
+        let outcome = tauri::async_runtime::block_on(join_bounded(
+            task,
+            Duration::from_secs(60),
+            cancel.as_ref(),
+            Duration::from_millis(120),
+        ))
+        .expect("an abandoned join is not a join failure");
+
+        assert!(matches!(outcome, BoundedJoin::Abandoned));
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the cancel, not the bound, must release the caller"
+        );
+        release.store(true, Ordering::Relaxed);
+    }
+
+    /// A responsive task still wins: a cancel it notices returns its own error,
+    /// which is what names the outcome on the queue card.
+    #[test]
+    fn a_task_that_returns_within_the_grace_reports_its_own_result() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let cancel_in_task = cancel.clone();
+        let task = tauri::async_runtime::spawn_blocking(move || {
+            if cancel_in_task.load(Ordering::Relaxed) {
+                return Err("Staging cancelled".to_string());
+            }
+            Ok(())
+        });
+
+        let outcome = tauri::async_runtime::block_on(join_bounded(
+            task,
+            Duration::from_secs(60),
+            cancel.as_ref(),
+            CANCEL_ABANDON_GRACE,
+        ))
+        .expect("a returning task is not a join failure");
+
+        match outcome {
+            BoundedJoin::Finished(result) => {
+                assert_eq!(result.unwrap_err(), "Staging cancelled");
+            }
+            _ => panic!("a task that returns must not be reported as abandoned"),
         }
     }
 

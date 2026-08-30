@@ -14,6 +14,7 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
 };
 use uuid::Uuid;
 
@@ -113,12 +114,24 @@ impl Drop for StagingDir {
     }
 }
 
+/// Returned when `deadline` passes before staging finished.
+///
+/// The worker maps this to a terminal run, so the text is what the user reads
+/// on the queue card when a card or share stops answering mid-staging.
+pub const STAGING_TIMED_OUT_ERROR: &str = "Staging timed out: the source stopped responding";
+
 /// Build a staging directory linking to `selected`. The returned guard removes
 /// the directory if it is not explicitly cleaned up. If `cancel` is set, staging
 /// stops before linking the next selected file and drops its partial directory.
+///
+/// `deadline` bounds the whole walk the way `scan_directory_streaming` bounds a
+/// scan: it is checked before each selected file, so it caps a slow source but
+/// cannot interrupt a single `is_file`/`link_file` call already blocked in the
+/// kernel. Only abandoning the join bounds that case; see `join_bounded`.
 pub fn create_staging_dir(
     selected: &[String],
     cancel: Option<&AtomicBool>,
+    deadline: Option<Instant>,
 ) -> Result<StagingDir, String> {
     if selected.is_empty() {
         return Err("No files selected to stage".to_string());
@@ -145,6 +158,9 @@ pub fn create_staging_dir(
     for entry in selected {
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Err("Staging cancelled".to_string());
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(STAGING_TIMED_OUT_ERROR.to_string());
         }
         let src = Path::new(entry);
         if !src.is_file() {
@@ -308,6 +324,7 @@ mod tests {
                 b.to_string_lossy().to_string(),
             ],
             None,
+            None,
         )
         .unwrap();
 
@@ -337,7 +354,7 @@ mod tests {
 
     #[test]
     fn empty_selection_errors() {
-        assert!(create_staging_dir(&[], None).is_err());
+        assert!(create_staging_dir(&[], None, None).is_err());
     }
 
     #[test]
@@ -356,12 +373,36 @@ mod tests {
                 b.to_string_lossy().to_string(),
             ],
             Some(&cancel),
+            None,
         ) {
             Err(error) => error,
             Ok(_) => panic!("pre-cancelled staging must fail"),
         };
         assert_eq!(error, "Staging cancelled");
         assert!(a.exists() && b.exists());
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// A source that answers too slowly must end the run instead of holding the
+    /// import worker — and its liveness markers — forever. The originals stay
+    /// untouched, and the partial staging directory drops with the guard.
+    #[test]
+    fn an_expired_deadline_stops_staging_and_keeps_the_originals() {
+        let tmp = std::env::temp_dir().join(format!("stage-deadline-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let a = tmp.join("a.jpg");
+        fs::write(&a, b"a").unwrap();
+        // Already passed: the check runs before the first file is linked.
+        let deadline = Instant::now() - std::time::Duration::from_secs(1);
+
+        let error =
+            match create_staging_dir(&[a.to_string_lossy().to_string()], None, Some(deadline)) {
+                Err(error) => error,
+                Ok(_) => panic!("staging past its deadline must fail"),
+            };
+
+        assert_eq!(error, STAGING_TIMED_OUT_ERROR);
+        assert!(a.exists(), "a timed-out staging run must not touch sources");
         fs::remove_dir_all(&tmp).unwrap();
     }
 
@@ -381,6 +422,7 @@ mod tests {
                 a.to_string_lossy().to_string(),
                 a.to_string_lossy().to_string(),
             ],
+            None,
             None,
         )
         .unwrap();
@@ -436,7 +478,8 @@ mod tests {
         // Craft the first entry with literal `..` segments relative to the second.
         let crafted = format!("{}/album/../evilfile.jpg", tmp.to_string_lossy());
         let staged =
-            create_staging_dir(&[crafted, normal.to_string_lossy().to_string()], None).unwrap();
+            create_staging_dir(&[crafted, normal.to_string_lossy().to_string()], None, None)
+                .unwrap();
 
         for entry in walkdir_files(staged.path()) {
             assert!(
@@ -460,7 +503,8 @@ mod tests {
         fs::write(&source, b"x").unwrap();
 
         let staged_path = {
-            let staged = create_staging_dir(&[source.to_string_lossy().to_string()], None).unwrap();
+            let staged =
+                create_staging_dir(&[source.to_string_lossy().to_string()], None, None).unwrap();
             let path = staged.path().to_path_buf();
             assert!(path.exists());
             path
