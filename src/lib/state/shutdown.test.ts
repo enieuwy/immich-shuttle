@@ -26,6 +26,7 @@ function deps(overrides: Partial<ShutdownDeps> = {}): ShutdownDeps {
     cancelImport: vi.fn(() => Promise.resolve()),
     awaitTerminal: vi.fn(() => Promise.resolve({})),
     timeoutMs: 1_000,
+    wipeTimeoutMs: 1_000,
     ...overrides,
   };
 }
@@ -226,7 +227,7 @@ describe("runImportShutdown", () => {
     const outcome = await runImportShutdown(
       deps({
         pendingWipes: [wipe.promise],
-        timeoutMs: 20,
+        wipeTimeoutMs: 20,
         cancelImport,
         runningJobIds: ["job-1"],
         retainedJobIds,

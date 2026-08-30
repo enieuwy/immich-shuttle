@@ -29,6 +29,17 @@ export const WIPE_INCOMPLETE_MESSAGE =
  *  seconds, and staging cleanup on a full card is slower. */
 export const SHUTDOWN_TIMEOUT_MS = 30_000;
 
+/**
+ * How long to wait for a confirmed delete before refusing the quit.
+ *
+ * Its own constant, even though it currently equals `SHUTDOWN_TIMEOUT_MS`: that
+ * one is a worker-exit policy, while this one only decides how long the user
+ * waits for an answer. A delete that outlives it keeps running, so raising or
+ * lowering this changes feedback, never safety, and the two must be free to
+ * move apart.
+ */
+export const WIPE_WAIT_TIMEOUT_MS = 30_000;
+
 export type ShutdownOutcome =
   | { kind: "complete" }
   | { kind: "incomplete"; message: string };
@@ -61,7 +72,10 @@ export type ShutdownDeps = {
   retainedJobIds: Set<string>;
   cancelImport: (jobId: string) => Promise<unknown>;
   awaitTerminal: (jobId: string, timeoutMs: number) => Promise<unknown>;
+  /** Override for the worker-exit wait; tests use a short one. */
   timeoutMs?: number;
+  /** Override for the confirmed-delete wait; tests use a short one. */
+  wipeTimeoutMs?: number;
 };
 
 /**
@@ -128,7 +142,8 @@ export async function runImportShutdown(deps: ShutdownDeps): Promise<ShutdownOut
 
   // Waited on before anything is cancelled: this quit may still be refused, and
   // a refused quit must not have stopped a running import on the way.
-  if (deps.pendingWipes.length > 0 && !(await settledWithin(deps.pendingWipes, timeoutMs))) {
+  const wipeTimeoutMs = deps.wipeTimeoutMs ?? WIPE_WAIT_TIMEOUT_MS;
+  if (deps.pendingWipes.length > 0 && !(await settledWithin(deps.pendingWipes, wipeTimeoutMs))) {
     return { kind: "incomplete", message: WIPE_INCOMPLETE_MESSAGE };
   }
 

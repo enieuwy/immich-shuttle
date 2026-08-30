@@ -410,6 +410,16 @@ fn admission_block_reason(run_live: bool, finalizing_live: bool) -> Option<&'sta
 /// fast Retry admits a second run while the first still owns those writes.
 /// `import_await_terminal` and `has_live_import_worker` observe both maps for
 /// the same reason, so admission must not answer the question differently.
+///
+/// `ACTIVE_WIPES` is deliberately NOT part of the answer: a confirmed delete
+/// does not block a new import. The delete only touches files the server has
+/// already confirmed, and it moves them to the Trash rather than erasing them,
+/// so a run that starts during one cannot lose anything — a file trashed between
+/// that run's scan and its upload is reported as a per-file access error in its
+/// log, against a copy the server already holds. Blocking would instead stop the
+/// user importing an unrelated card for as long as it takes to hash and delete
+/// the previous one, which is minutes on a full card. `has_live_import_worker`
+/// does count the wipe, so quitting waits for it even though admission does not.
 fn import_admission_block() -> Result<Option<&'static str>, String> {
     let jobs = JOBS
         .lock()
