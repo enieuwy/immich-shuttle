@@ -1160,43 +1160,26 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let mut staging_dir = if staging_requested {
             let selected_files = select_files.clone();
             let cancel_flag_for_staging = cancel_flag.clone();
-            let claim_roots = source_paths.clone();
-            // Claimed BEFORE the walk is queued, and released only when the walk
+            // Claimed BEFORE anything is queued, and released only when the walk
             // task ends, so a source that stops answering is refused by name on
-            // the next attempt. Claiming inside the walk would not do it: the
-            // claim exists only once the closure runs, so retries against a dead
-            // mount could queue behind saturated blocking threads without any of
-            // them owning the root. Bounded like every other blocking wait here —
-            // the claim itself waits up to `CLAIM_GRACE` for a previous walk.
-            let claim_task = tauri::async_runtime::spawn_blocking(move || {
-                media_scanner::acquire_scan_roots(media_scanner::ScanPurpose::Stage, &claim_roots)
-            });
-            let claimed = match join_bounded(
-                claim_task,
-                STAGING_STALL,
-                cancel_flag.as_ref(),
-                CANCEL_ABANDON_GRACE,
-                None,
-            )
-            .await
-            {
-                Ok(BoundedJoin::Finished(Ok(claim))) => Ok(claim),
-                Ok(BoundedJoin::Finished(Err(e))) => {
-                    Err(format!("Could not stage selected files: {e}"))
-                }
-                Ok(BoundedJoin::TimedOut) | Ok(BoundedJoin::Abandoned) => {
-                    Err(format!("{}.", staging::STAGING_TIMED_OUT_ERROR))
-                }
-                Err(e) => Err(format!("Staging task failed: {e}")),
-            };
-            let claim = match claimed {
+            // the next attempt. Two orderings were wrong here and both allowed
+            // retries to pile up against a dead mount: claiming inside the walk
+            // means no claim exists until the closure runs, and claiming in a
+            // second blocking task means the claim can queue behind the very
+            // threads it is meant to cap. The registry is a plain mutex with a
+            // `CLAIM_GRACE` ceiling, so it is taken here, off the blocking pool
+            // entirely — the same order `import_forecast` uses.
+            let claim = match media_scanner::acquire_scan_roots(
+                media_scanner::ScanPurpose::Stage,
+                &source_paths,
+            ) {
                 Ok(claim) => claim,
-                Err(error) => {
+                Err(e) => {
                     finish_staging_exit(
                         &app_clone,
                         &job_id_clone,
                         &profile.id,
-                        error,
+                        format!("Could not stage selected files: {e}"),
                         cancel_flag.as_ref(),
                         RunRecord {
                             started_at,
