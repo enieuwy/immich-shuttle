@@ -1,11 +1,12 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
   "description": [
-    "lockFileMaintenance is on because Renovate's ordinary updates are driven by what Cargo.toml and package.json declare, and its OSV alerts are documented as direct-only. Neither reaches a purely transitive crate. Every advisory found in the 2026-08-30 audit sweep was against one: anyhow and rand via tauri, event-listener via keyring, and the yanked wasm-bindgen family via reqwest. None is declared here, and none of the first 23 Renovate PRs on this repository touched a crate that was not declared, so the drift had no owner but a manual sweep.",
-    "The weekly refresh gives it one. It pairs with the deny-warnings ratchet in src-tauri/.cargo/audit.toml: a lock-maintenance PR that pulls in a crate carrying an unlisted advisory fails the audit job rather than merging quietly. Such a PR needs a decision - take the fix, pin the crate, or add an entry naming the upstream owner and why it cannot be fixed here - not a rubber stamp."
+    "No extends on purpose. Renovate's defaults are what this repository wants, and config:recommended would switch on the dependency dashboard along with everything else it composes.",
+    "lockFileMaintenance is the one addition. Renovate's ordinary updates are driven by what Cargo.toml and package.json declare, and osvVulnerabilityAlerts is documented as direct-only, so no Renovate mechanism reached a purely transitive crate. Every advisory found in the 2026-08-30 audit sweep was against one: anyhow and rand via tauri, event-listener via keyring, the yanked wasm-bindgen family via reqwest. None is declared here, and none of the first 23 Renovate PRs on this repository touched a crate that was not declared, so the drift had no owner but a manual sweep.",
+    "It runs daily rather than on the weekly default, matching the cadence of every other update on this repository. It pairs with the deny-warnings ratchet in src-tauri/.cargo/audit.toml: a lock-maintenance PR that pulls in a crate carrying an unlisted advisory fails the audit job rather than merging quietly. Such a PR needs a decision - take the fix, pin the crate, or add an entry naming the upstream owner and why it cannot be fixed here - not a rubber stamp."
   ],
   "lockFileMaintenance": {
-    "enabled": true
+    "enabled": true,
+    "schedule": ["before 4am"]
   }
 }
