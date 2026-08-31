@@ -15,15 +15,36 @@ use serde_json::{json, Value};
 /// retries on.
 pub const UNREACHABLE_ERROR: &str = "Could not reach the server";
 
+/// Follow redirects only when the scheme, host, and effective port stay fixed.
+/// Reqwest does not strip the custom `x-api-key` header when an origin changes.
+fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    let limited = reqwest::redirect::Policy::limited(10);
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let same_origin = attempt.previous().last().is_some_and(|previous| {
+            previous.scheme() == attempt.url().scheme()
+                && previous.host_str() == attempt.url().host_str()
+                && previous.port_or_known_default() == attempt.url().port_or_known_default()
+        });
+        if same_origin {
+            limited.redirect(attempt)
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 /// One shared HTTP client (connection pool + TLS config) reused across every
 /// request. Building a fresh `Client` per call is wasteful and was a likely
 /// source of flaky "error sending request" failures during the startup burst.
+/// Same-origin redirects remain supported. An origin change returns its 3xx
+/// response without sending the authenticated follow-up request.
 ///
 /// Keep the build error instead of falling back to reqwest's default
 /// constructor: that fallback can panic for the same TLS or resolver failure
 /// that rejected the configured client, poisoning this process-wide lazy value.
 static HTTP: LazyLock<Result<Client, String>> = LazyLock::new(|| {
     Client::builder()
+        .redirect(same_origin_redirect_policy())
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
         .build()
@@ -716,7 +737,138 @@ pub async fn probe_is_immich(server_url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_server_url, server_compatibility, ServerVersion};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+
+    use super::{normalize_server_url, server_compatibility, ImmichClient, ServerVersion};
+
+    struct HttpStub {
+        url: String,
+        requests: mpsc::UnboundedReceiver<String>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for HttpStub {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn spawn_http_stub(responder: impl Fn(&str) -> String + Send + 'static) -> HttpStub {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let addr = listener.local_addr().expect("stub address");
+        let (requests_tx, requests) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    continue;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while let Ok(read) = socket.read(&mut chunk).await {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let response = responder(&request);
+                let _ = requests_tx.send(request);
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        HttpStub {
+            url: format!("http://127.0.0.1:{}", addr.port()),
+            requests,
+            handle,
+        }
+    }
+
+    fn http_response(status: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let headers = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        format!(
+            "HTTP/1.1 {status}\r\n{headers}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn request_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().skip(1).find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            header_name.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    async fn next_request(stub: &mut HttpStub) -> String {
+        tokio::time::timeout(Duration::from_secs(1), stub.requests.recv())
+            .await
+            .expect("stub received a request before timeout")
+            .expect("stub request channel stayed open")
+    }
+
+    #[tokio::test]
+    async fn authenticated_json_redirects_follow_only_the_same_origin() {
+        const API_KEY: &str = "redirect-test-api-key";
+
+        let mut same_origin = spawn_http_stub(|request| {
+            if request.starts_with("GET /api/server/ping ") {
+                http_response("302 Found", &[("location", "/redirected")], "")
+            } else {
+                http_response("200 OK", &[], r#"{"res":"pong"}"#)
+            }
+        })
+        .await;
+        let client = ImmichClient::new(&same_origin.url, API_KEY);
+
+        client
+            .ping()
+            .await
+            .expect("same-origin redirect must remain supported");
+        for expected_path in ["/api/server/ping", "/redirected"] {
+            let request = next_request(&mut same_origin).await;
+            assert!(
+                request.starts_with(&format!("GET {expected_path} ")),
+                "unexpected request: {request}"
+            );
+            assert_eq!(request_header(&request, "x-api-key"), Some(API_KEY));
+        }
+
+        let mut cross_origin_target =
+            spawn_http_stub(|_| http_response("200 OK", &[], r#"{"res":"pong"}"#)).await;
+        let target_url = cross_origin_target.url.clone();
+        let cross_origin_source =
+            spawn_http_stub(move |_| http_response("302 Found", &[("location", &target_url)], ""))
+                .await;
+        let client = ImmichClient::new(&cross_origin_source.url, API_KEY);
+
+        let error = client
+            .ping()
+            .await
+            .expect_err("cross-origin redirect must be refused");
+        assert!(error.contains("302"), "unexpected redirect error: {error}");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                cross_origin_target.requests.recv()
+            )
+            .await
+            .is_err(),
+            "the client followed the cross-origin redirect"
+        );
+    }
+
     #[test]
     fn sniffs_only_known_image_signatures() {
         use super::sniff_image_mime;
