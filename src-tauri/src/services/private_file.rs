@@ -12,7 +12,7 @@
 
 use std::{
     fs,
-    io::Write,
+    io::{self, Write},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -39,10 +39,44 @@ static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 /// silently cleared on the next call.
 ///
 /// After the rename, the parent directory is fsynced (`#[cfg(unix)]`) so the
-/// new directory entry itself survives an unclean shutdown -- without this, a
-/// crash right after a successful rename can revert to the pre-rename entry
-/// even though this function already returned `Ok`, silently losing the save.
+/// new directory entry itself survives an unclean shutdown. A sync failure
+/// cannot undo the visible rename, so it is logged as a durability warning and
+/// the committed write still returns `Ok`.
 pub fn write_atomic_private(path: &Path, contents: &str) -> Result<(), String> {
+    write_atomic_private_with_parent_sync(
+        path,
+        contents,
+        sync_parent_directory,
+        report_parent_sync_failure,
+    )
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn report_parent_sync_failure(path: &Path, err: &io::Error) {
+    let warning = format!(
+        "atomic_write_committed_durability_unconfirmed path={} error={err}",
+        path.display()
+    );
+    if let Err(log_err) = crate::services::logs::append_log("app.log", &warning) {
+        eprintln!("{warning}; additionally failed to append app log: {log_err}");
+    }
+}
+
+fn write_atomic_private_with_parent_sync(
+    path: &Path,
+    contents: &str,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+    report_sync_failure: impl FnOnce(&Path, &io::Error),
+) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| format!("Could not resolve parent directory of {}", path.display()))?;
@@ -87,16 +121,18 @@ pub fn write_atomic_private(path: &Path, contents: &str) -> Result<(), String> {
     // No Windows equivalent: NTFS has no directory-fsync primitive, and
     // `fs::rename` on Windows already goes through `MoveFileEx`, which
     // journals the metadata update itself.
-    #[cfg(unix)]
-    if let Err(err) = fs::File::open(dir).and_then(|d| d.sync_all()) {
-        return Err(format!("Could not sync directory {}: {err}", dir.display()));
+    if let Err(err) = sync_parent(dir) {
+        // The rename already committed. Returning the same error as a
+        // pre-commit failure would make cross-store callers roll back related
+        // state while the new file remains visible.
+        report_sync_failure(path, &err);
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::write_atomic_private;
+    use super::{write_atomic_private, write_atomic_private_with_parent_sync};
     use uuid::Uuid;
 
     fn scratch_dir() -> std::path::PathBuf {
@@ -124,6 +160,36 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parent_sync_failure_keeps_the_committed_write_successful() {
+        let dir = scratch_dir();
+        let path = dir.join("store.json");
+        std::fs::write(&path, "previous").unwrap();
+        let warning_reported = std::cell::Cell::new(false);
+
+        write_atomic_private_with_parent_sync(
+            &path,
+            "current",
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected parent sync failure",
+                ))
+            },
+            |warning_path, err| {
+                warning_reported.set(true);
+                assert_eq!(warning_path, path);
+                assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            },
+        )
+        .expect("a parent sync failure occurs after the write commits");
+
+        assert!(warning_reported.get());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "current");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
