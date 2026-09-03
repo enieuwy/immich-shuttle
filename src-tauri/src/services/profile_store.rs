@@ -160,6 +160,7 @@ pub(crate) mod test_config {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use crate::models::profile::Profile;
 
@@ -239,6 +240,10 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// The temp files `write_atomic_private` creates are hidden: `.{stem}.{pid}.{n}.tmp`.
+    /// A search for `config.json.` therefore matched nothing that writer can
+    /// produce, so the count was always 0 and the test passed even with a
+    /// leftover on disk. The decoy at the end proves the search can still see one.
     #[test]
     fn failed_config_rename_removes_temp_file() {
         let _guard = lock_test_config();
@@ -249,17 +254,31 @@ mod tests {
         assert!(save_config(&AppConfig::default()).is_err());
 
         let config_dir = dir.join("immich-shuttle");
-        let temp_files = fs::read_dir(&config_dir)
-            .expect("read config directory")
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("config.json.")
-            })
-            .count();
-        assert_eq!(temp_files, 0);
+        let temp_files = |dir: &Path| -> usize {
+            fs::read_dir(dir)
+                .expect("read config directory")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    name.starts_with(".config.json.") && name.ends_with(".tmp")
+                })
+                .count()
+        };
+
+        assert_eq!(
+            temp_files(&config_dir),
+            0,
+            "a failed rename must not leave its temp file behind"
+        );
+
+        let decoy = config_dir.join(format!(".config.json.{}.0.tmp", std::process::id()));
+        fs::write(&decoy, b"leftover").expect("write decoy temp file");
+        assert_eq!(
+            temp_files(&config_dir),
+            1,
+            "test premise: the search must match the names write_atomic_private creates"
+        );
+
         let _ = fs::remove_dir_all(dir);
     }
 }

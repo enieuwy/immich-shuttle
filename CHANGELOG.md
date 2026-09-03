@@ -7,6 +7,7 @@
 
 ### Maintenance
 - **Two tests described the host rather than the app.** One needed the temporary directory to sit on a filesystem with a volume id, which a Linux CI container's root filesystem does not have; the other needed a recreated file to receive a new record, which ext4 does not do. Both now pin the invariant itself, and the Linux test job passes.
+- **A cleanup test could not see the file it was looking for.** The check that a failed config save leaves no temp file searched for `config.json.`, but the atomic writer creates hidden files named `.config.json.<pid>.<n>.tmp`, so the count was always zero. The search now matches the real name, and the test plants a leftover afterwards to prove the search would notice one.
 
 ## v0.8.0 - 2026-09-03
 
