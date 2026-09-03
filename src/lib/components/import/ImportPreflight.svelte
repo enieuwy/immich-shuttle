@@ -7,6 +7,7 @@
   import { sourceState } from "$lib/state/source";
   import { selectionState } from "$lib/state/selection";
   import { importOptionsState } from "$lib/state/import-options";
+  import { forecastProfileIdentity, nextForecastGeneration } from "$lib/state/forecast";
 
   // Preflight dry-run of the import: sits beside Start Import so "what would
   // this upload?" is answered right where the import is launched.
@@ -14,10 +15,11 @@
   let forecasting = $state(false);
   let forecastError = $state("");
   let forecastToken = 0;
-  // Every backend forecast receives a strictly increasing generation. Cleanup
-  // sends this exact value back, so a delayed F1 cancel is a no-op after F2 has
-  // replaced it in the backend.
-  let forecastGeneration = 0;
+  // Every backend forecast receives a strictly increasing generation from the module-level
+  // counter, which outlives this component: cleanup sends the exact value back, so a
+  // delayed F1 cancel is a no-op after F2 has replaced it in the backend -- and a remount
+  // can never reissue a retired number for the delayed cancel to hit.
+
   // Generation of the call that still owns active backend work. This must not
   // be a boolean: an old call can settle after F2 begins, and only its own
   // `finally` may release this ownership.
@@ -42,7 +44,7 @@
   // Invalidate any shown/in-flight forecast when its inputs change, so stale
   // counts from a previous profile/source/selection never sit under a new one.
   $effect(() => {
-    void $activeProfile?.id;
+    void forecastProfileIdentity($activeProfile);
     void $sourceState.selectedPaths;
     void $selectionState.selected;
     void $importOptionsState.mediaType;
@@ -76,7 +78,7 @@
     const selection = [...$selectionState.selected];
     const options = $importOptionsState;
     const token = ++forecastToken;
-    const generation = ++forecastGeneration;
+    const generation = nextForecastGeneration();
     forecastInFlightGeneration = generation;
     forecasting = true;
     forecastError = "";

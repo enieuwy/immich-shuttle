@@ -109,6 +109,31 @@ async fn response_text_limited(response: Response) -> Result<String, String> {
     String::from_utf8(body).map_err(|e| format!("response is not valid UTF-8: {e}"))
 }
 
+/// Longest server-supplied response body quoted back in an HTTP-failure
+/// message. `MAX_RESPONSE_BYTES` (16 MiB) bounds what this client will BUFFER,
+/// which a success path legitimately needs, but an error string travels much
+/// further: it becomes `job.error`, crosses IPC to the queue card, and is
+/// written to app.log as a single line. A body that large is not diagnostic
+/// anyway — the first few hundred characters carry the status page or JSON
+/// error object, and the rest is padding or an HTML page — so quote only that
+/// much, in the same spirit as `MAX_ECHOED_ID_CHARS`.
+const MAX_ERROR_BODY_CHARS: usize = 400;
+
+/// Bound a server-controlled response body for inclusion in an error message.
+/// The excerpt is cut on a character boundary and names how much was dropped,
+/// so a truncated message still says the server answered at length.
+fn error_body_excerpt(text: &str) -> String {
+    let trimmed = text.trim();
+    match trimmed.char_indices().nth(MAX_ERROR_BODY_CHARS) {
+        None => trimmed.to_string(),
+        Some((cut, _)) => format!(
+            "{}… (truncated, {} more bytes)",
+            &trimmed[..cut],
+            trimmed.len() - cut
+        ),
+    }
+}
+
 /// Immich server bases identify an origin (optionally behind a path-prefix), not
 /// a resource. Discard a query and fragment so they cannot be inherited by API
 /// requests or public share links.
@@ -301,8 +326,9 @@ impl ImmichClient {
                         .await
                         .map_err(|e| format!("Failed reading API response: {e}"))?;
                     if !status.is_success() {
+                        let body = error_body_excerpt(&text);
                         return Err(format!(
-                            "API {method} {display_path} failed at {url} ({status}): {text}"
+                            "API {method} {display_path} failed at {url} ({status}): {body}"
                         ));
                     }
                     if text.trim().is_empty() {
@@ -619,13 +645,7 @@ impl ImmichClient {
                 .get("results")
                 .and_then(|r| r.as_array())
                 .ok_or_else(|| "bulk-upload-check returned no results".to_string())?;
-            for (id, copy) in duplicates_from_results(results) {
-                let index = checked_result_index(id, &requested)?;
-                check.duplicates.insert(index);
-                if copy == ServerCopy::Live {
-                    check.confirmed_live.insert(index);
-                }
-            }
+            merge_checked_results(results, &requested, &mut check)?;
         }
         Ok(check)
     }
@@ -663,6 +683,65 @@ fn checked_result_index(id: &str, requested: &Range<usize>) -> Result<usize, Str
             ))
         }
     }
+}
+
+/// Fold one response's duplicate rows into the running sweep, rejecting a
+/// response that answers the same request row more than once.
+///
+/// Set-wise insertion made a repeated index silently resolve to the most
+/// permissive of its rows: a response carrying `isTrashed: false` for index 0
+/// and, later, `isTrashed: true` (or an absent field) for the same index left 0
+/// in `confirmed_live`, so verify-before-wipe (wipe::verify_uploaded) read a
+/// self-contradiction as proof that the local original was safely uploaded and
+/// could trash it. A repeat is therefore treated exactly like an out-of-range
+/// id: the whole sweep fails and nothing is deleted.
+///
+/// The rejection covers two rows that AGREE as well. A server that duplicates a
+/// row has already disproved its one-answer-per-row pairing, and agreement is
+/// not evidence that the duplication was harmless — the deliberate choice is to
+/// fail closed and keep the user's files.
+///
+/// Indexes are compared PARSED, never as strings: `"0"` and `"00"` are two
+/// different strings naming one request row.
+///
+/// Nothing is recorded until every row of the response has been validated, so a
+/// violating response contributes no partial evidence to the sweep.
+fn merge_checked_results(
+    results: &[Value],
+    requested: &Range<usize>,
+    check: &mut BulkUploadCheck,
+) -> Result<(), String> {
+    // Scan EVERY duplicate-reject row, not only the rows the liveness read
+    // keeps. The contradicting row is precisely the trashed or
+    // unknown-status one that read drops, so a guard placed after it would
+    // never see the conflict. Range-checking those rows too is the same
+    // fail-closed policy: a trashed answer for an index this request never
+    // issued is a mispairing whatever its liveness says.
+    let mut answered: HashSet<usize> = HashSet::with_capacity(results.len());
+    for result in results {
+        let Some(id) = duplicate_reject_id(result) else {
+            continue;
+        };
+        let index = checked_result_index(id, requested)?;
+        if !answered.insert(index) {
+            let shown: String = id.chars().take(MAX_ECHOED_ID_CHARS).collect();
+            return Err(format!(
+                "bulk-upload-check protocol violation: server echoed id {shown:?} for index {index} twice in one response for a request carrying indexes {}..{}",
+                requested.start, requested.end
+            ));
+        }
+    }
+
+    // Every id below already passed the range and repeat checks above, so this
+    // pass only records evidence.
+    for (id, copy) in duplicates_from_results(results) {
+        let index = checked_result_index(id, requested)?;
+        check.duplicates.insert(index);
+        if copy == ServerCopy::Live {
+            check.confirmed_live.insert(index);
+        }
+    }
+    Ok(())
 }
 
 /// Builds one bulk-upload-check request body. Split out so the wire shape can be
@@ -721,12 +800,7 @@ fn duplicates_from_results(results: &[Value]) -> Vec<(&str, ServerCopy)> {
     results
         .iter()
         .filter_map(|result| {
-            let id = result.get("id").and_then(Value::as_str)?;
-            let action = result.get("action").and_then(Value::as_str)?;
-            let reason = result.get("reason").and_then(Value::as_str);
-            if action != "reject" || reason != Some("duplicate") {
-                return None;
-            }
+            let id = duplicate_reject_id(result)?;
             match result.get("isTrashed").and_then(Value::as_bool) {
                 Some(true) => None,
                 Some(false) => Some((id, ServerCopy::Live)),
@@ -734,6 +808,20 @@ fn duplicates_from_results(results: &[Value]) -> Vec<(&str, ServerCopy)> {
             }
         })
         .collect()
+}
+
+/// The echoed id of a row the server rejected as an already-present duplicate,
+/// whatever that row says about liveness.
+///
+/// Shared by the liveness read above and the repeated-index guard in
+/// `merge_checked_results` so both agree on exactly which rows are answers
+/// about a local file. The guard has to see the rows the read discards, because
+/// a trashed row is both discarded and the row that contradicts a live one.
+fn duplicate_reject_id(result: &Value) -> Option<&str> {
+    let id = result.get("id").and_then(Value::as_str)?;
+    let action = result.get("action").and_then(Value::as_str)?;
+    let reason = result.get("reason").and_then(Value::as_str);
+    (action == "reject" && reason == Some("duplicate")).then_some(id)
 }
 
 /// Payload for creating a public album share link. `showMetadata` is false so a
@@ -1244,6 +1332,123 @@ mod tests {
         let mut duplicates = check.duplicates.into_iter().collect::<Vec<_>>();
         duplicates.sort_unstable();
         assert_eq!(duplicates, [0, 499, 500, 599]);
+    }
+
+    /// Two rows answering the SAME request index are two contradictory answers
+    /// about one local file, and set-wise insertion let the permissive one win:
+    /// a live row plus a trashed row for index 0 used to leave 0 in
+    /// `confirmed_live`, so verify-before-wipe would trash the local original on
+    /// contradictory evidence. `"0"` and `"00"` are different strings naming the
+    /// same parsed index, which is why the guard compares parsed indexes.
+    #[tokio::test]
+    async fn bulk_upload_check_rejects_a_repeated_index_with_conflicting_liveness() {
+        const RESULTS: &str = r#"{"results":[{"id":"0","action":"reject","reason":"duplicate","isTrashed":false},{"id":"00","action":"reject","reason":"duplicate","isTrashed":true}]}"#;
+
+        let stub = spawn_http_stub(|_| http_response("200 OK", &[], RESULTS)).await;
+        let error = ImmichClient::new(&stub.url, "repeat-test-api-key")
+            .bulk_upload_check(&[format!("{:040x}", 0)])
+            .await
+            .expect_err("a contradicted index must fail the whole check");
+        assert!(
+            error.contains("protocol violation") && error.contains("twice"),
+            "unexpected error: {error}"
+        );
+
+        // The sweep must also record nothing from a violating response, so no
+        // caller can read a half-merged confirmation out of a failed check.
+        let results: serde_json::Value = serde_json::from_str(RESULTS).expect("stub body parses");
+        let results = results["results"].as_array().expect("results array");
+        let mut check = super::BulkUploadCheck::default();
+        super::merge_checked_results(results, &(0..1), &mut check)
+            .expect_err("a contradicted index must fail the merge");
+        assert!(
+            check.confirmed_live.is_empty() && check.duplicates.is_empty(),
+            "a violating response contributed evidence: {check:?}"
+        );
+    }
+
+    /// Repeated rows that AGREE are rejected too. This is the deliberate
+    /// fail-closed choice: a server that answers one requested row twice has
+    /// disproved its one-answer-per-row pairing, and agreement between the two
+    /// copies is not evidence that the duplication was harmless. Keeping the
+    /// user's files costs one re-run of the check; trusting a mispairing server
+    /// costs the original.
+    #[tokio::test]
+    async fn bulk_upload_check_rejects_a_repeated_index_even_when_the_rows_agree() {
+        let stub = spawn_http_stub(|_| {
+            http_response(
+                "200 OK",
+                &[],
+                r#"{"results":[{"id":"0","action":"reject","reason":"duplicate","isTrashed":false},{"id":"0","action":"reject","reason":"duplicate","isTrashed":false}]}"#,
+            )
+        })
+        .await;
+
+        let error = ImmichClient::new(&stub.url, "repeat-test-api-key")
+            .bulk_upload_check(&[format!("{:040x}", 0)])
+            .await
+            .expect_err("a repeated index must fail the check even when it agrees");
+        assert!(
+            error.contains("protocol violation") && error.contains("twice"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The guard must not cost the normal case anything: one row per index still
+    /// confirms the live ones, still forecasts the unknown-status ones, and
+    /// still keeps the trashed ones out of both sets.
+    #[test]
+    fn one_row_per_index_is_recorded_unchanged() {
+        use serde_json::json;
+
+        let results = [
+            json!({ "id": "0", "action": "reject", "reason": "duplicate", "isTrashed": false }),
+            json!({ "id": "1", "action": "reject", "reason": "duplicate", "isTrashed": true }),
+            json!({ "id": "2", "action": "reject", "reason": "duplicate" }),
+            json!({ "id": "3", "action": "accept" }),
+        ];
+        let mut check = super::BulkUploadCheck::default();
+        super::merge_checked_results(&results, &(0..4), &mut check)
+            .expect("one answer per index is a well-formed response");
+
+        let mut confirmed = check.confirmed_live.into_iter().collect::<Vec<_>>();
+        confirmed.sort_unstable();
+        assert_eq!(confirmed, [0]);
+        let mut duplicates = check.duplicates.into_iter().collect::<Vec<_>>();
+        duplicates.sort_unstable();
+        assert_eq!(duplicates, [0, 2]);
+    }
+
+    /// An HTTP failure body is server-controlled text that becomes `job.error`,
+    /// crosses IPC to the queue card, and is written to app.log as one line. The
+    /// read limit is 16 MiB, so quoting the whole body let a server put megabytes
+    /// into all three. The excerpt still has to name the failure it saw.
+    #[tokio::test]
+    async fn api_error_body_is_bounded_before_it_reaches_the_job_error() {
+        let body = format!(
+            r#"{{"message":"upstream exploded","pad":"{}"}}"#,
+            "x".repeat(1024 * 1024)
+        );
+        let stub =
+            spawn_http_stub(move |_| http_response("500 Internal Server Error", &[], &body)).await;
+
+        let error = ImmichClient::new(&stub.url, "error-body-test-api-key")
+            .ping()
+            .await
+            .expect_err("a 500 must surface as an error");
+        assert!(
+            error.contains("500") && error.contains("upstream exploded"),
+            "the excerpt dropped the diagnostic opening: {error}"
+        );
+        assert!(
+            error.len() < 1024,
+            "the error string was not bounded ({} bytes)",
+            error.len()
+        );
+        assert!(
+            error.contains("truncated"),
+            "a truncated body must say so: {error}"
+        );
     }
 
     /// A profile URL may carry `user:pass@`, and `Url`'s Display prints userinfo

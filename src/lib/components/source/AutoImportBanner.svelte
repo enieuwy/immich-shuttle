@@ -24,10 +24,14 @@
   const askDeleteConfirmation = $derived(!!rule && unverified && !rule.keepFiles);
   const willDelete = $derived(!!rule && (unverified ? confirmDelete : !rule.keepFiles));
 
-  // Every candidate is a different physical card; a confirmation given for the previous
-  // one must never carry over to the next.
+  // Every candidate is a different physical card, and a confirmation given for the previous
+  // one must never carry over. The mount path alone cannot see that: it is a slot two cards
+  // share, and a card pulled and pushed back in reuses both the path and the volume id. The
+  // store's revision is what identifies THIS prompt, so all three are tracked.
   $effect(() => {
     void device?.mount_path;
+    void device?.volume_id;
+    void $autoImportState.candidateRevision;
     confirmDelete = false;
   });
 

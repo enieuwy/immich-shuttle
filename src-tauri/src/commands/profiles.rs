@@ -5,16 +5,16 @@ use crate::{
     models::profile::{Profile, ProfileInput, ServerInfo},
     services::{
         immich_client::{normalize_server_url, server_compatibility, ImmichClient},
-        keychain, profile_store,
+        keychain, logs, profile_store,
     },
 };
 
 #[tauri::command]
 pub async fn profiles_list() -> Result<Vec<Profile>, String> {
-    profile_store::list_profiles()?
+    Ok(profile_store::list_profiles()?
         .into_iter()
         .map(normalize_loaded_profile)
-        .collect()
+        .collect())
 }
 
 /// Scan the local network for reachable Immich servers, returning confirmed
@@ -102,11 +102,82 @@ fn normalized_optional_server_url(value: Option<&str>) -> Result<Option<String>,
         .transpose()
 }
 
-fn normalize_loaded_profile(mut profile: Profile) -> Result<Profile, String> {
-    profile.server_url = normalized_server_url(&profile.server_url)?;
-    profile.lan_server_url = normalized_optional_server_url(profile.lan_server_url.as_deref())?;
-    profile.wan_server_url = normalized_optional_server_url(profile.wan_server_url.as_deref())?;
-    Ok(profile)
+/// Normalize a stored profile for display, degrading rather than failing.
+///
+/// An older build let the editor save a value this normalizer now rejects — a
+/// schemeless `192.168.1.10:2283`, for example. Failing here failed the whole
+/// list, so one unparseable stored URL hid every profile and left the user an
+/// empty picker with no route back to the editor that could repair it. The
+/// profile therefore survives with a display-only URL, while every path that
+/// would USE that URL — `url_resolver::resolve_server_url`, `profile_upsert`,
+/// `profile_validate` — normalizes it again for itself and still refuses it.
+/// The label degrades; the action keeps failing closed.
+fn normalize_loaded_profile(mut profile: Profile) -> Profile {
+    let mut degraded: Vec<&'static str> = Vec::new();
+    profile.server_url = normalized_loaded_url(&profile.server_url, "server_url", &mut degraded);
+    profile.lan_server_url = loaded_optional_url(
+        profile.lan_server_url.as_deref(),
+        "lan_server_url",
+        &mut degraded,
+    );
+    profile.wan_server_url = loaded_optional_url(
+        profile.wan_server_url.as_deref(),
+        "wan_server_url",
+        &mut degraded,
+    );
+    if !degraded.is_empty() {
+        // Names the profile and the fields, never the stored text: an old value
+        // can still carry the credentials the URL used to be allowed to hold,
+        // and app.log is user-visible and shipped in support reports. A failed
+        // append must not cost the user their profile list, so it is ignored.
+        let _ = logs::append_log(
+            "app.log",
+            &format!(
+                "profile_url_not_normalizable profile_id={} fields={}",
+                profile.id,
+                degraded.join(",")
+            ),
+        );
+    }
+    profile
+}
+
+fn loaded_optional_url(
+    value: Option<&str>,
+    field: &'static str,
+    degraded: &mut Vec<&'static str>,
+) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| normalized_loaded_url(url, field, degraded))
+}
+
+/// One stored URL: normalized when it can be, kept as display-only text when it
+/// cannot, recording the field so the caller can log it.
+///
+/// Credentials are stripped from the degraded text whenever the value still
+/// parses as a URL, because the editor renders this text back to the user. A
+/// value that does not parse at all has no authority we could identify, and no
+/// consumer ever sends this text anywhere: each one normalizes first.
+fn normalized_loaded_url(
+    value: &str,
+    field: &'static str,
+    degraded: &mut Vec<&'static str>,
+) -> String {
+    if let Ok(url) = normalized_server_url(value) {
+        return url;
+    }
+    degraded.push(field);
+    let trimmed = value.trim();
+    match Url::parse(trimmed) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            String::from(url)
+        }
+        Err(_) => trimmed.to_string(),
+    }
 }
 
 fn profile_from_input(input: &ProfileInput, id: String) -> Result<Profile, String> {
@@ -174,7 +245,7 @@ pub async fn profile_validate(url: String, api_key: String) -> Result<ServerInfo
 mod tests {
     use super::{profile_from_input, profile_upsert, profile_validate, profiles_list};
     use crate::models::profile::{Profile, ProfileInput};
-    use crate::services::{keychain, profile_store};
+    use crate::services::{keychain, profile_store, url_resolver};
 
     /// Both process-wide test seams, always taken in this order so the
     /// keychain tests (credential lock only) cannot deadlock against these.
@@ -318,6 +389,61 @@ mod tests {
         assert_eq!(
             profile.wan_server_url.as_deref(),
             Some("https://wan.example.com")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // A stored URL an older build allowed must not hide the profiles beside
+    // it: the list is the only route to the editor that can repair it. The bad
+    // one still resolves to nothing, which every caller reports as no
+    // reachable server, so the display degrades and the action fails closed.
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn profiles_list_keeps_a_profile_whose_stored_url_cannot_be_normalized() {
+        let (_config, _credentials, dir) = isolate("list-unnormalizable-url");
+        profile_store::upsert_profile(Profile {
+            id: "schemeless".to_string(),
+            display_name: "Schemeless".to_string(),
+            server_url: "192.168.1.10:2283".to_string(),
+            lan_server_url: Some("ftp://lan-user:lan-password@lan.example.com".to_string()),
+            wan_server_url: None,
+        })
+        .expect("write schemeless profile");
+        profile_store::upsert_profile(Profile {
+            id: "valid".to_string(),
+            display_name: "Valid".to_string(),
+            server_url: "https://immich.example.com".to_string(),
+            lan_server_url: None,
+            wan_server_url: None,
+        })
+        .expect("write valid profile");
+
+        let profiles = profiles_list().await.expect("list both profiles");
+
+        let ids: Vec<&str> = profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["schemeless", "valid"]);
+        let schemeless = &profiles[0];
+        let valid = &profiles[1];
+        assert_eq!(schemeless.server_url, "192.168.1.10:2283");
+        assert_eq!(valid.server_url, "https://immich.example.com");
+        // The degraded text is rendered back into the editor, so a credential an
+        // older URL was allowed to carry is still stripped where it is visible.
+        let lan = schemeless
+            .lan_server_url
+            .as_deref()
+            .expect("the degraded LAN URL is kept for display");
+        assert!(!lan.contains("lan-password"), "leaked credential: {lan}");
+        assert!(!lan.contains("lan-user"), "leaked credential: {lan}");
+
+        assert!(
+            url_resolver::resolve_server_url(schemeless)
+                .await
+                .is_empty(),
+            "an unnormalizable stored URL must resolve to no server"
+        );
+        assert_eq!(
+            url_resolver::resolve_server_url(valid).await,
+            "https://immich.example.com"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

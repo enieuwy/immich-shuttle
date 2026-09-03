@@ -211,6 +211,12 @@ async function scanSelectedSources(
       scanning: false,
       error: error instanceof Error ? error.message : String(error),
     }));
+    // The failure destroys the file list the selection was keyed against, so a
+    // survivor is a hidden pick from an inventory nobody can vouch for -- and
+    // absolute paths repeat across cards, so the next successful scan would
+    // silently re-arm it against whatever now sits at that path. Same reason
+    // the cancelled/timed-out branch above clears it.
+    selectionState.clear();
   } finally {
     unlisten?.();
   }

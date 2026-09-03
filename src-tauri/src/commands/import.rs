@@ -21,7 +21,7 @@ use crate::{
         device_detector,
         immich_client::ImmichClient,
         keychain, logs, media_scanner, profile_store,
-        sidecar_runner::{run_upload, RunOutcome, RunUploadError, UploadRequest},
+        sidecar_runner::{run_upload, RunOutcome, RunUploadError, SidecarResult, UploadRequest},
         source_guard, staging, url_resolver, wipe,
     },
 };
@@ -221,8 +221,16 @@ struct ActiveForecast {
 }
 
 /// Clears the active forecast only when this forecast still owns the slot.
+///
+/// Ownership is the cancellation flag this forecast installed, not its
+/// generation: the generation arrives over IPC and two callers can legitimately
+/// send the same one. With a generation test, the first forecast's guard would
+/// clear a slot the second had already replaced, and the `forecast_cancel` that
+/// followed would find nothing to cancel while the second forecast kept hashing
+/// the card. `Arc::ptr_eq` names the exact slot, the same way `ACTIVE_SCAN`'s
+/// owner test does.
 struct ActiveForecastGuard {
-    generation: u64,
+    cancellation: Arc<AtomicBool>,
 }
 
 impl Drop for ActiveForecastGuard {
@@ -230,7 +238,7 @@ impl Drop for ActiveForecastGuard {
         if let Ok(mut active) = ACTIVE_FORECAST.lock() {
             if active
                 .as_ref()
-                .is_some_and(|current| current.generation == self.generation)
+                .is_some_and(|current| Arc::ptr_eq(&current.cancellation, &self.cancellation))
             {
                 active.take();
             }
@@ -261,6 +269,43 @@ struct PendingWipe {
     sequence: u64,
 }
 
+/// Scripted answers for `wipe_volume_identities`, in test builds only.
+///
+/// A unit test cannot swap a card at a mount point between two probes, and that
+/// race is exactly what the recheck before the delete exists to catch, so the
+/// identity source is scriptable here. Each entry answers ONE resolver — one
+/// batch of paths — and is consumed when that batch starts, so a test can say
+/// "this volume before the server check, a different one after it". An empty
+/// script means every probe reads the real device.
+#[cfg(test)]
+static VOLUME_IDENTITY_SCRIPT: LazyLock<Mutex<Vec<HashMap<String, String>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// One batch's identity probe, boxed so the production resolver and the test
+/// script share a single call shape.
+type VolumeIdentityResolver = Box<dyn FnMut(&Path) -> Option<String> + Send>;
+
+/// The identity source both wipe probes read: one fresh resolver per batch, so
+/// each batch re-probes rather than trusting an answer from before the last
+/// server round trip, while paths sharing a mount inside one batch cost a
+/// single probe.
+fn wipe_volume_identities() -> VolumeIdentityResolver {
+    #[cfg(test)]
+    {
+        let scripted = VOLUME_IDENTITY_SCRIPT
+            .lock()
+            .ok()
+            .filter(|script| !script.is_empty())
+            .map(|mut script| script.remove(0));
+        if let Some(identities) = scripted {
+            return Box::new(move |path: &Path| {
+                identities.get(path.to_string_lossy().as_ref()).cloned()
+            });
+        }
+    }
+    Box::new(device_detector::file_volume_identity_resolver())
+}
+
 fn snapshot_wipe_volumes(
     paths: &[String],
     mut identity: impl FnMut(&Path) -> Option<String>,
@@ -277,12 +322,19 @@ fn snapshot_wipe_volumes(
     Ok(volumes)
 }
 
-fn recheck_wipe_volumes(
-    pending: &PendingWipe,
+/// Re-prove the volume identity recorded for every candidate path.
+///
+/// Takes the payload's two fields rather than the payload because the probe is
+/// a per-mount `diskutil`/`wmic` call that must not run on the async runtime:
+/// the caller clones these onto a blocking thread and keeps the payload itself,
+/// so a task that fails to join can never take the only handle a retry has.
+fn recheck_volume_identities(
+    paths: &[String],
+    recorded: &HashMap<String, String>,
     mut identity: impl FnMut(&Path) -> Option<String>,
 ) -> Result<(), String> {
-    for path in &pending.paths {
-        let Some(expected) = pending.volume_ids.get(path) else {
+    for path in paths {
+        let Some(expected) = recorded.get(path) else {
             return Err(format!(
                 "The source volume was not recorded for {path}; source files were kept for safety."
             ));
@@ -363,13 +415,26 @@ const WIPE_PROMPT_WITHDRAWN_SUMMARY: &str =
 /// advertising `awaiting_wipe_confirmation` with no payload behind it can be
 /// neither answered, dismissed, nor evicted, so it would strand the card
 /// permanently.
-fn bound_pending_wipes(pending: &mut HashMap<String, PendingWipe>) -> Vec<String> {
+///
+/// `in_flight` names the jobs a confirmation is running for right now.
+/// `import_confirm_wipe` takes its payload out of the map, reads the keychain,
+/// and calls the server before it puts a retry payload back, so its entry is
+/// visible to this bound at exactly the moment it must not be dropped: the user
+/// has already said "delete", and withdrawing the offer under them loses the
+/// verified list they answered for. Those jobs are therefore never candidates,
+/// which lets the map exceed the cap by however many confirmations are actually
+/// running — a number bounded by the one-confirmation-per-job guard.
+fn bound_pending_wipes(
+    pending: &mut HashMap<String, PendingWipe>,
+    in_flight: &HashSet<String>,
+) -> Vec<String> {
     let excess = pending.len().saturating_sub(MAX_PENDING_WIPE_PROMPTS);
     if excess == 0 {
         return Vec::new();
     }
     let mut by_age: Vec<(u64, String)> = pending
         .iter()
+        .filter(|(id, _)| !in_flight.contains(*id))
         .map(|(id, entry)| (entry.sequence, id.clone()))
         .collect();
     by_age.sort_unstable();
@@ -378,6 +443,17 @@ fn bound_pending_wipes(pending: &mut HashMap<String, PendingWipe>) -> Vec<String
         pending.remove(id);
     }
     dropped
+}
+
+/// The jobs a wipe confirmation is running for right now, for
+/// `bound_pending_wipes`. A poisoned lock reads as "none in flight" rather than
+/// refusing the bound: the bound only ever drops offers, and the worst case is
+/// the pre-existing behaviour.
+fn in_flight_wipe_confirmations() -> HashSet<String> {
+    WIPE_CONFIRMATIONS
+        .lock()
+        .map(|confirmations| confirmations.clone())
+        .unwrap_or_default()
 }
 
 /// Take the prompt off every job whose payload the bound dropped, so the card
@@ -944,11 +1020,22 @@ fn validate_selected_under_sources(
 
 /// Enumerate the exact source files that existed before the sidecar started.
 ///
-/// A selected import manifests the user selection itself. A full import uses
-/// the same media scanner that supplies the preview. Failure leaves no manifest.
+/// A selected import manifests the user selection itself. A full import walks
+/// the source with no extension filter, because the question this answers is
+/// "which files existed under this source", not "which files does the preview
+/// grid show": immich-go uploads formats the preview allowlist omits, and a
+/// manifest narrower than the uploader turns every such clip into an
+/// unmanifested upload — a permanent fault on the card and an original that is
+/// never offered for deletion. Failure leaves no manifest.
+///
+/// `cancel` and `progress` exist so the caller can bound this walk the way it
+/// bounds staging: a source that stops answering blocks inside the kernel,
+/// where the deadline below can never reach it.
 fn immutable_source_manifest(
     selected: Option<&[String]>,
     source_paths: &[String],
+    cancel: &AtomicBool,
+    progress: &AtomicU64,
 ) -> Result<HashSet<PathBuf>, String> {
     let mut manifest = HashSet::new();
     if let Some(selected) = selected {
@@ -962,13 +1049,14 @@ fn immutable_source_manifest(
         return Ok(manifest);
     }
     for source in source_paths {
-        let skipped = media_scanner::scan_directory_streaming(
+        let skipped = media_scanner::manifest_directory_streaming(
             Path::new(source),
-            None,
+            Some(cancel),
             Some(Instant::now() + SCAN_DEADLINE),
+            progress,
             &mut |batch| {
                 for file in batch {
-                    if let Ok(path) = std::fs::canonicalize(file.path) {
+                    if let Ok(path) = std::fs::canonicalize(file) {
                         manifest.insert(path);
                     }
                 }
@@ -982,6 +1070,40 @@ fn immutable_source_manifest(
         }
     }
     Ok(manifest)
+}
+
+/// Await a source-manifest walk under the same silence bound staging uses,
+/// yielding the manifest or the reason there is none.
+///
+/// The walk runs BEFORE any upload and an unresponsive card or share blocks it
+/// inside the kernel, where the deadline the walk checks between entries can
+/// never reach it. An unbounded join therefore parks the worker in
+/// `RUNNING_IMPORTS` with no upload started and no way for the user to quit.
+/// Abandoning the join is the only bound that holds, and it costs one blocking
+/// thread until the filesystem answers — the same trade staging already takes.
+///
+/// A bound that passes leaves NO manifest, deliberately: the run then reports a
+/// fault, offers no delete prompt, and cannot advance the checkpoint, which is
+/// the honest reading of "nothing is known about what was on this source".
+async fn bounded_source_manifest(
+    task: tauri::async_runtime::JoinHandle<Result<HashSet<PathBuf>, String>>,
+    progress: &AtomicU64,
+    cancel: &AtomicBool,
+    stall: Duration,
+) -> (Option<HashSet<PathBuf>>, Option<String>) {
+    match join_bounded(task, stall, cancel, CANCEL_ABANDON_GRACE, Some(progress)).await {
+        Ok(BoundedJoin::Finished(Ok(manifest))) => (Some(manifest), None),
+        Ok(BoundedJoin::Finished(Err(error))) => (None, Some(error)),
+        Ok(BoundedJoin::TimedOut) => (
+            None,
+            Some("The source stopped responding while it was being listed.".to_string()),
+        ),
+        Ok(BoundedJoin::Abandoned) => (
+            None,
+            Some("Listing the source did not stop when the import was cancelled.".to_string()),
+        ),
+        Err(error) => (None, Some(format!("Listing the source failed: {error}"))),
+    }
 }
 
 fn retain_paths_in_manifest(
@@ -1005,6 +1127,20 @@ fn retain_paths_in_manifest(
         })
         .collect();
     (paths, dropped)
+}
+
+/// One `import_error` app.log line.
+///
+/// Both values are quoted because neither is ours: the file name comes from the
+/// user's card and the reason comes from the server, so either can contain a
+/// literal ` reason=` and silently redraw this line's field boundaries for
+/// anything reading the log back. `{:?}` also keeps a newline inside the value
+/// from splitting one event into two.
+fn import_error_log_line(job_id: &str, error: &FileError) -> String {
+    format!(
+        "import_error job_id={job_id} file={:?} reason={:?}",
+        error.file, error.reason
+    )
 }
 
 fn manifest_evidence_is_complete(
@@ -1149,7 +1285,14 @@ struct RunClassification {
 /// duplicate matches) AND it ended badly (bad or unproven exit, or per-file
 /// errors); a partial run that uploaded or matched duplicates succeeds,
 /// surfacing errors. Wipe is eligible only for a successful run with keep-files
-/// off and at least one completed path.
+/// off, at least one completed path, and an OBSERVED clean exit.
+///
+/// That last requirement is the same positive test the checkpoint already
+/// makes, for the same reason. `failed` is cleared by a single landed asset, so
+/// without it a run whose sidecar was never seen to stop — it may still be
+/// reading and uploading the card right now — could offer the user's originals
+/// for deletion. Refusing costs the user one re-import to be offered the delete
+/// again; accepting can delete a file the run never finished with.
 ///
 /// This `status` is deliberately NOT the whole account of how the run ended. A
 /// single landed asset clears `failed` however badly the run finished, so the
@@ -1192,7 +1335,10 @@ fn classify_completed_run(
     } else {
         JobStatus::Completed
     };
-    let wipe_eligible = !failed && !keep_files && completed_paths_len > 0;
+    let wipe_eligible = !failed
+        && !keep_files
+        && completed_paths_len > 0
+        && matches!(outcome, RunOutcome::Exited { success: true });
     // `landed` alone is not sufficient evidence for the checkpoint: it is read
     // straight off the immich-go log's uploaded/duplicate tallies, and those are
     // resolved against an invocation root by string matching only — no
@@ -1238,6 +1384,98 @@ fn worse_outcome(current: RunOutcome, next: RunOutcome) -> RunOutcome {
     }
 }
 
+/// What the upload loop knows so far, folded one source path at a time.
+///
+/// The loop itself is only iteration; every decision about what a path's result
+/// means to the whole run lives here, so the rule that stops a run can be
+/// stated and tested in one place.
+struct RunTally {
+    error_lines: Vec<String>,
+    outcome: RunOutcome,
+    cancelled: bool,
+    /// A sidecar this run started was never proven to have stopped.
+    unconfirmed_termination: bool,
+    spawn_error: Option<String>,
+}
+
+impl RunTally {
+    fn new() -> Self {
+        Self {
+            error_lines: Vec::new(),
+            // Starts at the only value that claims nothing: an observed clean
+            // exit is what every path must supply for the run to keep it. A
+            // path that ended badly, or whose termination was never confirmed,
+            // replaces this through `worse_outcome`.
+            outcome: RunOutcome::Exited { success: true },
+            cancelled: false,
+            unconfirmed_termination: false,
+            spawn_error: None,
+        }
+    }
+
+    /// Fold one path's result in, answering whether the run must stop here.
+    ///
+    /// `reaped` is the only proof that the sidecar process is gone, and it is
+    /// independent of the exit status: a closed event channel yields an `Ok`
+    /// result with `reaped == false`, which means a process may still be
+    /// reading this card and uploading from it. Continuing would put a SECOND
+    /// sidecar on the same source, and the run would go on to publish a
+    /// cancellation with no fault at all — erasing the only evidence that a
+    /// process is still out there. So an unreaped `Ok` stops the run exactly
+    /// like the unconfirmed-termination error does, keeping the merged outcome
+    /// and the stderr the terminal error is built from.
+    fn absorb(&mut self, result: Result<SidecarResult, RunUploadError>) -> bool {
+        match result {
+            Ok(run) => {
+                self.error_lines.extend(run.error_lines);
+                self.outcome = worse_outcome(self.outcome, run.outcome);
+                if !run.reaped {
+                    self.unconfirmed_termination = true;
+                    return true;
+                }
+                false
+            }
+            Err(RunUploadError::Cancelled) => {
+                self.cancelled = true;
+                true
+            }
+            Err(RunUploadError::UnconfirmedTermination(error)) => {
+                self.unconfirmed_termination = true;
+                self.spawn_error = Some(error);
+                true
+            }
+            Err(error) => {
+                self.spawn_error = Some(error.to_string());
+                true
+            }
+        }
+    }
+}
+
+/// Everything a completed run's aggregate faults are computed from. Bundled
+/// because they all answer one question — what did this run fail to prove it
+/// did — and adding a new kind of missing evidence must not mean adding another
+/// positional boolean nobody passes.
+struct RunFaultInputs<'a> {
+    outcome: RunOutcome,
+    scan_errors: u32,
+    /// Selections staging could not prepare, out of `requested`.
+    unstaged: usize,
+    requested: usize,
+    /// The last few stderr lines, for the exit clauses.
+    stderr_tail: Option<&'a str>,
+    /// Why the run log could not be read, when it could not.
+    log_read_error: Option<&'a str>,
+    /// Why the pre-sidecar source manifest failed, when it failed with a reason.
+    manifest_error: Option<&'a str>,
+    /// Whether a pre-sidecar source manifest exists at all.
+    manifest_present: bool,
+    /// Uploaded paths the manifest did not contain.
+    unmanifested_paths: usize,
+    /// `file=` records in the run log that resolved to no invocation root.
+    unresolved_file_events: u32,
+}
+
 /// The aggregate faults of a completed run, one user-facing clause each, or
 /// empty when the run has no fault the per-file tallies do not already express.
 ///
@@ -1249,16 +1487,33 @@ fn worse_outcome(current: RunOutcome, next: RunOutcome) -> RunOutcome {
 /// while enumerating the rest reported itself as clean, and the user could
 /// reformat the card on the strength of that.
 ///
-/// The stderr tail is carried in the exit clause because for a landed-but-bad
+/// The stderr tail is carried in the exit clauses because for a landed-but-bad
 /// run it is the ONLY evidence of what went wrong: nothing else in the job
-/// names it.
-fn aggregate_fault_reasons(
-    outcome: RunOutcome,
-    scan_errors: u32,
-    unstaged: usize,
-    requested: usize,
-    stderr_tail: Option<&str>,
-) -> Vec<String> {
+/// names it. That includes the unproven-termination clause, where the tail is
+/// the reap diagnostic — the one line that says WHY the process could not be
+/// confirmed gone.
+///
+/// The evidence clauses below (no manifest, unmanifested uploads, unresolved
+/// log records, an unreadable log) are faults for the same reason a bad exit
+/// is: each one means the run cannot account for what it did. They already
+/// withheld the delete prompt and the checkpoint silently; naming them here is
+/// what puts them on the card and in the history receipt as well. The concrete
+/// case: one resolved and one unresolved upload record in the same log
+/// published "Upload completed. 1 uploaded" with no fault, while the second
+/// file was kept with no explanation anywhere.
+fn aggregate_fault_reasons(inputs: RunFaultInputs<'_>) -> Vec<String> {
+    let RunFaultInputs {
+        outcome,
+        scan_errors,
+        unstaged,
+        requested,
+        stderr_tail,
+        log_read_error,
+        manifest_error,
+        manifest_present,
+        unmanifested_paths,
+        unresolved_file_events,
+    } = inputs;
     let mut reasons = Vec::new();
     match outcome {
         RunOutcome::Exited { success: true } => {}
@@ -1269,10 +1524,16 @@ fn aggregate_fault_reasons(
         // Never presented as a success. The channel closed or a kill could not
         // be confirmed, so what the process did with the rest of the source is
         // unknown — which is a weaker claim than a failure, not a stronger one.
-        RunOutcome::Unknown => reasons.push(
-            "immich-go never reported that it stopped, so what happened to the rest of this source is unknown."
+        RunOutcome::Unknown => reasons.push(match stderr_tail {
+            Some(tail) => format!(
+                "immich-go never reported that it stopped, so what happened to the rest of this source is unknown: {tail}"
+            ),
+            None => "immich-go never reported that it stopped, so what happened to the rest of this source is unknown."
                 .to_string(),
-        ),
+        }),
+    }
+    if let Some(error) = log_read_error {
+        reasons.push(error.to_string());
     }
     if scan_errors > 0 {
         reasons.push(format!(
@@ -1282,6 +1543,25 @@ fn aggregate_fault_reasons(
     if unstaged > 0 {
         reasons.push(format!(
             "{unstaged} of {requested} selected file(s) could not be prepared for upload, so they were never sent."
+        ));
+    }
+    if !manifest_present {
+        reasons.push(match manifest_error {
+            Some(error) => format!(
+                "The source could not be listed before the upload started, so no uploaded file can be matched back to it: {error}"
+            ),
+            None => "The source could not be listed before the upload started, so no uploaded file can be matched back to it."
+                .to_string(),
+        });
+    }
+    if unmanifested_paths > 0 {
+        reasons.push(format!(
+            "{unmanifested_paths} uploaded file(s) were not in the source listing taken before the run, so they were kept."
+        ));
+    }
+    if unresolved_file_events > 0 {
+        reasons.push(format!(
+            "{unresolved_file_events} upload result(s) in the run log could not be matched to a source file, so those files were kept."
         ));
     }
     reasons
@@ -1300,7 +1580,6 @@ struct RunEvidenceInputs<'a> {
     keep_files: bool,
     awaiting_wipe_confirmation: bool,
     pending_wipe_store_failed: bool,
-    log_read_error: Option<String>,
 }
 
 /// What a completed run tells the user about how it ended.
@@ -1328,8 +1607,13 @@ fn terminal_evidence(inputs: RunEvidenceInputs<'_>) -> TerminalEvidence {
         keep_files,
         awaiting_wipe_confirmation,
         pending_wipe_store_failed,
-        log_read_error,
     } = inputs;
+
+    // The unreadable-log clause is NOT handled here: it is an aggregate fault
+    // like any other, so `aggregate_fault_reasons` owns it. Carrying it
+    // separately put it in the `error` but never in the `summary` a `Completed`
+    // card actually shows, and left `incomplete` — the history receipt's own
+    // account — believing the run was clean.
 
     // All terminal evidence travels together. A log-read or wipe-prompt warning
     // must not hide a bad/unproven exit or a source that could not enumerate:
@@ -1339,11 +1623,6 @@ fn terminal_evidence(inputs: RunEvidenceInputs<'_>) -> TerminalEvidence {
     if pending_wipe_store_failed {
         // The user's originals are the thing at stake, so this comes first.
         clauses.push(PENDING_WIPE_STORE_ERROR.to_string());
-    }
-    if let Some(log_error) = log_read_error {
-        // The tallies can no longer be trusted, but an observed bad exit is
-        // still independent evidence and remains in the clauses below.
-        clauses.push(log_error);
     }
     clauses.extend_from_slice(faults);
     if file_error_count > 0 {
@@ -1517,6 +1796,34 @@ fn persist_run_history(
     }
 }
 
+/// Dispose of a finished run's staging directory, returning the path when it
+/// was RETAINED rather than removed.
+///
+/// Removing the tree is only safe once the sidecar is proven gone. When
+/// termination was never confirmed the process may still be reading the staged
+/// links, and immich-go follows them to the user's originals: deleting the tree
+/// under a live uploader turns a recoverable unknown into a half-uploaded card
+/// with no record of which files went.
+///
+/// `std::mem::forget` is the mechanism on purpose. `StagingDir`'s `Drop`
+/// removes the tree, and the open `.lock` file it holds is exactly the lease
+/// `prune_stale_temp_artifacts` probes: while this process lives the lock is
+/// held and the directory is left alone, and the moment the process exits the
+/// lock is released so the next startup reclaims it. Leaking one descriptor per
+/// unproven run for the rest of the session is the price of not deleting files
+/// a live process is using.
+///
+/// Runs on a blocking thread: the cleanup branch removes a directory tree.
+fn release_staging_dir(dir: staging::StagingDir, termination_unproven: bool) -> Option<PathBuf> {
+    if !termination_unproven {
+        staging::cleanup_staging_dir(dir);
+        return None;
+    }
+    let retained = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    Some(retained)
+}
+
 /// Close out a worker that exits during staging, before the shared
 /// finalization tail can run.
 ///
@@ -1583,27 +1890,52 @@ fn finish_staging_exit(
     }
 }
 
-#[tauri::command]
-pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<String, String> {
+/// Everything `import_start` decides about a request before it reads the
+/// keychain, the profile store, or the process-global job maps.
+///
+/// Separate from the command body because the command takes an `AppHandle`,
+/// which a unit test cannot build. With this inline, the two decisions that
+/// matter most at this boundary — an explicitly empty selection must never
+/// become a whole-source upload, and an unknown error mode must be refused
+/// rather than silently inverted into "stop at the first error" — could only be
+/// asserted against the helpers, so a command that stopped calling them would
+/// still pass every test. Here they are the command's own answer.
+struct StartPlan {
+    source_paths: Vec<String>,
+    /// `Some` is a hand-picked subset, which is staged; `None` is the whole
+    /// source. The explicitly empty case never gets this far.
+    select_files: Option<Vec<String>>,
+    keep_files: bool,
+    stack_raw_jpeg: bool,
+    stack_burst: bool,
+    date_range: Option<String>,
+    concurrent_tasks: Option<u32>,
+    into_album: Option<String>,
+    organization: Organization,
+    on_errors: Option<String>,
+    overwrite: bool,
+    tags: Vec<String>,
+    session_tag: bool,
+    include_type: Option<String>,
+    include_extensions: Vec<String>,
+    exclude_extensions: Vec<String>,
+    /// The one album this run can be deep-linked to, or `None` when it fans out.
+    album_link_name: Option<String>,
+    /// The picker's id, shown while the run is in flight and replaced at
+    /// finalization by the album the upload actually populated.
+    provisional_album_id: Option<String>,
+}
+
+fn plan_import_start(input: &ImportInput) -> Result<StartPlan, String> {
     if input.source_paths.is_empty() {
         return Err("At least one source path is required".to_string());
     }
 
     let source_paths = collapse_overlapping_roots(input.source_paths.clone());
-    let record_source_paths = source_paths.clone();
-    // Selected (staged) imports honor the same keep/delete toggle as whole-folder
-    // imports; the post-wipe SHA-1 verification guards deletion either way.
-    let keep_files = input.keep_files;
-    let stack_raw_jpeg = input.stack_raw_jpeg;
-    let stack_burst = input.stack_burst;
-    let date_range = input.date_range.clone();
     // The UI limits this to 1..=20; re-clamp here since the value arrives over
     // IPC and must not be trusted to be in range (unbounded values would be
     // forwarded straight to immich-go's --concurrent-tasks).
     let concurrent_tasks = input.concurrent_tasks.map(|n| n.clamp(1, 20));
-    let album_ids = input.album_ids.clone();
-    let into_album = input.into_album.clone();
-    let organization = input.organization;
     // `on_errors` arrives over IPC. Refuse an unknown value instead of dropping
     // it: the fallback is immich-go's default of stopping at the first per-file
     // error, so a typo would silently invert "keep going on errors" and abort a
@@ -1620,41 +1952,81 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             ))
         }
     };
-    let overwrite = input.overwrite;
     let tags: Vec<String> = input
         .tags
         .iter()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect();
-    let session_tag = input.session_tag;
     let include_type = parse_include_type(input.include_type.as_deref())?;
     let include_extensions = normalize_extensions(&input.include_extensions);
     let exclude_extensions = normalize_extensions(&input.exclude_extensions);
     // immich-go uploads into a single album per run (`--into-album`), so more
     // than one id is not a request this command can honour. Only element 0 was
     // ever read; refuse the rest rather than discard it silently.
-    if album_ids.len() > 1 {
+    if input.album_ids.len() > 1 {
         return Err(format!(
             "An import targets one album, but {} were selected.",
-            album_ids.len()
+            input.album_ids.len()
         ));
     }
-    // The one album this run can be deep-linked to. Both the in-flight id and
-    // the resolution at finalization read it, so they cannot disagree about
-    // whether a link is warranted.
-    let album_link_name = album_link_target(organization, into_album.as_deref());
-    // Provisional: the id the picker chose, shown while the run is in flight. The
-    // album the upload actually populated is resolved from its name at
-    // finalization, because the NAME is what immich-go targets.
+    // Both the in-flight id and the resolution at finalization read this, so
+    // they cannot disagree about whether a link is warranted.
+    let album_link_name = album_link_target(input.organization, input.into_album.as_deref());
     let provisional_album_id = if album_link_name.is_some() {
-        album_ids.first().cloned()
+        input.album_ids.first().cloned()
     } else {
         None
     };
-    // `Some` is a hand-picked subset, which is staged; `None` is the whole
-    // source. The empty case never reaches the worker.
     let select_files = normalize_select_files(input.select_files.clone(), &source_paths)?;
+    Ok(StartPlan {
+        source_paths,
+        select_files,
+        // Selected (staged) imports honor the same keep/delete toggle as
+        // whole-folder imports; the post-wipe SHA-1 verification guards deletion
+        // either way.
+        keep_files: input.keep_files,
+        stack_raw_jpeg: input.stack_raw_jpeg,
+        stack_burst: input.stack_burst,
+        date_range: input.date_range.clone(),
+        concurrent_tasks,
+        into_album: input.into_album.clone(),
+        organization: input.organization,
+        on_errors,
+        overwrite: input.overwrite,
+        tags,
+        session_tag: input.session_tag,
+        include_type,
+        include_extensions,
+        exclude_extensions,
+        album_link_name,
+        provisional_album_id,
+    })
+}
+
+#[tauri::command]
+pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<String, String> {
+    let StartPlan {
+        source_paths,
+        select_files,
+        keep_files,
+        stack_raw_jpeg,
+        stack_burst,
+        date_range,
+        concurrent_tasks,
+        into_album,
+        organization,
+        on_errors,
+        overwrite,
+        tags,
+        session_tag,
+        include_type,
+        include_extensions,
+        exclude_extensions,
+        album_link_name,
+        provisional_album_id,
+    } = plan_import_start(&input)?;
+    let record_source_paths = source_paths.clone();
     // Credentials are read only after every pure check on the input has passed.
     // Reading the keychain first can raise an OS unlock prompt, and reports a
     // missing key, for a request this command was always going to refuse.
@@ -1724,12 +2096,24 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // log entry can only propose a wipe when it names this immutable set.
         let manifest_selection = select_files.clone();
         let manifest_sources = source_paths.clone();
-        let pre_sidecar_manifest = tauri::async_runtime::spawn_blocking(move || {
-            immutable_source_manifest(manifest_selection.as_deref(), &manifest_sources)
-        })
-        .await
-        .ok()
-        .and_then(Result::ok);
+        let manifest_cancel = cancel_flag.clone();
+        let manifest_progress = Arc::new(AtomicU64::new(0));
+        let manifest_progress_for_walk = manifest_progress.clone();
+        let manifest_task = tauri::async_runtime::spawn_blocking(move || {
+            immutable_source_manifest(
+                manifest_selection.as_deref(),
+                &manifest_sources,
+                manifest_cancel.as_ref(),
+                manifest_progress_for_walk.as_ref(),
+            )
+        });
+        let (pre_sidecar_manifest, manifest_error) = bounded_source_manifest(
+            manifest_task,
+            manifest_progress.as_ref(),
+            cancel_flag.as_ref(),
+            STAGING_STALL,
+        )
+        .await;
 
         let mut staging_dir = if let Some(selected_files) = select_files {
             let cancel_flag_for_staging = cancel_flag.clone();
@@ -1871,39 +2255,23 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             include_extensions,
             exclude_extensions,
         };
-        let mut error_lines: Vec<String> = Vec::new();
-        // Starts at the only value that claims nothing: an observed clean exit
-        // is what every path must supply for the run to keep it. A path that
-        // ended badly, or whose termination was never confirmed, replaces this
-        // through `worse_outcome`.
-        let mut outcome = RunOutcome::Exited { success: true };
-        let mut cancelled = false;
-        let mut unconfirmed_termination = false;
-        let mut spawn_error: Option<String> = None;
-
+        let mut tally = RunTally::new();
         let mut request = request;
         for path in upload_paths {
             request.source_path = path;
-            match run_upload(app_clone.clone(), request.clone()).await {
-                Ok(run) => {
-                    error_lines.extend(run.error_lines);
-                    outcome = worse_outcome(outcome, run.outcome);
-                }
-                Err(RunUploadError::Cancelled) => {
-                    cancelled = true;
-                    break;
-                }
-                Err(RunUploadError::UnconfirmedTermination(error)) => {
-                    unconfirmed_termination = true;
-                    spawn_error = Some(error);
-                    break;
-                }
-                Err(error) => {
-                    spawn_error = Some(error.to_string());
-                    break;
-                }
+            // The loop is iteration only; `absorb` owns what each result means
+            // to the run, including which of them must stop it.
+            if tally.absorb(run_upload(app_clone.clone(), request.clone()).await) {
+                break;
             }
         }
+        let RunTally {
+            error_lines,
+            outcome,
+            cancelled,
+            unconfirmed_termination,
+            spawn_error,
+        } = tally;
 
         // Staging's own account of the selection, taken before cleanup consumes
         // the guard. A selection that was partly staged ran against fewer files
@@ -1921,10 +2289,19 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             .map(|dir| dir.take_links())
             .unwrap_or_default();
         if let Some(dir) = staging_dir {
-            let _ = tauri::async_runtime::spawn_blocking(move || {
-                staging::cleanup_staging_dir(dir);
+            let retained = tauri::async_runtime::spawn_blocking(move || {
+                release_staging_dir(dir, unconfirmed_termination)
             })
-            .await;
+            .await
+            .unwrap_or_default();
+            if let Some(root) = retained {
+                let _ = logs::append_log(
+                    "app.log",
+                    &format!(
+                        "import_staging_retained job_id={job_id_clone} reason=unconfirmed_termination path={root:?}"
+                    ),
+                );
+            }
         }
 
         // Keep post-run work visible after the run leaves `RUNNING_IMPORTS`, so
@@ -2045,9 +2422,11 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let (completed_asset_paths, unmanifested_paths) =
             retain_paths_in_manifest(completed_asset_paths, pre_sidecar_manifest.as_ref());
 
-        // The sidecar can exit on its own between the loop's last cancel check and
-        // A process without a confirmed reap may still access its source. It is
-        // therefore a failed, leased session, even if a cancellation raced it.
+        // A process without a confirmed reap may still be reading this source
+        // and uploading from it, so the source is leased for the rest of this
+        // session however the run otherwise ended. The lease is taken even when
+        // a cancellation raced the run: a cancel the user asked for says
+        // nothing about whether the process actually stopped.
         if unconfirmed_termination {
             if let Ok(mut leases) = SESSION_SAFETY_LEASES.lock() {
                 leases.insert(job_id_clone.clone());
@@ -2132,23 +2511,46 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 (!tail.is_empty()).then(|| tail.join(" | "))
             };
             // Assembled WITHOUT consulting `failed`. One landed asset clears
-            // that boolean, and these are exactly the faults it then hid.
-            let faults = aggregate_fault_reasons(
+            // that boolean, and these are exactly the faults it then hid. Every
+            // kind of missing evidence is in here, so `incomplete` below is
+            // simply "this list is not empty" and the card, the terminal error,
+            // and the history receipt cannot disagree about it.
+            let faults = aggregate_fault_reasons(RunFaultInputs {
                 outcome,
-                run.scan_errors,
-                staging_failures.len(),
-                staging_requested,
-                stderr_tail.as_deref(),
-            );
-            incomplete = !faults.is_empty() || !evidence_complete;
+                scan_errors: run.scan_errors,
+                unstaged: staging_failures.len(),
+                requested: staging_requested,
+                stderr_tail: stderr_tail.as_deref(),
+                log_read_error: log_read_error.as_deref(),
+                manifest_error: manifest_error.as_deref(),
+                manifest_present: pre_sidecar_manifest.is_some(),
+                unmanifested_paths,
+                unresolved_file_events: run.unresolved_file_events,
+            });
+            incomplete = !faults.is_empty();
             let mut pending_wipe_stored = false;
             let mut pending_wipe_store_failed = false;
             let mut withdrawn_prompts: Vec<String> = Vec::new();
             if wipe_eligible {
-                let volumes = snapshot_wipe_volumes(
-                    &completed_asset_paths,
-                    device_detector::volume_identity_for_path,
-                );
+                // Every candidate is a FILE, and only its containing mount has
+                // an identity, so the resolver maps each one to its mount root
+                // and probes that root once. The probe shells out per mount and
+                // is allowed up to three seconds, which is far too long to hold
+                // the async worker: run the whole batch on a blocking thread.
+                let candidates = completed_asset_paths.clone();
+                let volumes = match tauri::async_runtime::spawn_blocking(move || {
+                    snapshot_wipe_volumes(
+                        &candidates,
+                        wipe_volume_identities(),
+                    )
+                })
+                .await
+                {
+                    Ok(volumes) => volumes,
+                    Err(error) => Err(format!(
+                        "Could not prove the source volumes; source files were kept for safety: {error}"
+                    )),
+                };
                 match (volumes, PENDING_WIPE.lock()) {
                     (Ok(volume_ids), Ok(mut pending)) => {
                         pending.insert(
@@ -2166,7 +2568,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                         // because an older prompt is unanswered would stop the
                         // user importing at all, and the run that has already
                         // uploaded is the one whose offer is worth keeping.
-                        withdrawn_prompts = bound_pending_wipes(&mut pending);
+                        withdrawn_prompts =
+                            bound_pending_wipes(&mut pending, &in_flight_wipe_confirmations());
                     }
                     (Err(_), _) | (_, Err(_)) => {
                         pending_wipe_store_failed = true;
@@ -2209,7 +2612,6 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 keep_files,
                 awaiting_wipe_confirmation,
                 pending_wipe_store_failed,
-                log_read_error,
             });
 
             // The deep link must name the album the upload actually populated.
@@ -2249,13 +2651,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         };
 
         for fe in &file_errors {
-            let _ = logs::append_log(
-                "app.log",
-                &format!(
-                    "import_error job_id={} file={} reason={}",
-                    job_id_clone, fe.file, fe.reason
-                ),
-            );
+            let _ = logs::append_log("app.log", &import_error_log_line(&job_id_clone, fe));
         }
 
         let _ = logs::append_log(
@@ -2333,7 +2729,11 @@ pub async fn import_forecast(
     if let Some(previous) = previous {
         previous.cancellation.store(true, Ordering::Relaxed);
     }
-    let _forecast_guard = ActiveForecastGuard { generation };
+    // The flag this forecast just installed IS its claim on the slot. See
+    // `ActiveForecastGuard`: the generation is caller-supplied and repeatable.
+    let _forecast_guard = ActiveForecastGuard {
+        cancellation: cancellation.clone(),
+    };
 
     // Same path scope the preview commands enforce. This command opens and
     // SHA-1s every path the renderer names, then sends those hashes and the
@@ -2555,6 +2955,31 @@ fn retry_pending_wipe(pending: PendingWipe, failed_paths: Vec<String>) -> Option
     })
 }
 
+/// Re-prove every candidate's volume identity, off the async runtime.
+///
+/// The identity of a mount is read by shelling out to the platform's disk tool,
+/// once per distinct mount and with a per-call timeout measured in seconds.
+/// This command is what the confirmation dialog is waiting on, so that work
+/// cannot run on the runtime thread.
+///
+/// Only the two fields the check reads are cloned onto the blocking thread. The
+/// payload stays here on purpose: it is the sole handle a retry has, and a task
+/// that failed to join would carry it away and strand the card.
+async fn recheck_wipe_volumes_off_thread(pending: &PendingWipe) -> Result<(), String> {
+    let paths = pending.paths.clone();
+    let recorded = pending.volume_ids.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        recheck_volume_identities(&paths, &recorded, wipe_volume_identities())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!(
+            "Could not prove the source volume; source files were kept for safety: {error}"
+        )),
+    }
+}
+
 #[tauri::command]
 pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<ImportJob, String> {
     let mut job = get_job(&job_id)?;
@@ -2589,9 +3014,7 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
         .remove(&job_id)
         .ok_or_else(|| format!("No pending wipe payload for job: {job_id}"))?;
     if confirm {
-        if let Err(error) =
-            recheck_wipe_volumes(&pending, device_detector::volume_identity_for_path)
-        {
+        if let Err(error) = recheck_wipe_volumes_off_thread(&pending).await {
             PENDING_WIPE
                 .lock()
                 .map_err(|_| "Could not lock pending wipe state".to_string())?
@@ -2613,12 +3036,33 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
             Ok(verified) => {
                 let confirmed_count = verified.confirmed.len();
                 let unverified_count = verified.unverified.len();
-                match tauri::async_runtime::spawn_blocking(move || {
-                    wipe::wipe_files(&verified.confirmed)
-                })
-                .await
-                {
-                    Ok(wipe_result) => {
+                // The recorded identity was last proven before the keychain
+                // read and a whole server round trip ago. A card swapped at the
+                // same mount inside that window has its OWN files hashed and
+                // moved to the Trash, so prove the volume again immediately
+                // before the delete. A failure refuses the WHOLE wipe rather
+                // than deleting the subset that still matches: if the volume
+                // cannot be identified, nothing about the set can be trusted.
+                let deleted = match recheck_wipe_volumes_off_thread(&pending).await {
+                    Ok(()) => Ok(tauri::async_runtime::spawn_blocking(move || {
+                        wipe::wipe_files(&verified.confirmed)
+                    })
+                    .await),
+                    Err(error) => Err(error),
+                };
+                match deleted {
+                    Err(error) => {
+                        job.summary = Some(format!(
+                            "All {pending_count} files were kept: the source could not be proven to be the same volume after the server check."
+                        ));
+                        job.error = Some(error);
+                        let _ = logs::append_log(
+                            "app.log",
+                            &format!("import_wipe_volume_recheck_failed job_id={job_id}"),
+                        );
+                        retry_pending = Some(pending);
+                    }
+                    Ok(Ok(wipe_result)) => {
                         let kept = wipe_result.failed
                             + wipe_result.skipped
                             + wipe_result.changed
@@ -2700,7 +3144,7 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
                             retry_pending = retry_pending_wipe(pending, wipe_result.failed_paths);
                         }
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         job.summary = Some(
                             "Wipe worker stopped before completion. Source files were kept where possible — you can retry the wipe."
                                 .to_string(),
@@ -2740,7 +3184,10 @@ pub async fn import_confirm_wipe(job_id: String, confirm: bool) -> Result<Import
         let (stored, withdrawn_prompts) = match PENDING_WIPE.lock() {
             Ok(mut map) => {
                 map.insert(job_id.clone(), payload);
-                let withdrawn_prompts = bound_pending_wipes(&mut map);
+                // This job's own confirmation is still in flight, so the bound
+                // cannot withdraw the retry payload it just put back.
+                let withdrawn_prompts =
+                    bound_pending_wipes(&mut map, &in_flight_wipe_confirmations());
                 (map.contains_key(&job_id), withdrawn_prompts)
             }
             Err(_) => (false, Vec::new()),
@@ -3225,6 +3672,45 @@ mod tests {
     /// The sidecar was seen to exit with a failure.
     const BAD_EXIT: RunOutcome = RunOutcome::Exited { success: false };
 
+    /// A run with nothing wrong, so every fault test names only the one fault
+    /// it is about.
+    fn clean_fault_inputs() -> RunFaultInputs<'static> {
+        RunFaultInputs {
+            outcome: CLEAN_EXIT,
+            scan_errors: 0,
+            unstaged: 0,
+            requested: 0,
+            stderr_tail: None,
+            log_read_error: None,
+            manifest_error: None,
+            manifest_present: true,
+            unmanifested_paths: 0,
+            unresolved_file_events: 0,
+        }
+    }
+
+    /// Serializes the tests that script `VOLUME_IDENTITY_SCRIPT`. The script is
+    /// process-wide, like the disks it stands in for, and each entry is
+    /// consumed by whichever probe runs first, so two scripting tests running
+    /// at once would answer each other's probes.
+    fn volume_script_guard() -> std::sync::MutexGuard<'static, ()> {
+        static VOLUME_SCRIPT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        VOLUME_SCRIPT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Arm the identity answers, one entry per probe batch, in order.
+    fn script_volume_identities(batches: Vec<HashMap<String, String>>) {
+        *VOLUME_IDENTITY_SCRIPT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = batches;
+    }
+
+    fn clear_volume_identity_script() {
+        script_volume_identities(Vec::new());
+    }
+
     #[test]
     fn collapse_overlapping_roots_keeps_disjoint_ancestors_once() {
         let temp_dir =
@@ -3278,15 +3764,21 @@ mod tests {
 
     #[test]
     fn uploads_present_succeed_despite_errors_and_bad_exit() {
-        // A partial run that uploaded something is a success even with per-file
-        // errors and a non-zero exit; deletion of the originals stays eligible.
+        // A partial run that uploaded something is still a success: the status
+        // policy is unchanged.
         let o = classify_completed_run(5, 0, BAD_EXIT, 4, false, 5, 0);
         assert!(!is_failed(&o));
-        assert!(o.wipe_eligible);
+        assert!(
+            !o.wipe_eligible,
+            "the exit was not observed to be clean, so the originals are not offered for deletion"
+        );
         assert!(
             !o.checkpoint_eligible,
             "a partial run must not raise the only-new date floor"
         );
+        // The same run seen to exit cleanly does offer them, so the refusal
+        // above comes from the ending and nothing else.
+        assert!(classify_completed_run(5, 0, CLEAN_EXIT, 4, false, 5, 0).wipe_eligible);
     }
 
     #[test]
@@ -3758,77 +4250,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&unapproved).unwrap();
-    }
-
-    /// `import_start` and `import_forecast` used to read `select_files`
-    /// differently: the forecast matched the `Option` and reported zero files
-    /// for `Some([])`, while `import_start` called `unwrap_or_default()` and
-    /// treated the empty vector as "whole source" — so one request forecast
-    /// nothing and then uploaded every media file under the roots. Both now
-    /// normalize through the same helper, so pin all three discriminants.
-    #[test]
-    fn both_import_commands_read_a_selection_the_same_way() {
-        let root = std::env::temp_dir().join(format!("immich-shuttle-select-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let file = root.join("photo.jpg");
-        std::fs::write(&file, b"x").unwrap();
-        let roots = vec![root.to_string_lossy().into_owned()];
-        let selected = file.to_string_lossy().into_owned();
-
-        // No subset: import the whole source.
-        assert_eq!(normalize_select_files(None, &roots).unwrap(), None);
-        // A subset: exactly these files, once they pass the scope check.
-        assert_eq!(
-            normalize_select_files(Some(vec![selected.clone()]), &roots).unwrap(),
-            Some(vec![selected])
-        );
-        // Neither: refused rather than guessed.
-        assert_eq!(
-            normalize_select_files(Some(Vec::new()), &roots).unwrap_err(),
-            EMPTY_SELECTION_ERROR
-        );
-
-        // The command boundary refuses it too. Zero `source_paths` keeps this
-        // off the process-global approved-root state, exactly as the
-        // select-scope test above does; the bogus profile id proves the refusal
-        // lands before any profile or keychain work.
-        let err = tauri::async_runtime::block_on(import_forecast(
-            "no-such-profile".to_string(),
-            Vec::new(),
-            Some(Vec::new()),
-            None,
-            Vec::new(),
-            Vec::new(),
-            3,
-        ))
-        .unwrap_err();
-        assert_eq!(err, EMPTY_SELECTION_ERROR);
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// `None` is the only value that makes the worker upload the source roots:
-    /// staging runs only for `Some`, and `upload_paths` falls back to
-    /// `source_paths` only when there is no staging dir. Refusing to turn an
-    /// explicitly empty selection into `None` is therefore the whole guard
-    /// against a zero-file request importing the entire card — and, with
-    /// keep-files off, proposing to wipe it afterwards.
-    #[test]
-    fn an_empty_selection_never_becomes_a_whole_source_upload() {
-        let root =
-            std::env::temp_dir().join(format!("immich-shuttle-empty-sel-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("a.jpg"), b"x").unwrap();
-        std::fs::write(root.join("b.mp4"), b"x").unwrap();
-        let roots = vec![root.to_string_lossy().into_owned()];
-
-        match normalize_select_files(Some(Vec::new()), &roots) {
-            Ok(None) => panic!("an empty selection collapsed into a whole-source import"),
-            Ok(Some(files)) => panic!("an empty selection became a subset: {files:?}"),
-            Err(e) => assert_eq!(e, EMPTY_SELECTION_ERROR),
-        }
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// The whole point of `import_await_terminal`: a terminal STATUS is not a
@@ -4513,13 +4934,12 @@ mod tests {
             "an unreadable source must not raise the only-new date floor"
         );
 
-        let faults = aggregate_fault_reasons(
-            BAD_EXIT,
-            run.scan_errors,
-            0,
-            0,
-            Some("immich-go: cannot read DCIM/SUB"),
-        );
+        let faults = aggregate_fault_reasons(RunFaultInputs {
+            outcome: BAD_EXIT,
+            scan_errors: run.scan_errors,
+            stderr_tail: Some("immich-go: cannot read DCIM/SUB"),
+            ..clean_fault_inputs()
+        });
         let evidence = terminal_evidence(RunEvidenceInputs {
             failed: false,
             progress: run.progress.clone(),
@@ -4528,7 +4948,6 @@ mod tests {
             keep_files: true,
             awaiting_wipe_confirmation: false,
             pending_wipe_store_failed: false,
-            log_read_error: None,
         });
 
         let error = evidence
@@ -4575,7 +4994,11 @@ mod tests {
     /// survive alongside it.
     #[test]
     fn a_landed_run_that_exits_non_zero_with_no_file_error_still_reports_it() {
-        let faults = aggregate_fault_reasons(BAD_EXIT, 0, 0, 0, Some("panic: runtime error"));
+        let faults = aggregate_fault_reasons(RunFaultInputs {
+            outcome: BAD_EXIT,
+            stderr_tail: Some("panic: runtime error"),
+            ..clean_fault_inputs()
+        });
         assert_eq!(faults.len(), 1, "the bad exit is the whole fault");
 
         let evidence = terminal_evidence(RunEvidenceInputs {
@@ -4591,7 +5014,6 @@ mod tests {
             keep_files: false,
             awaiting_wipe_confirmation: true,
             pending_wipe_store_failed: false,
-            log_read_error: None,
         });
 
         let error = evidence
@@ -4629,7 +5051,11 @@ mod tests {
         // refusal above comes from the outcome and nothing else.
         assert!(classify_completed_run(9, 0, CLEAN_EXIT, 0, true, 9, 0).checkpoint_eligible);
 
-        let faults = aggregate_fault_reasons(RunOutcome::Unknown, 0, 0, 0, None);
+        let faults = aggregate_fault_reasons(RunFaultInputs {
+            outcome: RunOutcome::Unknown,
+            stderr_tail: Some("dial tcp: connection reset"),
+            ..clean_fault_inputs()
+        });
         assert_eq!(
             faults.len(),
             1,
@@ -4648,17 +5074,22 @@ mod tests {
             keep_files: true,
             awaiting_wipe_confirmation: false,
             pending_wipe_store_failed: false,
-            log_read_error: None,
         });
+        let error = evidence
+            .error
+            .expect("an unproven run must carry terminal evidence");
+        assert!(error.contains("never reported that it stopped"), "{error}");
         assert!(
-            evidence
-                .error
-                .is_some_and(|error| error.contains("never reported that it stopped")),
-            "an unproven run must carry terminal evidence"
+            error.contains("dial tcp: connection reset"),
+            "the reap diagnostic is the only account of WHY it could not be confirmed: {error}"
         );
         assert!(evidence
             .summary
             .is_some_and(|summary| summary.contains("This run did not finish cleanly")));
+        assert!(
+            !classify_completed_run(9, 0, RunOutcome::Unknown, 0, false, 9, 0).wipe_eligible,
+            "a process that may still be uploading must not offer its originals for deletion"
+        );
     }
 
     /// A multi-path run is one job, so the worst path decides it. `Unknown`
@@ -4730,7 +5161,11 @@ mod tests {
             "files that were never sent must not be treated as imported"
         );
 
-        let faults = aggregate_fault_reasons(CLEAN_EXIT, 0, failures.len(), requested, None);
+        let faults = aggregate_fault_reasons(RunFaultInputs {
+            unstaged: failures.len(),
+            requested,
+            ..clean_fault_inputs()
+        });
         let evidence = terminal_evidence(RunEvidenceInputs {
             failed: false,
             progress: progress.clone(),
@@ -4739,7 +5174,6 @@ mod tests {
             keep_files: true,
             awaiting_wipe_confirmation: false,
             pending_wipe_store_failed: false,
-            log_read_error: None,
         });
         let summary = evidence.summary.expect("a completed run has a summary");
         assert!(
@@ -4812,7 +5246,7 @@ mod tests {
             );
         }
 
-        let dropped = bound_pending_wipes(&mut pending);
+        let dropped = bound_pending_wipes(&mut pending, &HashSet::new());
         assert_eq!(
             dropped,
             vec![oldest],
@@ -4824,7 +5258,7 @@ mod tests {
             "withdrawing an offer must never delete a source file"
         );
         assert!(
-            bound_pending_wipes(&mut pending).is_empty(),
+            bound_pending_wipes(&mut pending, &HashSet::new()).is_empty(),
             "exactly at the bound, nothing is withdrawn"
         );
 
@@ -4874,6 +5308,7 @@ mod tests {
     /// from. `forecast_cancel` touches only the forecast.
     #[test]
     fn forecast_cancel_raises_only_the_forecast_flag() {
+        let _slot = forecast_slot_guard();
         let scan = Arc::new(AtomicBool::new(false));
         let forecast = Arc::new(AtomicBool::new(false));
         *ACTIVE_SCAN
@@ -4888,14 +5323,6 @@ mod tests {
 
         tauri::async_runtime::block_on(forecast_cancel(41))
             .expect("cancelling a forecast never fails");
-        // A sibling `import_forecast` test may replace the slot in between; it
-        // raises the flag it displaced, so the flag settles either way.
-        for _ in 0..100 {
-            if forecast.load(Ordering::Relaxed) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
         assert!(
             forecast.load(Ordering::Relaxed),
             "the forecast is cancelled"
@@ -4921,23 +5348,379 @@ mod tests {
         tauri::async_runtime::block_on(forecast_cancel(41))
             .expect("no active forecast is not an error");
     }
-    #[test]
-    fn stale_forecast_generation_cannot_cancel_the_active_forecast() {
-        assert!(!forecast_generation_matches(9, 8));
-        assert!(forecast_generation_matches(9, 9));
+    /// Serializes every test that installs or reads the single active-forecast
+    /// slot, which is process-global.
+    fn forecast_slot_guard() -> std::sync::MutexGuard<'static, ()> {
+        static FORECAST_SLOT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        FORECAST_SLOT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn install_forecast(generation: u64, cancellation: Arc<AtomicBool>) {
+        ACTIVE_FORECAST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(ActiveForecast {
+                generation,
+                cancellation,
+            });
+    }
+
+    fn clear_forecast_slot() {
+        ACTIVE_FORECAST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+    }
+
+    /// Driven through the command against a real installed slot: the pure
+    /// generation comparison keeps passing even if `forecast_cancel` stops
+    /// consulting it, so the comparison alone defends nothing.
+    #[test]
+    fn stale_forecast_generation_cannot_cancel_the_active_forecast() {
+        let _slot = forecast_slot_guard();
+        let live = Arc::new(AtomicBool::new(false));
+        install_forecast(9, live.clone());
+
+        tauri::async_runtime::block_on(forecast_cancel(8)).expect("a stale cancel is not an error");
+        assert!(
+            !live.load(Ordering::Relaxed),
+            "a stale generation must never cancel the forecast that is running"
+        );
+
+        tauri::async_runtime::block_on(forecast_cancel(9)).expect("the live generation cancels");
+        assert!(live.load(Ordering::Relaxed));
+        clear_forecast_slot();
+    }
+
+    /// SLOT-OWNERSHIP: the generation arrives over IPC and two callers can send
+    /// the same one. A guard that cleared the slot on a generation match would
+    /// let the FIRST forecast's guard remove the SECOND forecast's live entry,
+    /// after which `forecast_cancel` finds nothing to cancel and the second
+    /// keeps hashing the card with no way to stop it.
+    #[test]
+    fn a_forecast_guard_cannot_clear_a_slot_it_did_not_install() {
+        let _slot = forecast_slot_guard();
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+
+        install_forecast(7, first.clone());
+        let first_guard = ActiveForecastGuard {
+            cancellation: first.clone(),
+        };
+        // The second forecast replaces the slot, with the SAME generation.
+        install_forecast(7, second.clone());
+        drop(first_guard);
+
+        tauri::async_runtime::block_on(forecast_cancel(7)).expect("cancelling never errors");
+        assert!(
+            second.load(Ordering::Relaxed),
+            "the live forecast must still be reachable by a cancel"
+        );
+        assert!(
+            !first.load(Ordering::Relaxed),
+            "the finished forecast must not be re-cancelled"
+        );
+        clear_forecast_slot();
+    }
+
+    /// Answers every request with one body and counts how many it was asked.
+    /// A wipe that refuses before the server must leave the count at zero.
+    struct ServerStub {
+        url: String,
+        hits: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ServerStub {
+        fn start(body: &'static str) -> Self {
+            use std::io::{Read, Write};
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+            let url = format!(
+                "http://127.0.0.1:{}",
+                listener.local_addr().expect("stub address").port()
+            );
+            listener
+                .set_nonblocking(true)
+                .expect("stub accepts without blocking");
+            let hits = Arc::new(AtomicU64::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = std::thread::spawn({
+                let hits = hits.clone();
+                let stop = stop.clone();
+                move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let Ok((mut socket, _)) = listener.accept() else {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        };
+                        hits.fetch_add(1, Ordering::Relaxed);
+                        let _ = socket.set_nonblocking(false);
+                        let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
+                        // Read the head and the body it declares. Answering
+                        // while a POST body is still unread reaches the client
+                        // as a connection reset instead of a response.
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 1024];
+                        while let Ok(read) = socket.read(&mut chunk) {
+                            if read == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&chunk[..read]);
+                            let text = String::from_utf8_lossy(&request).into_owned();
+                            let Some(head_len) = text.find("\r\n\r\n").map(|at| at + 4) else {
+                                continue;
+                            };
+                            let declared = text
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= head_len + declared {
+                                break;
+                            }
+                        }
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes());
+                        let _ = socket.flush();
+                    }
+                }
+            });
+            Self {
+                url,
+                hits,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn hits(&self) -> u64 {
+            self.hits.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for ServerStub {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// The server's answer for a file it already holds, live (not trashed) —
+    /// the only answer that authorizes deleting the local original.
+    const DUPLICATE_LIVE_BODY: &str =
+        r#"{"results":[{"id":"0","action":"reject","reason":"duplicate","isTrashed":false}]}"#;
+
+    /// Publishes a job awaiting confirmation with `payload` behind it, and the
+    /// profile key the confirmation will read.
+    fn offer_wipe(job_id: &str, profile_id: &str, payload: PendingWipe) {
+        keychain::store_api_key(profile_id, "test-key").expect("the test keychain accepts a key");
+        let mut job = terminal_job(job_id, true);
+        job.profile_id = profile_id.to_string();
+        job.pending_wipe_count = payload.paths.len() as u32;
+        lock_jobs().push(job);
+        PENDING_WIPE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job_id.to_string(), payload);
+    }
+
+    fn forget_wipe(job_id: &str) {
+        lock_jobs().retain(|job| job.id != job_id);
+        PENDING_WIPE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(job_id);
+    }
+
+    /// A candidate with no recorded identity is refused as hard as a changed
+    /// one: there is nothing to compare the card against, so nothing about it
+    /// is proven. Asserted through the injected closure, which is the only way
+    /// to reach this branch without a payload built by a real run.
+    #[test]
+    fn a_candidate_with_no_recorded_volume_is_refused() {
+        let error =
+            recheck_volume_identities(&["/card/photo.jpg".to_string()], &HashMap::new(), |_| {
+                Some("disk-a".to_string())
+            })
+            .expect_err("an unrecorded candidate cannot be proven");
+        assert!(error.contains("was not recorded"), "{error}");
+
+        assert!(recheck_volume_identities(
+            &["/card/photo.jpg".to_string()],
+            &HashMap::from([("/card/photo.jpg".to_string(), "disk-a".to_string())]),
+            |_| Some("disk-a".to_string()),
+        )
+        .is_ok());
+    }
+
+    /// Driven through `import_confirm_wipe`: the rejection has to happen inside
+    /// the command, before it hashes anything or asks the server, and it has to
+    /// leave the offer answerable. Asserting the recheck helper alone would
+    /// keep passing if the command stopped calling it.
     #[test]
     fn volume_mismatch_rejects_before_the_bulk_check() {
-        let path = "/source/photo.jpg".to_string();
-        let pending = PendingWipe {
-            paths: vec![path.clone()],
-            server_url: "https://example.invalid".to_string(),
-            volume_ids: HashMap::from([(path, "disk-a".to_string())]),
-            sequence: 0,
-        };
-        let error = recheck_wipe_volumes(&pending, |_| Some("disk-b".to_string())).unwrap_err();
-        assert!(error.contains("volume changed"));
+        let _script = volume_script_guard();
+        let _keychain = keychain::test_store::exclusive();
+        let source = std::env::temp_dir().join(format!("wipe-mismatch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&source).unwrap();
+        let photo = source.join("photo.jpg");
+        std::fs::write(&photo, b"photo").unwrap();
+        let path = photo.to_string_lossy().into_owned();
+        let stub = ServerStub::start(DUPLICATE_LIVE_BODY);
+
+        // The card at this mount now answers with a different identity than the
+        // one recorded when the offer was made.
+        script_volume_identities(vec![HashMap::from([(path.clone(), "disk-b".to_string())])]);
+        let job_id = format!("wipe-mismatch-{}", Uuid::new_v4());
+        offer_wipe(
+            &job_id,
+            &format!("profile-{job_id}"),
+            PendingWipe {
+                paths: vec![path.clone()],
+                server_url: stub.url.clone(),
+                volume_ids: HashMap::from([(path.clone(), "disk-a".to_string())]),
+                sequence: PENDING_WIPE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            },
+        );
+
+        let error = tauri::async_runtime::block_on(import_confirm_wipe(job_id.clone(), true))
+            .expect_err("a changed volume must refuse the wipe");
+
+        assert!(
+            error.contains("The source volume changed"),
+            "the mismatch itself must be named: {error}"
+        );
+        assert_eq!(
+            stub.hits(),
+            0,
+            "nothing may be hashed or sent to the server once the volume is wrong"
+        );
+        assert!(photo.exists(), "the original must still be on the card");
+        assert!(
+            PENDING_WIPE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&job_id),
+            "the offer must stay answerable after a refusal"
+        );
+
+        clear_volume_identity_script();
+        forget_wipe(&job_id);
+        std::fs::remove_dir_all(&source).unwrap();
+    }
+
+    /// SWAPPED-CARD: the identity recorded at terminalization was last proven
+    /// before the keychain read and a whole server round trip. A card swapped
+    /// at the same mount inside that window has its OWN files hashed and moved
+    /// to the Trash, so the identity must be proven again immediately before
+    /// the delete. With only the pre-verification check, this test's file is
+    /// trashed.
+    #[test]
+    fn a_volume_change_after_verification_refuses_the_whole_wipe() {
+        let _script = volume_script_guard();
+        let _keychain = keychain::test_store::exclusive();
+        let source = std::env::temp_dir().join(format!("wipe-swap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&source).unwrap();
+        let photo = source.join("photo.jpg");
+        std::fs::write(&photo, b"photo").unwrap();
+        let path = photo.to_string_lossy().into_owned();
+        let stub = ServerStub::start(DUPLICATE_LIVE_BODY);
+
+        // First batch: the volume the offer recorded, so the wipe proceeds to
+        // the server. Second batch: the card was swapped while it waited.
+        script_volume_identities(vec![
+            HashMap::from([(path.clone(), "disk-a".to_string())]),
+            HashMap::from([(path.clone(), "disk-b".to_string())]),
+        ]);
+        let job_id = format!("wipe-swap-{}", Uuid::new_v4());
+        offer_wipe(
+            &job_id,
+            &format!("profile-{job_id}"),
+            PendingWipe {
+                paths: vec![path.clone()],
+                server_url: stub.url.clone(),
+                volume_ids: HashMap::from([(path.clone(), "disk-a".to_string())]),
+                sequence: PENDING_WIPE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            },
+        );
+
+        let job = tauri::async_runtime::block_on(import_confirm_wipe(job_id.clone(), true))
+            .expect("the command reports the refusal on the job, not as an error");
+
+        assert!(
+            photo.exists(),
+            "a file on a volume that can no longer be proven must never be deleted"
+        );
+        assert!(stub.hits() > 0, "the server check did run before the swap");
+        let error = job.error.expect("the refusal must be visible on the card");
+        assert!(
+            error.contains("kept for safety"),
+            "the user must be told the files were kept: {error}"
+        );
+        assert!(
+            job.awaiting_wipe_confirmation,
+            "the offer must be retryable once the right card is back"
+        );
+
+        clear_volume_identity_script();
+        forget_wipe(&job_id);
+        std::fs::remove_dir_all(&source).unwrap();
+    }
+
+    /// A confirmation the user already answered holds no payload in the map
+    /// while it reads the keychain and calls the server — it took it out — but
+    /// a retry it puts back is visible to the next terminalization's bound.
+    /// Withdrawing THAT offer drops the verified list under a delete the user
+    /// already agreed to.
+    #[test]
+    fn a_confirmation_in_flight_keeps_its_payload_when_the_bound_runs() {
+        let mut pending: HashMap<String, PendingWipe> = HashMap::new();
+        let answering = "bound-in-flight".to_string();
+        pending.insert(
+            answering.clone(),
+            PendingWipe {
+                paths: vec!["/card/photo.jpg".to_string()],
+                server_url: "https://example.invalid".to_string(),
+                volume_ids: HashMap::new(),
+                sequence: 0,
+            },
+        );
+        for index in 1..=MAX_PENDING_WIPE_PROMPTS {
+            pending.insert(
+                format!("bound-other-{index}"),
+                PendingWipe {
+                    paths: Vec::new(),
+                    server_url: "https://example.invalid".to_string(),
+                    volume_ids: HashMap::new(),
+                    sequence: index as u64,
+                },
+            );
+        }
+
+        let in_flight = HashSet::from([answering.clone()]);
+        let dropped = bound_pending_wipes(&mut pending, &in_flight);
+
+        assert_eq!(
+            dropped,
+            vec!["bound-other-1".to_string()],
+            "the oldest offer NOT being answered is the one withdrawn"
+        );
+        assert!(
+            pending.contains_key(&answering),
+            "a confirmation in flight must keep the payload it is about to retry"
+        );
     }
 
     #[test]
@@ -4969,15 +5752,477 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// SILENT-KEEP: one upload record that resolves and one that does not is
+    /// the whole trigger. The unresolved file is kept with no explanation, and
+    /// the run used to publish "Upload completed. 1 uploaded" with no fault at
+    /// all: the evidence gate withheld the delete prompt and the checkpoint
+    /// silently, and nothing reached the card, the error, or the receipt.
     #[test]
     fn unresolved_event_blocks_checkpoint() {
-        assert!(!manifest_evidence_is_complete(true, 0, 1));
-        assert!(!manifest_evidence_is_complete(false, 0, 0));
-        assert!(manifest_evidence_is_complete(true, 0, 0));
+        let root = std::env::temp_dir().join(format!("unresolved-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let landed = root.join("landed.jpg");
+        std::fs::write(&landed, b"landed").unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let log = format!(
+            "2026-06-24 16:10:00 INF uploaded successfully file={}:landed.jpg\n\
+             2026-06-24 16:10:01 INF uploaded successfully file=/elsewhere/unknown.jpg\n",
+            root.display()
+        );
+        let run = crate::services::stdout_parser::parse_run_progress(&log, &roots);
+        assert_eq!(run.progress.uploaded, 1);
+        assert_eq!(
+            run.unresolved_file_events, 1,
+            "the second record resolves against no invocation root"
+        );
+
+        let (completed, _) = retain_paths_under_sources(run.completed_paths.clone(), &roots);
+        let classification = classify_completed_run(
+            run.progress.uploaded,
+            0,
+            CLEAN_EXIT,
+            0,
+            false,
+            completed.len(),
+            0,
+        );
+        let evidence_complete = manifest_evidence_is_complete(true, 0, run.unresolved_file_events);
+        assert!(!evidence_complete);
+        assert!(
+            !(classification.wipe_eligible && evidence_complete),
+            "an unaccounted-for upload record must withhold the delete prompt"
+        );
+        assert!(!(classification.checkpoint_eligible && evidence_complete));
+
+        let faults = aggregate_fault_reasons(RunFaultInputs {
+            unresolved_file_events: run.unresolved_file_events,
+            ..clean_fault_inputs()
+        });
+        assert!(
+            !faults.is_empty(),
+            "the run cannot account for one of its own upload records"
+        );
+        let evidence = terminal_evidence(RunEvidenceInputs {
+            failed: false,
+            progress: run.progress.clone(),
+            file_error_count: 0,
+            faults: &faults,
+            keep_files: false,
+            awaiting_wipe_confirmation: false,
+            pending_wipe_store_failed: false,
+        });
+        let summary = evidence.summary.expect("a completed run has a summary");
+        assert!(
+            summary.contains("could not be matched to a source file"),
+            "the card must say why a file was kept: {summary}"
+        );
+        assert!(evidence
+            .error
+            .is_some_and(|error| error.contains("could not be matched to a source file")));
+
+        let mut job = terminal_job("unresolved-record", false);
+        job.progress = run.progress.clone();
+        let record = run_history_record(
+            &job,
+            RunRecord {
+                started_at: 0,
+                source_paths: roots,
+                request: replayable_input("p1"),
+            },
+            !faults.is_empty(),
+        );
+        assert!(
+            record.incomplete,
+            "the receipt must not present this run as clean"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The other three kinds of missing evidence reach the user the same way:
+    /// they are faults, not silent gates.
+    #[test]
+    fn missing_evidence_is_reported_as_a_fault() {
+        let unreadable_log = aggregate_fault_reasons(RunFaultInputs {
+            log_read_error: Some("Could not read import run log: permission denied"),
+            ..clean_fault_inputs()
+        });
+        assert_eq!(unreadable_log.len(), 1, "{unreadable_log:?}");
+        assert!(unreadable_log[0].contains("permission denied"));
+
+        let no_manifest = aggregate_fault_reasons(RunFaultInputs {
+            manifest_present: false,
+            manifest_error: Some("The source stopped responding while it was being listed."),
+            ..clean_fault_inputs()
+        });
+        assert_eq!(no_manifest.len(), 1, "{no_manifest:?}");
+        assert!(
+            no_manifest[0].contains("stopped responding"),
+            "the reason the listing failed must survive, not be collapsed away: {no_manifest:?}"
+        );
+
+        let unmanifested = aggregate_fault_reasons(RunFaultInputs {
+            unmanifested_paths: 2,
+            ..clean_fault_inputs()
+        });
+        assert_eq!(unmanifested.len(), 1, "{unmanifested:?}");
+        assert!(unmanifested[0].contains("2 uploaded file(s)"));
+
+        assert!(
+            aggregate_fault_reasons(clean_fault_inputs()).is_empty(),
+            "a run with nothing missing has no fault to report"
+        );
+    }
+
+    /// Driven through the process-global admission state, not the pure ordering
+    /// helper: the lease only defends a source if `import_start`'s own check
+    /// reads it.
     #[test]
     fn unconfirmed_sidecar_lease_blocks_admission() {
         assert!(admission_block_reason(false, false, true).is_some());
+
+        let job_id = format!("lease-{}", Uuid::new_v4());
+        SESSION_SAFETY_LEASES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job_id.clone());
+        let blocked = import_admission_block().expect("admission state is readable");
+        SESSION_SAFETY_LEASES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&job_id);
+
+        assert!(
+            blocked.is_some_and(|reason| reason.contains("did not prove its sidecar stopped")),
+            "a leased session must refuse a new import by name"
+        );
+    }
+
+    /// LIVE-PROCESS: an `Ok` result whose process was never reaped is the same
+    /// hazard as the unconfirmed-termination error. Continuing the loop starts
+    /// a second sidecar on the same card, and the run then publishes a
+    /// cancellation with no fault, erasing the evidence entirely.
+    #[test]
+    fn an_unreaped_run_stops_the_loop_and_is_never_a_clean_cancel() {
+        let mut tally = RunTally::new();
+        let stop = tally.absorb(Ok(SidecarResult {
+            error_lines: vec!["immich-go: broken pipe".to_string()],
+            outcome: RunOutcome::Unknown,
+            reaped: false,
+        }));
+
+        assert!(stop, "an unreaped process must stop the run");
+        assert!(
+            tally.unconfirmed_termination,
+            "the session lease and the cancelled-suppression both read this"
+        );
+        assert_eq!(tally.outcome, RunOutcome::Unknown);
+        assert_eq!(
+            tally.error_lines,
+            vec!["immich-go: broken pipe".to_string()]
+        );
+        assert!(
+            tally.spawn_error.is_none(),
+            "the run reached the sidecar, so it is classified, not a spawn failure"
+        );
+        // What the worker derives from it: a cancel racing this run can no
+        // longer publish `Cancelled` and hide the live process.
+        assert!(!(!tally.unconfirmed_termination && (tally.cancelled || true)));
+
+        let mut proven = RunTally::new();
+        assert!(
+            !proven.absorb(Ok(SidecarResult {
+                error_lines: Vec::new(),
+                outcome: CLEAN_EXIT,
+                reaped: true,
+            })),
+            "a proven exit lets the next source path run"
+        );
+        assert!(!proven.unconfirmed_termination);
+
+        let mut errored = RunTally::new();
+        assert!(errored.absorb(Err(RunUploadError::UnconfirmedTermination(
+            "Could not cancel immich-go sidecar".to_string()
+        ))));
+        assert!(errored.unconfirmed_termination);
+    }
+
+    /// A staging tree is a set of links to the user's originals, and immich-go
+    /// follows them. Removing it under a process that was never proven gone
+    /// turns a recoverable unknown into a half-uploaded card. The retained
+    /// directory keeps its `.lock` held for this process's life, which is
+    /// exactly the lease startup pruning reclaims once we exit.
+    #[test]
+    fn an_unproven_termination_keeps_the_staging_tree() {
+        let tmp = std::env::temp_dir().join(format!("import-retain-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("photo.jpg");
+        std::fs::write(&source, b"photo").unwrap();
+        let selected = vec![source.to_string_lossy().into_owned()];
+
+        let staged =
+            staging::create_staging_dir(&selected, None, None, &AtomicU64::new(0)).unwrap();
+        let retained_root = staged.path().to_path_buf();
+        let retained = release_staging_dir(staged, true);
+
+        assert_eq!(retained.as_ref(), Some(&retained_root));
+        assert!(
+            retained_root.exists(),
+            "the staged links must survive a process that may still be reading them"
+        );
+        // The same probe `prune_stale_temp_artifacts` makes at startup.
+        use fs4::fs_std::FileExt;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(retained_root.join(".lock"))
+            .expect("the lease file is still there");
+        assert!(
+            !lock.try_lock_exclusive().expect("the lease is probeable"),
+            "the retained directory must still hold its lease, so pruning leaves it alone"
+        );
+        drop(lock);
+
+        let proven =
+            staging::create_staging_dir(&selected, None, None, &AtomicU64::new(0)).unwrap();
+        let proven_root = proven.path().to_path_buf();
+        assert_eq!(release_staging_dir(proven, false), None);
+        assert!(
+            !proven_root.exists(),
+            "a proven run still cleans up after itself"
+        );
+
+        std::fs::remove_dir_all(&retained_root).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// MOUNT-QUESTION: `volume_identity_for_path` answers only for a mount
+    /// POINT, and every wipe candidate is a FILE, so asking it directly could
+    /// never prove anything and delete-after-import could never store a prompt.
+    #[test]
+    fn wipe_candidates_are_asked_about_their_mount_not_their_own_path() {
+        let _script = volume_script_guard();
+        clear_volume_identity_script();
+        let tmp = std::env::temp_dir().join(format!("wipe-volume-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let photo = tmp.join("photo.jpg");
+        std::fs::write(&photo, b"photo").unwrap();
+        let paths = vec![photo.to_string_lossy().into_owned()];
+
+        assert!(
+            snapshot_wipe_volumes(&paths, device_detector::volume_identity_for_path).is_err(),
+            "a file path is not a mount point, so the old question can never be answered"
+        );
+        let volumes = snapshot_wipe_volumes(&paths, wipe_volume_identities())
+            .expect("the containing mount does have an identity");
+        assert_eq!(volumes.len(), 1);
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Both values are quoted because neither is ours: a server reason carrying
+    /// its own ` reason=` used to redraw this line's field boundaries.
+    #[test]
+    fn the_error_log_line_quotes_values_it_does_not_control() {
+        let line = import_error_log_line(
+            "job-1",
+            &FileError {
+                file: "/card/DCIM/a b.jpg".to_string(),
+                reason: "upload failed reason=injected file=/etc/passwd".to_string(),
+            },
+        );
+        // Every field boundary the reader can see is now a quote, so the
+        // server's own ` reason=` sits inside a value instead of opening a
+        // field of its own.
+        assert!(
+            line.starts_with(r#"import_error job_id=job-1 file="/card/DCIM/a b.jpg" reason=""#),
+            "{line}"
+        );
+        assert!(
+            line.contains(r#"reason="upload failed reason=injected file=/etc/passwd""#),
+            "the injected text must be delimited, not merged into the line: {line}"
+        );
+        assert!(line.ends_with('"'), "{line}");
+
+        // A newline in either value would otherwise split one event into two.
+        let split = import_error_log_line(
+            "job-2",
+            &FileError {
+                file: "/card/a.jpg".to_string(),
+                reason: "failed\nimport_error job_id=job-3".to_string(),
+            },
+        );
+        assert!(!split.contains('\n'), "{split}");
+    }
+
+    /// MANIFEST-SCOPE: the manifest answers "what was under this source before
+    /// the run", not "what does the preview grid show". immich-go uploads
+    /// formats the preview allowlist omits, and a manifest narrower than the
+    /// uploader marks every such clip unaccounted for — a permanent fault on
+    /// the card and an original that is never offered for deletion.
+    #[test]
+    fn the_source_manifest_covers_formats_the_preview_grid_hides() {
+        let root = std::env::temp_dir().join(format!("manifest-scope-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let clip = root.join("clip.mts");
+        let photo = root.join("photo.jpg");
+        std::fs::write(&clip, b"clip").unwrap();
+        std::fs::write(&photo, b"photo").unwrap();
+
+        let manifest = immutable_source_manifest(
+            None,
+            &[root.to_string_lossy().into_owned()],
+            &AtomicBool::new(false),
+            &AtomicU64::new(0),
+        )
+        .expect("a readable source manifests");
+
+        assert!(
+            manifest.contains(&clip.canonicalize().unwrap()),
+            "a format immich-go uploads must be in the manifest: {manifest:?}"
+        );
+        assert!(manifest.contains(&photo.canonicalize().unwrap()));
+        let (kept, dropped) =
+            retain_paths_in_manifest(vec![clip.to_string_lossy().into_owned()], Some(&manifest));
+        assert_eq!(kept.len(), 1, "the uploaded clip stays a wipe candidate");
+        assert_eq!(dropped, 0);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A source that stops answering blocks the manifest walk inside the
+    /// kernel, where its own deadline can never reach it. Unbounded, the worker
+    /// sits in `RUNNING_IMPORTS` with no upload started and the app cannot
+    /// quit. The bound leaves no manifest, which the finalization reports as a
+    /// fault and treats as no evidence.
+    #[test]
+    fn a_source_that_never_answers_cannot_park_the_manifest_walk() {
+        let release = Arc::new(AtomicBool::new(false));
+        let release_for_walk = release.clone();
+        let stuck = tauri::async_runtime::spawn_blocking(move || {
+            // Stands in for a `readdir` blocked in the kernel: it reports no
+            // progress and cannot be interrupted from outside.
+            while !release_for_walk.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(HashSet::new())
+        });
+        let progress = AtomicU64::new(0);
+        let cancel = AtomicBool::new(false);
+
+        let started = Instant::now();
+        let (manifest, error) = tauri::async_runtime::block_on(bounded_source_manifest(
+            stuck,
+            &progress,
+            &cancel,
+            Duration::from_millis(120),
+        ));
+        let waited = started.elapsed();
+        release.store(true, Ordering::Relaxed);
+
+        assert!(manifest.is_none(), "an abandoned walk proves nothing");
+        assert!(
+            error.is_some_and(|error| error.contains("stopped responding")),
+            "the reason must survive into the run's faults"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "the join must be bounded by silence, not by the walk returning: {waited:?}"
+        );
+    }
+
+    /// Driven through `plan_import_start`, which is everything the command
+    /// decides before it touches the keychain or the job maps. Asserting
+    /// `normalize_select_files` alone would keep passing if `import_start`
+    /// stopped calling it — which is the exact regression this defends.
+    #[test]
+    fn both_import_commands_read_a_selection_the_same_way() {
+        let root = std::env::temp_dir().join(format!("immich-shuttle-select-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("photo.jpg");
+        std::fs::write(&file, b"x").unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let selected = file.to_string_lossy().into_owned();
+
+        // No subset: import the whole source.
+        assert_eq!(normalize_select_files(None, &roots).unwrap(), None);
+        // A subset: exactly these files, once they pass the scope check.
+        assert_eq!(
+            normalize_select_files(Some(vec![selected.clone()]), &roots).unwrap(),
+            Some(vec![selected.clone()])
+        );
+        // Neither: refused rather than guessed.
+        assert_eq!(
+            normalize_select_files(Some(Vec::new()), &roots).unwrap_err(),
+            EMPTY_SELECTION_ERROR
+        );
+
+        // The start boundary reads all three the same way.
+        let mut input = replayable_input("p1");
+        input.source_paths = roots.clone();
+        input.select_files = None;
+        assert_eq!(plan_import_start(&input).unwrap().select_files, None);
+        input.select_files = Some(vec![selected.clone()]);
+        assert_eq!(
+            plan_import_start(&input).unwrap().select_files,
+            Some(vec![selected])
+        );
+        input.select_files = Some(Vec::new());
+        assert_eq!(
+            plan_import_start(&input)
+                .err()
+                .expect("an explicitly empty selection is refused"),
+            EMPTY_SELECTION_ERROR
+        );
+
+        // And so does the forecast boundary. Zero `source_paths` keeps this off
+        // the process-global approved-root state; the bogus profile id proves
+        // the refusal lands before any profile or keychain work.
+        let err = tauri::async_runtime::block_on(import_forecast(
+            "no-such-profile".to_string(),
+            Vec::new(),
+            Some(Vec::new()),
+            None,
+            Vec::new(),
+            Vec::new(),
+            3,
+        ))
+        .unwrap_err();
+        assert_eq!(err, EMPTY_SELECTION_ERROR);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `None` is the only value that makes the worker upload the source roots:
+    /// staging runs only for `Some`, and `upload_paths` falls back to
+    /// `source_paths` only when there is no staging dir. Refusing to turn an
+    /// explicitly empty selection into `None` is therefore the whole guard
+    /// against a zero-file request importing the entire card — and, with
+    /// keep-files off, proposing to wipe it afterwards.
+    #[test]
+    fn an_empty_selection_never_becomes_a_whole_source_upload() {
+        let root =
+            std::env::temp_dir().join(format!("immich-shuttle-empty-sel-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.jpg"), b"x").unwrap();
+        std::fs::write(root.join("b.mp4"), b"x").unwrap();
+
+        let mut input = replayable_input("p1");
+        input.source_paths = vec![root.to_string_lossy().into_owned()];
+        input.keep_files = false;
+        input.select_files = Some(Vec::new());
+
+        match plan_import_start(&input) {
+            Ok(plan) if plan.select_files.is_none() => {
+                panic!("an empty selection collapsed into a whole-source import")
+            }
+            Ok(plan) => panic!(
+                "an empty selection became a subset: {:?}",
+                plan.select_files
+            ),
+            Err(e) => assert_eq!(e, EMPTY_SELECTION_ERROR),
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

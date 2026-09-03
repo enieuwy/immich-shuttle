@@ -25,6 +25,12 @@ const noLongerRunning = () =>
     new Error("import_cancel failed: Import is no longer running: job-1"),
   );
 
+/** The rejection `import_cancel` produces when the job was evicted from the
+ *  registry between the snapshot this shutdown took and the cancel it sent.
+ *  Hard-coded for the same reason as `alreadyTerminal` above. */
+const jobEvicted = () =>
+  Promise.reject(new Error("import_cancel failed: Job not found: job-1"));
+
 function deps(overrides: Partial<ShutdownDeps> = {}): ShutdownDeps {
   return {
     pendingStarts: [],
@@ -81,6 +87,31 @@ describe("runImportShutdown", () => {
     );
 
     expect(outcome).toEqual({ kind: "complete" });
+  });
+
+  /**
+   * The same race at its widest: the job was evicted from the registry between
+   * the snapshot this shutdown took and the cancel it sent, so the cancel names
+   * an id the backend no longer has. No worker can outlive its job record, so
+   * nothing is left to stop and the quit must close instead of telling the user
+   * an import that no longer exists is "still shutting down".
+   */
+  it("closes when the job was evicted before the cancel landed", async () => {
+    const retainedJobIds = new Set<string>();
+
+    const outcome = await runImportShutdown(
+      deps({
+        runningJobIds: ["job-1"],
+        retainedJobIds,
+        cancelImport: vi.fn(jobEvicted),
+        awaitTerminal: vi.fn(() =>
+          Promise.reject(new Error("import_await_terminal failed: Job not found: job-1")),
+        ),
+      }),
+    );
+
+    expect(outcome).toEqual({ kind: "complete" });
+    expect([...retainedJobIds]).toEqual([]);
   });
 
   it("keeps the window open when a cancel fails for any other reason", async () => {

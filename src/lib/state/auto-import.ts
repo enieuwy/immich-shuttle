@@ -5,7 +5,7 @@ import { deviceRulesState, type DeviceRule } from "$lib/state/device-rules";
 import { activeProfile } from "$lib/state/profiles";
 import { errorsState } from "$lib/state/errors";
 import { queueState } from "$lib/state/queue";
-import { sourceState } from "$lib/state/source";
+import { sourceState, type SourceToken } from "$lib/state/source";
 import type { RemovableDevice } from "$lib/types";
 
 const STORAGE_KEY = "immich-shuttle-auto-import";
@@ -31,6 +31,14 @@ type AutoImportState = {
    * must not be applied until the user confirms it for this card.
    */
   candidateRuleNeedsConfirmation: boolean;
+  /**
+   * Increments whenever anything invalidates the current prompt: a replacement card, a
+   * dismissal, an ejection, the toggle. Published because mount path and volume id alone
+   * cannot tell two prompts apart -- pull a card and push the same one back in and both
+   * are identical -- so a view that arms per-card state, such as the "also delete
+   * originals" tick, needs this to know the prompt it was armed for is gone.
+   */
+  candidateRevision: number;
 };
 
 const state = writable<AutoImportState>({
@@ -38,6 +46,7 @@ const state = writable<AutoImportState>({
   candidate: null,
   candidateRule: null,
   candidateRuleNeedsConfirmation: false,
+  candidateRevision: 0,
 });
 
 // A lifecycle entry identifies both the mount and the OS-proven volume identity. Mount paths
@@ -80,6 +89,36 @@ function clearCandidate(): void {
   }));
 }
 
+// Bumping the revision and publishing it are one event: a view keys its per-card state to
+// this value, so a bump only this module could see would leave that state armed.
+function bumpRevision(): void {
+  candidateRevision += 1;
+  state.update((s) => ({ ...s, candidateRevision }));
+}
+
+// Fresh detector evidence about the card mounted at `device.mount_path`. A probe that
+// throws proves nothing, so it is reported apart from a probe that ran and found some
+// other card (or none): the first means we cannot look, the second means we looked and
+// this is not the card the caller holds.
+type CardProbe =
+  | { device: RemovableDevice }
+  | { failure: "unavailable" | "mismatch" };
+
+async function probeMountedCard(device: RemovableDevice, key: string): Promise<CardProbe> {
+  let live: RemovableDevice | undefined;
+  try {
+    live = (await devicesListRemovable()).find(
+      (current) =>
+        current.mount_path === device.mount_path &&
+        current.has_dcim &&
+        candidateKey(current) === key,
+    );
+  } catch {
+    return { failure: "unavailable" };
+  }
+  return live ? { device: live } : { failure: "mismatch" };
+}
+
 export const autoImportState = {
   subscribe: state.subscribe,
 
@@ -89,7 +128,7 @@ export const autoImportState = {
     } catch {
       // Best-effort persistence; behavior still applies for the session.
     }
-    candidateRevision += 1;
+    bumpRevision();
     state.update((s) => ({
       ...s,
       enabled,
@@ -141,7 +180,7 @@ export const autoImportState = {
       }
       // The mounted card changed or disappeared. Its prompt and all settings derived from it
       // are invalid. Pruning above also removes its seen and dismissed lifecycle entries.
-      candidateRevision += 1;
+      bumpRevision();
       clearCandidate();
       candidate = null;
       ({ enabled } = get(state));
@@ -164,7 +203,7 @@ export const autoImportState = {
     if (fresh) {
       // Only the card we actually surface is marked seen. Sibling cards stay unseen.
       seenMounts.add(candidateKey(fresh)!);
-      candidateRevision += 1;
+      bumpRevision();
       const match = deviceRulesState.lookup(fresh);
       state.update((s) => ({
         ...s,
@@ -194,17 +233,10 @@ export const autoImportState = {
     }
 
     const revision = candidateRevision;
-    let liveDevice: RemovableDevice | undefined;
-    try {
-      liveDevice = (await devicesListRemovable()).find(
-        (current) =>
-          current.mount_path === device.mount_path &&
-          current.has_dcim &&
-          candidateKey(current) === key,
-      );
-    } catch {
+    const probe = await probeMountedCard(device, key);
+    if ("failure" in probe && probe.failure === "unavailable") {
       // No fresh detector evidence means we cannot safely start work on source media.
-      candidateRevision += 1;
+      bumpRevision();
       clearCandidate();
       errorsState.addError("Could not verify the removable device before auto-import.");
       return;
@@ -219,14 +251,15 @@ export const autoImportState = {
     ) {
       return;
     }
-    if (!liveDevice) {
+    if ("failure" in probe) {
       // A different card may now occupy this mount. Drop the old settings and wait for a
       // fresh observation rather than passing its destination or delete policy to startImport.
-      candidateRevision += 1;
+      bumpRevision();
       clearCandidate();
       errorsState.addError("The removable device changed. Review it before auto-import.");
       return;
     }
+    const liveDevice = probe.device;
 
     // Nothing about an unconfirmed legacy rule proves it belongs to this card, so the
     // destructive half of it degrades to the safe answer unless the user ticked it now.
@@ -234,13 +267,50 @@ export const autoImportState = {
       ? { ...rule, keepFiles: needsConfirmation ? !confirmDeleteOriginals : rule.keepFiles }
       : null;
     clearCandidate();
+    let sourceToken: SourceToken | null = null;
     try {
       // Reflect the selection in the source picker so progress is visible there.
-      await sourceState.selectSources([liveDevice.mount_path]);
+      sourceToken = await sourceState.selectSources([liveDevice.mount_path]);
+
+      // That scan is the longest await on this path, and a card can be swapped at this
+      // mount while it runs. The scan then inventories card B, while `effective` -- delete
+      // policy included -- still describes card A, the card the user read on the banner.
+      // Nothing may start until this exact identity is proven again for the card in hand:
+      // an unproven identity must never carry a destructive policy.
+      if (candidateRevision !== revision) {
+        if (sourceToken !== null) sourceState.clearSourceIfUnchanged(sourceToken);
+        errorsState.addError(
+          "Auto-import was interrupted while the card was being scanned, so it did not start.",
+        );
+        return;
+      }
+      const rescan = await probeMountedCard(liveDevice, key);
+      if ("failure" in rescan) {
+        if (sourceToken !== null) sourceState.clearSourceIfUnchanged(sourceToken);
+        errorsState.addError(
+          rescan.failure === "unavailable"
+            ? "Could not re-check the removable device after scanning it, so auto-import did not start."
+            : "The removable device changed while it was being scanned, so auto-import did not start.",
+        );
+        return;
+      }
+
+      // A cancelled or timed-out scan leaves a partial inventory the source store refuses
+      // to commit, and this path imports the WHOLE source rather than a reviewed selection.
+      // Starting anyway would hand immich-go files nobody has seen -- and with a delete
+      // policy armed, arm deletion over them. The sources stay selected so the picker can
+      // retry the scan.
+      if (get(sourceState).scanOutcome !== "complete") {
+        errorsState.addError(
+          "Scanning the card did not finish, so auto-import did not start. Retry the scan from the source list.",
+        );
+        return;
+      }
+
       await queueState.startImport(
         effective
           ? {
-              sourcePaths: [liveDevice.mount_path],
+              sourcePaths: [rescan.device.mount_path],
               profileId: effective.profileId,
               albumIds: [],
               intoAlbum: effective.albumName,
@@ -249,11 +319,11 @@ export const autoImportState = {
               stackBurst: effective.stackBurst,
               organization: effective.organization,
             }
-          : { sourcePaths: [liveDevice.mount_path], keepFiles: true, albumIds: [] },
+          : { sourcePaths: [rescan.device.mount_path], keepFiles: true, albumIds: [] },
       );
-      // The fresh probe above proves this exact current volume identity before migration.
+      // The re-probe above proves this exact current volume identity before migration.
       if (effective && needsConfirmation) {
-        deviceRulesState.migrateLegacyRule(liveDevice, effective);
+        deviceRulesState.migrateLegacyRule(rescan.device, effective);
       }
     } catch (error) {
       // Restore only the exact card whose start failed. A later observation can replace the
@@ -274,7 +344,7 @@ export const autoImportState = {
 
   /** Decline the current candidate; it won't re-prompt until the card is re-inserted. */
   dismiss(): void {
-    candidateRevision += 1;
+    bumpRevision();
     const device = get(state).candidate;
     const key = device && candidateKey(device);
     if (key) {
@@ -293,6 +363,7 @@ export const autoImportState = {
       candidate: null,
       candidateRule: null,
       candidateRuleNeedsConfirmation: false,
+      candidateRevision,
     });
   },
 };

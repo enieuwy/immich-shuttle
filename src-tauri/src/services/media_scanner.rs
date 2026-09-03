@@ -1,9 +1,9 @@
 use std::{
     collections::HashSet,
     fmt, fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Condvar, LazyLock, Mutex,
     },
     time::{Duration, Instant},
@@ -262,6 +262,87 @@ pub fn scan_directory_streaming(
                 size_bytes: meta.len(),
                 is_video: is_video_ext(ext.as_str()),
             });
+            if files.len() >= STREAM_BATCH_SIZE {
+                on_batch(std::mem::take(&mut files));
+            }
+        }
+    }
+
+    if !files.is_empty() {
+        on_batch(files);
+    }
+    Ok(skipped_unreadable)
+}
+
+/// Enumerate every regular file under `path`, with no extension filter, in
+/// bounded batches.
+///
+/// This exists for the pre-sidecar source manifest, which asks a different
+/// question from the preview grid: not "which files does this app show" but
+/// "which files existed under this source before the sidecar started". The
+/// preview allowlist is deliberately narrower than what immich-go uploads (it
+/// omits `.mts`, `.webm`, `.3gp`, and several vendor raw formats), so filtering
+/// here would leave a legitimately uploaded clip outside the manifest — and the
+/// import worker then reports the run as unproven and keeps that original
+/// forever.
+///
+/// The cancellation, deadline, symlink, and skipped-unreadable semantics are
+/// exactly those of [`scan_directory_streaming`]; only the extension test and
+/// the per-file metadata read are gone, because a manifest needs the path and
+/// nothing else.
+///
+/// `progress` counts entries the walk has examined, including skipped ones. It
+/// is the only signal a caller has that a walk blocked inside the kernel is
+/// still alive: the deadline above is checked between entries, so it can never
+/// interrupt a `readdir` that never returns.
+pub fn manifest_directory_streaming(
+    path: &Path,
+    cancellation: Option<&AtomicBool>,
+    deadline: Option<Instant>,
+    progress: &AtomicU64,
+    on_batch: &mut dyn FnMut(Vec<PathBuf>),
+) -> Result<usize, ScanError> {
+    check_scan_controls(cancellation, deadline)?;
+    if !path.exists() {
+        return Err(ScanError::Failed(format!(
+            "Source path does not exist: {}",
+            path.display()
+        )));
+    }
+
+    let mut files: Vec<PathBuf> = Vec::with_capacity(STREAM_BATCH_SIZE);
+    let mut skipped_unreadable = 0_usize;
+
+    if path.is_file() {
+        check_scan_controls(cancellation, deadline)?;
+        progress.fetch_add(1, Ordering::Relaxed);
+        files.push(path.to_path_buf());
+    } else {
+        let mut entries = WalkDir::new(path).into_iter();
+        loop {
+            check_scan_controls(cancellation, deadline)?;
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            check_scan_controls(cancellation, deadline)?;
+            progress.fetch_add(1, Ordering::Relaxed);
+            let entry = match entry {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped_unreadable += 1;
+                    continue;
+                }
+            };
+            // Same reason as the preview walk: a link pointing outside the
+            // selected source must not become part of this source's manifest.
+            if entry.path_is_symlink() {
+                continue;
+            }
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            files.push(p.to_path_buf());
             if files.len() >= STREAM_BATCH_SIZE {
                 on_batch(std::mem::take(&mut files));
             }
@@ -654,6 +735,46 @@ mod tests {
         .unwrap();
         assert_eq!(skipped, 0);
         assert!(non_media_batches.is_empty());
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The manifest walk keeps the preview walk's controls, and reports
+    /// progress: the import worker bounds this walk by SILENCE, so a counter
+    /// that never moved would declare a healthy but slow card unresponsive.
+    #[test]
+    fn the_manifest_walk_reports_progress_and_still_obeys_its_controls() {
+        let tmp = std::env::temp_dir().join(format!("manifest-controls-{}", Uuid::new_v4()));
+        fs::create_dir_all(tmp.join("sub")).unwrap();
+        fs::write(tmp.join("clip.mts"), b"clip").unwrap();
+        fs::write(tmp.join("sub/notes.txt"), b"notes").unwrap();
+
+        let progress = AtomicU64::new(0);
+        let mut seen: Vec<PathBuf> = Vec::new();
+        let skipped = manifest_directory_streaming(&tmp, None, None, &progress, &mut |batch| {
+            seen.extend(batch)
+        })
+        .expect("a readable source enumerates");
+        assert_eq!(skipped, 0);
+        assert!(seen.contains(&tmp.join("clip.mts")));
+        assert!(
+            seen.contains(&tmp.join("sub/notes.txt")),
+            "the manifest is every file that existed, not every file the grid shows"
+        );
+        assert!(
+            progress.load(Ordering::Relaxed) >= seen.len() as u64,
+            "every examined entry must move the counter the caller's bound reads"
+        );
+
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            manifest_directory_streaming(&tmp, Some(&cancelled), None, &progress, &mut |_| {}),
+            Err(ScanError::Cancelled)
+        );
+        assert_eq!(
+            manifest_directory_streaming(&tmp, None, Some(Instant::now()), &progress, &mut |_| {}),
+            Err(ScanError::TimedOut)
+        );
 
         fs::remove_dir_all(&tmp).unwrap();
     }

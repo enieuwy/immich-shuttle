@@ -172,7 +172,23 @@ pub fn create_staging_dir(
     }
 
     let root = std::env::temp_dir().join(format!("immich-shuttle-stage-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root).map_err(|e| format!("Could not create staging dir: {e}"))?;
+    // Owner-only, like the run-log and immich-go config directories: on Linux
+    // `temp_dir()` is the shared `/tmp`, and the staged tree carries the user's
+    // photos under their original names. At the default umask another local
+    // user could list the selection and read a staged copy of every picture.
+    #[cfg(unix)]
+    let mut dir_builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut b = fs::DirBuilder::new();
+        b.mode(0o700);
+        b
+    };
+    #[cfg(not(unix))]
+    let mut dir_builder = fs::DirBuilder::new();
+    dir_builder
+        .recursive(true)
+        .create(&root)
+        .map_err(|e| format!("Could not create staging dir: {e}"))?;
     let lock = match acquire_dir_lock(&root) {
         Ok(lock) => lock,
         Err(e) => {
@@ -422,10 +438,19 @@ fn copy_reporting_progress(src: &Path, dest: &Path, progress: &AtomicU64) -> std
     // destination and follows a symlink at that path, so staging would write
     // through the link made for an earlier selection and destroy that file's
     // original on the source media before anything was uploaded.
-    let mut writer = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dest)?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    // A copy is real photo bytes in the shared temp directory, not a link to a
+    // file the owner already protects, so it is created owner-only for the same
+    // reason the staging root is. The link paths are untouched: a symlink's own
+    // mode is not consulted, and a hard link is the original file's inode,
+    // whose mode is the user's to choose.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut writer = opts.open(dest)?;
     // `create_new` proved nothing else owned `dest`, so the file is ours from
     // here and we must not leave it behind half-written. A read error on the
     // source or a write error on a dying mount stops the copy mid-file, and
@@ -579,6 +604,44 @@ mod tests {
         assert!(!staged_path.exists());
         // Originals survive cleanup.
         assert!(a.exists() && b.exists());
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// On Linux `std::env::temp_dir()` is the shared `/tmp`, so the staged tree
+    /// must not be readable by other local users: the filenames alone disclose
+    /// what the user is importing, and a copied destination is the photo itself.
+    #[cfg(unix)]
+    #[test]
+    fn the_staging_root_and_copied_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join(format!("stage-modes-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("IMG_1.JPG");
+        fs::write(&src, b"photo bytes").unwrap();
+
+        let staged = create_staging_dir(
+            &[src.to_string_lossy().to_string()],
+            None,
+            None,
+            &AtomicU64::new(0),
+        )
+        .unwrap();
+        let root_mode = fs::metadata(staged.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(root_mode, 0o700, "staging root mode was {root_mode:o}");
+
+        // Only the copy fallback writes photo bytes into the staging tree, and
+        // a healthy unix host always gets a symlink, so the copy is called
+        // directly — the same seam the other copy-fallback tests use.
+        let copied = staged.path().join("copied.JPG");
+        copy_reporting_progress(&src, &copied, &AtomicU64::new(0)).unwrap();
+        let copy_mode = fs::metadata(&copied).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            copy_mode, 0o600,
+            "copied destination mode was {copy_mode:o}"
+        );
+
+        cleanup_staging_dir(staged);
         fs::remove_dir_all(&tmp).unwrap();
     }
 

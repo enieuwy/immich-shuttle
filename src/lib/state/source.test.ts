@@ -417,6 +417,49 @@ describe("sourceState", () => {
     expect(importOptionsForSource(state, [])).toBeNull();
   });
 
+  // A scan that throws destroys the same file list a cancelled one does, so it
+  // owes the selection the same treatment. Leaving it armed let the next
+  // successful scan resurrect a hidden pick -- and absolute paths repeat across
+  // cards, so the resurrected pick can belong to a different card entirely.
+  it("clears the media selection when a scan fails outright", async () => {
+    await sourceState.selectSources(["/Volumes/Untitled/DCIM"]);
+    selectionState.selectOnly(["/Volumes/Untitled/DCIM/IMG_0001.JPG"]);
+
+    vi.mocked(api.scanSourcesStream).mockRejectedValueOnce(new Error("device disappeared"));
+    await sourceState.rescan();
+
+    expect(get(sourceState).scanResult).toBeNull();
+    expect(get(sourceState).error).toBe("device disappeared");
+    expect(selectionState.paths()).toEqual([]);
+
+    // The retry succeeds and exposes the identical absolute path. Nothing may
+    // be pre-ticked: the user never reviewed this inventory.
+    vi.mocked(api.scanSourcesStream).mockImplementationOnce(async (_paths, scanId) => {
+      progressListener?.({
+        payload: {
+          scan_id: scanId,
+          files: [mediaFile("/Volumes/Untitled/DCIM/IMG_0001.JPG")],
+          photo_count: 1,
+          video_count: 0,
+          total_size_bytes: 10,
+          skipped_unreadable: 0,
+        },
+      });
+      return {
+        status: "complete",
+        photo_count: 1,
+        video_count: 0,
+        total_size_bytes: 10,
+        skipped_unreadable: 0,
+      };
+    });
+
+    await sourceState.rescan();
+
+    expect(get(sourceState).scanOutcome).toBe("complete");
+    expect(selectionState.paths()).toEqual([]);
+  });
+
   it("rescans the same sources and commits once the scan completes", async () => {
     vi.mocked(api.scanSourcesStream).mockImplementationOnce(async () => ({
       status: "timed_out" as const,

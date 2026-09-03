@@ -42,6 +42,17 @@ pub enum RunOutcome {
 pub struct SidecarResult {
     pub error_lines: Vec<String>,
     pub outcome: RunOutcome,
+    /// Whether the sidecar process was proven gone: an observed `Terminated`
+    /// event, or a reap the plugin confirmed.
+    ///
+    /// `reaped == false` means the process may still be reading its source and
+    /// uploading, so the caller must keep its source admission lease, leave the
+    /// staged files alone, and refuse to admit a retry for that source.
+    ///
+    /// This is independent of `outcome`: a closed event channel whose reap was
+    /// still confirmed leaves the exit status `Unknown` while the process is
+    /// provably dead, so both facts have to travel separately.
+    pub reaped: bool,
 }
 
 /// A sidecar result that did not establish process termination.
@@ -139,16 +150,36 @@ pub struct UploadRequest {
 }
 
 /// Removes the private per-run config directory (with the api-key file inside)
-/// when dropped.
+/// when dropped, unless the run asked for it to be retained.
 struct TempConfig {
     dir: PathBuf,
     path: PathBuf,
     lock: Option<fs::File>,
+    /// Set when the directory must outlive the run. The config file carries the
+    /// API key immich-go was started with and reads through `--config`, so
+    /// removing it under a process whose termination was never proven can break
+    /// an upload the app has already decided it cannot account for. Startup
+    /// pruning reclaims the directory later: this process releases the advisory
+    /// lock on drop, which is exactly the evidence `prune_stale_temp_artifacts`
+    /// waits for.
+    retain: bool,
+}
+
+impl TempConfig {
+    /// Disarm the cleanup and report the directory that is being left behind,
+    /// so the caller can name it in the log line support needs to find it.
+    fn persist(&mut self) -> &Path {
+        self.retain = true;
+        &self.dir
+    }
 }
 
 impl Drop for TempConfig {
     fn drop(&mut self) {
         drop(self.lock.take());
+        if self.retain {
+            return;
+        }
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -186,6 +217,7 @@ fn write_api_key_config(api_key: &str) -> Result<TempConfig, String> {
         dir: dir.clone(),
         path: dir.join("config.yaml"),
         lock: Some(lock),
+        retain: false,
     };
 
     let escaped = api_key.replace('\\', "\\\\").replace('"', "\\\"");
@@ -544,7 +576,10 @@ where
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let outcome = loop {
+    // The loop yields both what the run established about the exit status and
+    // whether the process itself was proven gone; the caller needs the second
+    // fact to decide whether it may release the source admission lease.
+    let (outcome, reaped) = loop {
         if cancel_flag.load(Ordering::Relaxed) {
             // An unconfirmed reap is not a cancelled run: the sidecar may still
             // be uploading, so it must surface as an error rather than as the
@@ -576,11 +611,16 @@ where
                         // reap diagnostic is recorded as a stderr line so it
                         // reaches the failure message and the run log through
                         // the same path as immich-go's own output.
-                        let diagnostic = reap_diagnostic(kill_and_reap(child, rx).await);
-                        error_lines.push(&diagnostic.unwrap_or_else(|| {
+                        // The reap decides `reaped` separately: only a
+                        // confirmed reap proves the process is gone, and
+                        // without that proof the caller has to keep treating it
+                        // as a live process that may still be uploading.
+                        let reap = kill_and_reap(child, rx).await;
+                        let confirmed = matches!(reap, ReapOutcome::Confirmed { .. });
+                        error_lines.push(&reap_diagnostic(reap).unwrap_or_else(|| {
                             "sidecar stopped without a termination event".to_string()
                         }));
-                        break RunOutcome::Unknown;
+                        break (RunOutcome::Unknown, confirmed);
                     }
 
                     Some(CommandEvent::Stderr(line_bytes)) => {
@@ -595,15 +635,26 @@ where
                         // A missing code means the process was signalled rather
                         // than exiting on its own; that is a failed run, not a
                         // clean one.
-                        break RunOutcome::Exited { success: payload.code == Some(0) };
+                        break (RunOutcome::Exited { success: payload.code == Some(0) }, true);
                     }
                     Some(CommandEvent::Error(error)) => {
-                        let detail = reap_diagnostic(kill_and_reap(child, rx).await)
+                        // An unconfirmed reap here is the same live-process
+                        // hazard the cancel path guards: `Other` lets the caller
+                        // finalize the run — wiping the staging tree and
+                        // admitting a retry — while immich-go may still be
+                        // uploading. Only a confirmed reap earns that.
+                        let reap = kill_and_reap(child, rx).await;
+                        let confirmed = matches!(reap, ReapOutcome::Confirmed { .. });
+                        let detail = reap_diagnostic(reap)
                             .map(|diagnostic| format!("; {diagnostic}"))
                             .unwrap_or_default();
-                        return Err(RunUploadError::Other(format!(
-                            "immich-go sidecar event failed: {error}{detail}"
-                        )));
+                        let message =
+                            format!("immich-go sidecar event failed: {error}{detail}");
+                        return Err(if confirmed {
+                            RunUploadError::Other(message)
+                        } else {
+                            RunUploadError::UnconfirmedTermination(message)
+                        });
                     }
                     Some(_) => {}
                 }
@@ -614,7 +665,56 @@ where
     Ok(SidecarResult {
         error_lines: error_lines.into_vec(),
         outcome,
+        reaped,
     })
+}
+
+/// Whether the finished run proved that the sidecar process is gone.
+///
+/// Only a confirmed reap counts. `UnconfirmedTermination` and an `Ok` result
+/// with `reaped == false` both leave a process that may still be reading the
+/// source and talking to the server, and every other outcome — a clean exit, a
+/// cancel whose reap was confirmed, a failure raised before the spawn — has
+/// established that no process of ours is left.
+fn termination_proven(result: &Result<SidecarResult, RunUploadError>) -> bool {
+    match result {
+        Ok(result) => result.reaped,
+        Err(RunUploadError::UnconfirmedTermination(_)) => false,
+        Err(_) => true,
+    }
+}
+
+/// Decide the fate of the run's private config directory.
+///
+/// The config file carries the API key immich-go reads through `--config` for
+/// the whole run, so it may only be removed once the process is proven gone.
+/// Removing it under a possibly-live sidecar would break an upload the app has
+/// already decided it cannot account for — precisely the run the safety lease
+/// exists to protect. A retained directory is not a leak: this process drops
+/// its advisory lock here, so the next startup's `prune_stale_temp_artifacts`
+/// reclaims it.
+///
+/// `log` is injected because the log sink writes into the real user data
+/// directory, which a unit test must not touch.
+fn settle_temp_config<L>(
+    mut config: TempConfig,
+    result: &Result<SidecarResult, RunUploadError>,
+    log: L,
+) where
+    L: FnOnce(&str),
+{
+    if termination_proven(result) {
+        // The guard's drop removes the directory, as on every normal run.
+        return;
+    }
+
+    let retained = config.persist();
+    // Named in the log so support (and the user clearing space by hand) can
+    // find the directory that startup pruning will collect later.
+    log(&format!(
+        "sidecar_config_retained reason=unconfirmed_termination path={}",
+        retained.display()
+    ));
 }
 
 pub async fn run_upload(
@@ -653,7 +753,15 @@ pub async fn run_upload(
         &mut progress,
         |snapshot, current_path| emit_progress(&app, &request.job_id, snapshot, current_path),
     )
-    .await?;
+    .await;
+
+    // Taken before the error is propagated, because an unproven termination
+    // arrives on both the error and the success path and the config must
+    // outlive the sidecar in either case.
+    settle_temp_config(config, &result, |line| {
+        let _ = crate::services::logs::append_log("app.log", line);
+    });
+    let result = result?;
 
     // Final authoritative snapshot so the UI lands on the run log's last counts.
     let snapshot = progress.finish();
@@ -910,6 +1018,12 @@ mod tests {
         .expect("a lost termination event is reported, not an error");
 
         assert_eq!(result.outcome, RunOutcome::Unknown);
+        // Nothing proved the process is gone, so the caller must still treat it
+        // as live: this is the flag its safety lease hangs on.
+        assert!(
+            !result.reaped,
+            "an unconfirmed reap must not read as a reaped process"
+        );
         // The diagnostic must survive: it is the only evidence the user gets.
         assert!(
             result
@@ -949,6 +1063,8 @@ mod tests {
             .unwrap();
 
             assert_eq!(result.outcome, expected, "exit code {code:?}");
+            // An observed termination event IS the proof of reaping.
+            assert!(result.reaped, "exit code {code:?}");
             // The termination event consumed the handle, so nothing is left to kill.
             assert!(child.is_none());
             fs::remove_dir_all(dir).unwrap();
@@ -1022,5 +1138,193 @@ mod tests {
         );
         assert_ne!(error, RunUploadError::Cancelled);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A closed channel is not automatically a live process. When the reap was
+    /// still confirmed, the exit status stays unknown while the process is
+    /// provably gone, so the two facts travel as separate fields and the caller
+    /// only keeps the safety lease for the case that needs it.
+    #[tokio::test]
+    async fn a_closed_channel_with_a_confirmed_reap_reports_a_dead_process() {
+        let dir = log_dir();
+        let mut progress = reader_for(&dir, "");
+        let (tx, mut rx) = tauri::async_runtime::channel::<CommandEvent>(4);
+        drop(tx);
+        // The only shape a closed channel can still confirm: no handle left,
+        // which in production means a `Terminated` event was already observed.
+        let mut child: Option<FakeKill> = None;
+
+        let result = drive_run(
+            &mut rx,
+            &mut child,
+            &AtomicBool::new(false),
+            &mut progress,
+            |_, _| {},
+        )
+        .await
+        .expect("a lost exit status is reported, not an error");
+
+        assert_eq!(result.outcome, RunOutcome::Unknown);
+        assert!(
+            result.reaped,
+            "a confirmed reap is proof of termination even without an exit status"
+        );
+        assert_eq!(
+            result.error_lines,
+            vec!["sidecar stopped without a termination event".to_string()]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `Other` lets the worker finalize the run — wipe the staging tree and
+    /// admit a retry — so an event failure whose reap was never confirmed must
+    /// be reported as an unproven termination instead, exactly like a cancel.
+    #[tokio::test]
+    async fn an_event_error_with_an_unconfirmed_reap_is_an_unproven_termination() {
+        let dir = log_dir();
+        let mut progress = reader_for(&dir, "");
+        let (tx, mut rx) = tauri::async_runtime::channel::<CommandEvent>(4);
+        tx.send(CommandEvent::Error("pipe broken".to_string()))
+            .await
+            .unwrap();
+        // No termination event follows the failure, so the reap stays unproven.
+        drop(tx);
+        let mut child = kills_ok();
+
+        let error = drive_run(
+            &mut rx,
+            &mut child,
+            &AtomicBool::new(false),
+            &mut progress,
+            |_, _| {},
+        )
+        .await
+        .expect_err("an event failure is never a finished run");
+
+        match &error {
+            RunUploadError::UnconfirmedTermination(message) => {
+                // Both diagnostics stay on the record: what failed, and why the
+                // process could not be accounted for afterwards.
+                assert!(message.contains("pipe broken"), "{message}");
+                assert!(message.contains("event channel closed"), "{message}");
+            }
+            other => panic!("an unreaped sidecar must not read as a plain failure: {other}"),
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_event_error_with_a_confirmed_reap_stays_a_plain_failure() {
+        let dir = log_dir();
+        let mut progress = reader_for(&dir, "");
+        let (tx, mut rx) = tauri::async_runtime::channel::<CommandEvent>(4);
+        tx.send(CommandEvent::Error("pipe broken".to_string()))
+            .await
+            .unwrap();
+        // The reap that follows the failure observes the termination event.
+        tx.send(terminated(Some(1))).await.unwrap();
+        drop(tx);
+        let mut child = kills_ok();
+
+        let error = drive_run(
+            &mut rx,
+            &mut child,
+            &AtomicBool::new(false),
+            &mut progress,
+            |_, _| {},
+        )
+        .await
+        .expect_err("an event failure is never a finished run");
+
+        assert!(
+            matches!(&error, RunUploadError::Other(message) if message.contains("pipe broken")),
+            "a proven-dead sidecar is an ordinary failure: {error}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // ---- the run's private config directory ----
+
+    /// Create a real per-run config directory, settle it against `result`, and
+    /// report the directory it used plus everything that was logged.
+    fn settle(result: Result<SidecarResult, RunUploadError>) -> (PathBuf, Vec<String>) {
+        let config = write_api_key_config("secret").unwrap();
+        let dir = config.dir.clone();
+        assert!(
+            dir.join("config.yaml").exists(),
+            "the fixture must start with the api-key config in place"
+        );
+
+        let mut logged = Vec::new();
+        settle_temp_config(config, &result, |line| logged.push(line.to_string()));
+        (dir, logged)
+    }
+
+    fn finished(outcome: RunOutcome, reaped: bool) -> Result<SidecarResult, RunUploadError> {
+        Ok(SidecarResult {
+            error_lines: Vec::new(),
+            outcome,
+            reaped,
+        })
+    }
+
+    #[test]
+    fn a_clean_run_removes_the_private_config_directory() {
+        let (dir, logged) = settle(finished(RunOutcome::Exited { success: true }, true));
+
+        assert!(
+            !dir.exists(),
+            "a proven-dead sidecar leaves no config to protect"
+        );
+        assert!(logged.is_empty(), "nothing was retained: {logged:?}");
+    }
+
+    /// The config file carries the API key immich-go reads through `--config`
+    /// for the whole run. Deleting it under a process the app could not account
+    /// for can break the very upload the safety lease exists to protect, so the
+    /// directory outlives the run and startup pruning reclaims it later.
+    #[test]
+    fn an_unproven_termination_keeps_the_private_config_and_logs_its_path() {
+        for result in [
+            finished(RunOutcome::Unknown, false),
+            Err(RunUploadError::UnconfirmedTermination(
+                "Could not cancel immich-go sidecar: timed out".to_string(),
+            )),
+        ] {
+            let (dir, logged) = settle(result);
+
+            assert!(
+                dir.join("config.yaml").exists(),
+                "immich-go may still be reading its --config file"
+            );
+            assert_eq!(
+                logged.len(),
+                1,
+                "one retention line is expected: {logged:?}"
+            );
+            assert!(
+                logged[0].contains("sidecar_config_retained")
+                    && logged[0].contains(&dir.display().to_string()),
+                "the retained path must be findable from the log: {}",
+                logged[0]
+            );
+
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Every other ending established that no process of ours is left: a cancel
+    /// whose reap was confirmed, and a failure raised around the run.
+    #[test]
+    fn a_proven_termination_removes_the_private_config_on_the_error_paths() {
+        for error in [
+            RunUploadError::Cancelled,
+            RunUploadError::Other("Could not spawn immich-go sidecar".to_string()),
+        ] {
+            let (dir, logged) = settle(Err(error));
+
+            assert!(!dir.exists(), "{} must be cleaned up", dir.display());
+            assert!(logged.is_empty(), "nothing was retained: {logged:?}");
+        }
     }
 }

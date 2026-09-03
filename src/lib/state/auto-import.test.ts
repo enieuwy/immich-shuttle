@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 
+// `accept` stages the card in the source store, so the scan the source store runs is part
+// of this path: it decides whether the inventory is complete enough to import at all.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async () => () => {}),
+}));
+
 vi.mock("$lib/api", () => ({
   importStart: vi.fn(async () => "job-1"),
   importListJobs: vi.fn(async () => []),
@@ -27,6 +33,14 @@ vi.mock("$lib/api", () => ({
     skipped_unreadable: 0,
   })),
   devicesListRemovable: vi.fn(async () => []),
+  scanSourcesStream: vi.fn(async () => ({
+    status: "complete",
+    photo_count: 1,
+    video_count: 0,
+    total_size_bytes: 1024,
+    skipped_unreadable: 0,
+  })),
+  scanCancel: vi.fn(async () => undefined),
   albumsList: vi.fn(async () => []),
 }));
 
@@ -408,5 +422,131 @@ describe("autoImportState", () => {
 
     expect(get(autoImportState).candidateRuleNeedsConfirmation).toBe(true);
     expect(deviceRulesState.lookup(card)).toEqual({ rule: savedRule, needsConfirmation: true });
+  });
+
+  /**
+   * The scan is the longest await between reading the banner and starting the import, and
+   * a mount path is a slot, not a card. A card swapped during the scan is the card the scan
+   * actually inventoried, while the rule captured before it -- `keepFiles: false` included
+   * -- still describes the card the user read about. Starting there would offer a stranger's
+   * originals for deletion.
+   */
+  it("refuses to start when a different card occupies the mount after the scan", async () => {
+    const replacement: RemovableDevice = {
+      ...card,
+      volume_id: "22222222-2222-2222-2222-222222222222",
+    };
+    deviceRulesState.saveRule(card, savedRule);
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+
+    // The pre-scan probe still sees the card the banner described; by the time the scan of
+    // that mount finishes, the slot holds a different one.
+    vi.mocked(api.devicesListRemovable)
+      .mockResolvedValueOnce([card])
+      .mockResolvedValue([replacement]);
+
+    await autoImportState.accept();
+
+    expect(vi.mocked(api.importStart)).not.toHaveBeenCalled();
+    expect(get(errorsState)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          message: expect.stringMatching(/changed while it was being scanned/),
+        }),
+      ]),
+    );
+    // The source was staged only for this attempt and now names an unidentified card.
+    expect(get(sourceState).selectedPaths).toEqual([]);
+  });
+
+  /**
+   * Auto-import imports the WHOLE source: there is no reviewed selection to fall back on.
+   * A cancelled or timed-out scan means nobody -- not even the app -- knows what is on the
+   * card, so a delete policy armed over it would be armed over unseen files.
+   */
+  it("refuses to start when the scan of the card did not finish", async () => {
+    deviceRulesState.saveRule(card, savedRule);
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+    vi.mocked(api.scanSourcesStream).mockResolvedValueOnce({
+      status: "timed_out",
+      photo_count: 1,
+      video_count: 0,
+      total_size_bytes: 10,
+      skipped_unreadable: 0,
+    });
+
+    await autoImportState.accept();
+
+    expect(vi.mocked(api.importStart)).not.toHaveBeenCalled();
+    expect(get(errorsState)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ message: expect.stringMatching(/did not finish/) }),
+      ]),
+    );
+    // Unlike the swapped-card refusal, the sources stay selected: the scan is the only
+    // thing that failed, and the picker offers the retry.
+    expect(get(sourceState).selectedPaths).toEqual([card.mount_path]);
+  });
+
+  it("refuses to start when auto-import is switched off while the card is scanned", async () => {
+    deviceRulesState.saveRule(card, savedRule);
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+    vi.mocked(api.scanSourcesStream).mockImplementationOnce(async () => {
+      autoImportState.setEnabled(false);
+      return {
+        status: "complete",
+        photo_count: 1,
+        video_count: 0,
+        total_size_bytes: 10,
+        skipped_unreadable: 0,
+      };
+    });
+
+    await autoImportState.accept();
+
+    expect(vi.mocked(api.importStart)).not.toHaveBeenCalled();
+    expect(get(errorsState)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ message: expect.stringMatching(/interrupted/) }),
+      ]),
+    );
+    expect(get(sourceState).selectedPaths).toEqual([]);
+  });
+
+  /**
+   * AutoImportBanner arms "also delete originals" per prompt and must drop it the moment
+   * the prompt is replaced. It cannot key that on the mount path (a slot two cards share)
+   * or even on the volume id (the same card re-inserted is identical), so the store
+   * publishes a revision. This is the state-level half of that component invariant.
+   */
+  it("publishes a new candidate revision for every prompt", () => {
+    const replacement: RemovableDevice = {
+      ...card,
+      volume_id: "22222222-2222-2222-2222-222222222222",
+    };
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+    const first = get(autoImportState).candidateRevision;
+
+    // A different card in the same slot: identical mount path, new prompt.
+    autoImportState.observe([replacement]);
+    const second = get(autoImportState).candidateRevision;
+    expect(get(autoImportState).candidate).toEqual(replacement);
+    expect(second).toBeGreaterThan(first);
+
+    // The same card pulled and pushed back in: mount path AND volume id are identical, so
+    // the revision is the only evidence that this is a different prompt.
+    autoImportState.dismiss();
+    autoImportState.observe([]);
+    autoImportState.observe([replacement]);
+    expect(get(autoImportState).candidate).toEqual(replacement);
+    expect(get(autoImportState).candidateRevision).toBeGreaterThan(second);
   });
 });

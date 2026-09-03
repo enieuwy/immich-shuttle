@@ -1,6 +1,6 @@
 use std::{
-    collections::HashSet,
-    path::Path,
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::{mpsc, LazyLock, Mutex},
     thread,
     time::Duration,
@@ -78,6 +78,32 @@ impl Drop for InFlightProbeGuard {
     }
 }
 
+/// `IN_FLIGHT_PROBES` keys are namespaced by probe kind. A DCIM probe and an identity probe
+/// of the same mount are independent operations, so neither may suppress the other; the only
+/// redundant work worth dropping is a second probe of the same kind for the same mount.
+fn dcim_probe_key(mount: &str) -> String {
+    format!("dcim:{mount}")
+}
+
+fn identity_probe_key(mount: &str) -> String {
+    format!("identity:{mount}")
+}
+
+/// Registers `key` as outstanding and hands back the guard that releases it, or `None` when
+/// a probe for `key` is already running. The guard has to be moved into the probe closure so
+/// the entry clears when the probe thread actually finishes, not when the caller stops
+/// waiting for it.
+fn reserve_in_flight_probe(key: &str) -> Option<InFlightProbeGuard> {
+    let mut in_flight = IN_FLIGHT_PROBES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    in_flight
+        .insert(key.to_string())
+        .then(|| InFlightProbeGuard {
+            key: key.to_string(),
+        })
+}
+
 /// Runs `probe` for `key` through `run_probe_with_timeout`, unless a probe for `key` is
 /// already outstanding — in which case this returns `false` immediately without spawning a
 /// thread. A mount that hasn't answered a filesystem stat within `timeout` isn't a usable
@@ -89,21 +115,36 @@ fn probe_mount_if_not_in_flight(
     probe: impl FnOnce() -> bool + Send + 'static,
     timeout: Duration,
 ) -> bool {
-    let mut in_flight = IN_FLIGHT_PROBES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !in_flight.insert(key.to_string()) {
+    let Some(guard) = reserve_in_flight_probe(key) else {
         return false;
-    }
-    drop(in_flight);
-
-    let guard = InFlightProbeGuard {
-        key: key.to_string(),
     };
     run_probe_with_timeout(
         move || {
             let _guard = guard;
             probe()
+        },
+        timeout,
+    )
+}
+
+/// The identity counterpart of `probe_mount_if_not_in_flight`: runs `resolve` for `key`
+/// through `resolve_with_timeout` unless an identity probe for `key` is already outstanding.
+///
+/// `list_removable_devices` asks for an identity for every candidate on every 2s poll, and a
+/// timed-out lookup abandons its worker thread. Without this guard a wedged volume therefore
+/// leaked one permanently blocked thread plus one abandoned `diskutil`/`mountvol` child per
+/// poll, forever. `None` is the same fail-safe answer a timed-out probe gives, and callers
+/// must already treat an unknown identity as untrusted.
+fn resolve_identity_if_not_in_flight(
+    key: &str,
+    resolve: impl FnOnce() -> Option<String> + Send + 'static,
+    timeout: Duration,
+) -> Option<String> {
+    let guard = reserve_in_flight_probe(key)?;
+    resolve_with_timeout(
+        move || {
+            let _guard = guard;
+            resolve()
         },
         timeout,
     )
@@ -116,7 +157,11 @@ fn has_dcim(mount: &str) -> bool {
     // already in flight we report "no DCIM" immediately instead of stacking another thread,
     // so a permanently hung mount (sleeping USB drive, dead SMB/NFS mount) costs one thread
     // total rather than one per poll.
-    probe_mount_if_not_in_flight(mount, move || dcim_path.is_dir(), DCIM_PROBE_TIMEOUT)
+    probe_mount_if_not_in_flight(
+        &dcim_probe_key(mount),
+        move || dcim_path.is_dir(),
+        DCIM_PROBE_TIMEOUT,
+    )
 }
 fn should_include_mount(path: &str, removable: bool) -> bool {
     if removable {
@@ -234,19 +279,35 @@ fn parse_mountvol_guid(output: &str) -> Option<String> {
         .map(|token| token.trim_end_matches('\\').to_string())
 }
 
-#[cfg(target_os = "windows")]
-fn probe_volume_id(mount: &str) -> Option<String> {
-    use std::process::Command;
-
+/// Builds the argv for one `mountvol` identity probe: the absolute path of the System32
+/// executable, then exactly two arguments.
+///
+/// `mountvol` must never be invoked through `cmd /C`. The mount path comes from the OS, and a
+/// volume mounted at a directory whose name contains `&`, `|` or `^` would make `cmd` run the
+/// suffix as a command under the app account. Passing the path as a single argument to the
+/// executable itself removes the shell from the picture entirely. The absolute path also
+/// stops a `mountvol.exe` planted earlier on `PATH` from being picked up.
+#[cfg(any(target_os = "windows", test))]
+fn mountvol_command(mount: &str, system_root: Option<&str>) -> (PathBuf, Vec<String>) {
     // `mountvol` only accepts a directory path with a trailing separator.
     let mut path = mount.to_string();
     if !path.ends_with('\\') {
         path.push('\\');
     }
-    let output = Command::new("cmd")
-        .args(["/C", "mountvol", &path, "/L"])
-        .output()
-        .ok()?;
+    let root = system_root.unwrap_or(r"C:\Windows");
+    (
+        PathBuf::from(format!(r"{root}\System32\mountvol.exe")),
+        vec![path, "/L".to_string()],
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn probe_volume_id(mount: &str) -> Option<String> {
+    use std::process::Command;
+
+    let system_root = std::env::var("SystemRoot").ok();
+    let (program, args) = mountvol_command(mount, system_root.as_deref());
+    let output = Command::new(program).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -262,21 +323,125 @@ fn probe_volume_id(_mount: &str) -> Option<String> {
 ///
 /// Callers must treat `None` as untrusted. This function deliberately keeps no result cache:
 /// a mount path can be reused by a different card before a device refresh observes an eject.
+/// The in-flight guard is not a cache: it drops a probe only while an earlier probe of the
+/// same mount is still running, and that probe's caller has already been told `None`.
 fn resolve_volume_identity(
     path: &Path,
     resolve: impl FnOnce(String) -> Option<String> + Send + 'static,
 ) -> Option<String> {
     let mount = path.to_str()?.to_owned();
-    resolve_with_timeout(move || resolve(mount), VOLUME_ID_TIMEOUT)
+    let key = identity_probe_key(&mount);
+    resolve_identity_if_not_in_flight(&key, move || resolve(mount), VOLUME_ID_TIMEOUT)
 }
 
 /// Returns the stable identity for the volume mounted at `path`.
+///
+/// `path` must be a mount point: every platform probe requires one. `diskutil` exits non-zero
+/// for a file, `mountvol` rejects it, and `/proc/self/mounts` has no line for it. Use
+/// `file_volume_identity_resolver` for asset paths.
 ///
 /// This always performs a fresh, bounded OS probe. A replacement at the same mount path must
 /// never inherit the former volume's identity. It returns `None` when the OS cannot prove an
 /// identity or the probe fails or times out.
 pub fn volume_identity_for_path(path: &Path) -> Option<String> {
     resolve_volume_identity(path, |mount| probe_volume_id(&mount))
+}
+
+/// Returns the mount point that contains `path`, which may be a regular file.
+///
+/// `None` means the mount point could not be proven, and callers must then treat the volume
+/// identity as unknown rather than guess a root.
+#[cfg(unix)]
+pub fn mount_root_for_path(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Canonicalize first. `ancestors()` walks the path text, so a relative path or a symlinked
+    // prefix (`/tmp` -> `/private/tmp` on macOS) would otherwise be walked as written and end
+    // somewhere that is not a mount point at all.
+    let resolved = std::fs::canonicalize(path).ok()?;
+    let device = std::fs::metadata(&resolved).ok()?.dev();
+
+    let mut root = resolved.as_path();
+    for ancestor in resolved.ancestors().skip(1) {
+        match std::fs::metadata(ancestor) {
+            Ok(metadata) if metadata.dev() == device => root = ancestor,
+            // The first ancestor on a different device is the far side of a mount boundary, so
+            // the previous one is the mount point. We stop there instead of taking the highest
+            // matching ancestor overall, because a bind mount can put the same device back
+            // above a boundary and that higher directory is not this file's mount point.
+            _ => break,
+        }
+    }
+    Some(root.to_path_buf())
+}
+
+/// Windows has no `st_dev`, so "is this directory a mount point" has to be asked of the OS:
+/// walk upwards and take the first ancestor whose volume probe succeeds. That accepts a
+/// drive-letter root and a directory mount point alike.
+#[cfg(target_os = "windows")]
+pub fn mount_root_for_path(path: &Path) -> Option<PathBuf> {
+    mount_root_for_path_with(path, |candidate| {
+        probe_volume_id(&candidate.to_string_lossy()).is_some()
+    })
+}
+
+/// Split out from `mount_root_for_path` so the walk itself is testable on any host: the
+/// injected `is_mount_point` stands in for the OS acceptance test.
+#[cfg(any(target_os = "windows", test))]
+fn mount_root_for_path_with(
+    path: &Path,
+    mut is_mount_point: impl FnMut(&Path) -> bool,
+) -> Option<PathBuf> {
+    let resolved = std::path::absolute(path).ok()?;
+    // A file path is never a mount point, and probing it would only waste a subprocess, so
+    // start at the parent unless the path itself is a directory.
+    let start = if resolved.is_dir() {
+        resolved.as_path()
+    } else {
+        resolved.parent()?
+    };
+    start
+        .ancestors()
+        .find(|candidate| is_mount_point(candidate))
+        .map(Path::to_path_buf)
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+pub fn mount_root_for_path(_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Returns a resolver that maps any path — including a regular file — to the identity of the
+/// volume that holds it.
+///
+/// Each returned closure performs at most one fresh probe per distinct mount root and reuses
+/// that answer for its own lifetime only, so a 2,000-file import costs one probe per card
+/// instead of one blocking probe and one subprocess per file.
+///
+/// The memo is deliberately closure-local, and there is deliberately no static cache: a
+/// replacement card mounted at the same path must never inherit the ejected card's identity.
+/// Every new resolver therefore starts empty and re-probes.
+pub fn file_volume_identity_resolver() -> impl FnMut(&Path) -> Option<String> + Send {
+    file_volume_identity_resolver_with(mount_root_for_path, volume_identity_for_path)
+}
+
+fn file_volume_identity_resolver_with(
+    mount_root: impl Fn(&Path) -> Option<PathBuf> + Send,
+    probe: impl Fn(&Path) -> Option<String> + Send,
+) -> impl FnMut(&Path) -> Option<String> + Send {
+    let mut resolved: HashMap<PathBuf, Option<String>> = HashMap::new();
+    move |path| {
+        let root = mount_root(path)?;
+        // An unprovable identity is memoized too. Re-probing it per file would reintroduce
+        // exactly the per-file subprocess storm this resolver exists to remove, and `None`
+        // already means "refuse to act on this volume".
+        if let Some(identity) = resolved.get(&root) {
+            return identity.clone();
+        }
+        let identity = probe(&root);
+        resolved.insert(root, identity.clone());
+        identity
+    }
 }
 
 pub fn list_removable_devices() -> Vec<RemovableDevice> {
@@ -345,21 +510,48 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    use std::time::Instant;
+    use uuid::Uuid;
+
+    /// Test seam for a probe that never answers on its own.
+    ///
+    /// The probe counts itself in `starts`, signals the returned "started" receiver, then parks
+    /// in `recv()` until the test drops the returned sender. Blocking on channels the test owns
+    /// makes the timeout path the only outcome the caller can reach and lets the test wait for
+    /// facts instead of sleeping, so no assertion depends on how fast the machine is.
+    fn parked_probe<T: Send + 'static>(
+        answer: T,
+        starts: Arc<AtomicUsize>,
+    ) -> (
+        impl FnOnce() -> T + Send + 'static,
+        mpsc::Sender<()>,
+        mpsc::Receiver<()>,
+    ) {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let probe = move || {
+            starts.fetch_add(1, Ordering::SeqCst);
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            answer
+        };
+        (probe, release_tx, started_rx)
+    }
+
+    fn probe_starts() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
 
     #[test]
     fn timed_out_probe_does_not_wait_for_the_filesystem_operation() {
-        let started = Instant::now();
-        let result = run_probe_with_timeout(
-            || {
-                thread::sleep(Duration::from_millis(250));
-                true
-            },
-            Duration::from_millis(10),
-        );
+        let (probe, release, started) = parked_probe(true, probe_starts());
 
+        // The probe cannot answer while the test holds `release`, so returning at all proves
+        // the caller did not wait for the filesystem operation, and `false` is the fail-safe.
+        let result = run_probe_with_timeout(probe, Duration::from_millis(10));
         assert!(!result);
-        assert!(started.elapsed() < Duration::from_millis(100));
+
+        started.recv().expect("the probe thread ran");
+        drop(release);
     }
 
     #[test]
@@ -371,66 +563,43 @@ mod tests {
             run_probe_with_timeout_outcome(|| panic!("probe failed"), Duration::from_millis(10));
         assert_eq!(disconnected, ProbeOutcome::Disconnected);
 
-        let timed_out = run_probe_with_timeout_outcome(
-            || {
-                thread::sleep(Duration::from_millis(250));
-                true
-            },
-            Duration::from_millis(10),
-        );
+        let (probe, release, started) = parked_probe(true, probe_starts());
+        let timed_out = run_probe_with_timeout_outcome(probe, Duration::from_millis(10));
         assert_eq!(timed_out, ProbeOutcome::TimedOut);
+        started.recv().expect("the probe thread ran");
+        drop(release);
     }
 
     #[test]
     fn stalled_probe_suppresses_further_probes_of_the_same_mount() {
-        // A probe that increments `spawn_count` before blocking on `release_rx` lets us
-        // observe exactly how many probe threads were actually started, independent of how
-        // many times `probe_mount_if_not_in_flight` is called.
-        fn make_counting_probe(
-            spawn_count: Arc<AtomicUsize>,
-            release_rx: Arc<Mutex<mpsc::Receiver<()>>>,
-        ) -> impl FnOnce() -> bool {
-            move || {
-                spawn_count.fetch_add(1, Ordering::SeqCst);
-                let _ = release_rx
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .recv();
-                true
-            }
-        }
-
-        let spawn_count = Arc::new(AtomicUsize::new(0));
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let release_rx = Arc::new(Mutex::new(release_rx));
+        let starts = probe_starts();
         let key = "test-mount-stalled-probe";
 
-        // First call spawns a probe thread that blocks on `release_rx`; the 10ms timeout
-        // elapses long before it can answer, so the caller sees the fail-safe `false`.
-        let first = probe_mount_if_not_in_flight(
-            key,
-            make_counting_probe(Arc::clone(&spawn_count), Arc::clone(&release_rx)),
-            Duration::from_millis(10),
-        );
+        // First call parks a probe thread on a channel only this test can release, so the 10ms
+        // timeout is the only way out and the caller sees the fail-safe `false`.
+        let (first_probe, first_release, first_started) = parked_probe(true, Arc::clone(&starts));
+        let first = probe_mount_if_not_in_flight(key, first_probe, Duration::from_millis(10));
         assert!(!first);
 
-        // Give the spawned thread time to register itself as in-flight before probing again.
-        thread::sleep(Duration::from_millis(50));
+        // Waiting for the probe's own signal replaces a sleep: from here the first probe is
+        // provably running, so the in-flight entry it registered is provably present.
+        first_started.recv().expect("the first probe thread ran");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
 
         // Second call while the first probe is still outstanding must return the same
         // fail-safe answer without spawning another worker thread.
-        let second = probe_mount_if_not_in_flight(
-            key,
-            make_counting_probe(Arc::clone(&spawn_count), Arc::clone(&release_rx)),
-            Duration::from_millis(10),
-        );
+        let (second_probe, _second_release, second_started) =
+            parked_probe(true, Arc::clone(&starts));
+        let second = probe_mount_if_not_in_flight(key, second_probe, Duration::from_millis(10));
         assert!(!second);
-        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
+        // The second probe closure was dropped without ever running, so its start signal can
+        // never arrive — a stronger statement than a count that might still be catching up.
+        assert!(second_started.try_recv().is_err());
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
 
-        // Release the stalled probe so its thread exits and clears the in-flight entry —
+        // Release the parked probe so its thread exits and clears the in-flight entry —
         // otherwise it leaks a permanently blocked thread into the rest of the suite.
-        let _ = release_tx.send(());
-        thread::sleep(Duration::from_millis(50));
+        drop(first_release);
     }
 
     /// `removable` comes from the OS, so a removable disk is a card wherever it
@@ -497,17 +666,15 @@ mod tests {
     /// A wedged volume must not stall enumeration: an abandoned lookup reads as unknown.
     #[test]
     fn hung_identity_lookup_times_out_to_unknown() {
-        let started = Instant::now();
-        let resolved = resolve_with_timeout(
-            || {
-                thread::sleep(Duration::from_millis(250));
-                Some("late".to_string())
-            },
-            Duration::from_millis(10),
-        );
+        let (probe, release, started) = parked_probe(Some("late".to_string()), probe_starts());
 
+        // The lookup cannot answer while this test holds `release`, so an answer of `None` can
+        // only mean the caller stopped waiting for it.
+        let resolved = resolve_with_timeout(probe, Duration::from_millis(10));
         assert_eq!(resolved, None);
-        assert!(started.elapsed() < Duration::from_millis(100));
+
+        started.recv().expect("the lookup thread ran");
+        drop(release);
     }
 
     /// The one scalar we read out of `diskutil info -plist`. A volume with no UUID (many
@@ -562,5 +729,234 @@ mod tests {
             Some("\\\\?\\Volume{9a1b2c3d-0000-0000-0000-100000000000}")
         );
         assert_eq!(parse_mountvol_guid("There is no volume mounted"), None);
+    }
+
+    /// The defect this guards: every asset path went straight into a platform probe that only
+    /// accepts a mount point, so the identity was always unknown and the wipe prompt could
+    /// never confirm a volume on any platform. An asset path has to be resolved through the
+    /// mount root that contains it.
+    #[cfg(any(unix, target_os = "windows"))]
+    #[test]
+    fn file_identity_is_resolved_through_the_files_mount_root() {
+        let dir = std::env::temp_dir().join(format!("device-mount-root-{}", Uuid::new_v4()));
+        let nested = dir.join("DCIM").join("100CANON");
+        std::fs::create_dir_all(&nested).expect("temp tree");
+        let file = nested.join("IMG_0001.JPG");
+        std::fs::write(&file, b"asset").expect("temp asset");
+
+        let root = mount_root_for_path(&file).expect("a file on a mounted filesystem has a root");
+        assert!(
+            root.is_dir(),
+            "the mount root must be a directory: {root:?}"
+        );
+        assert!(
+            std::fs::canonicalize(&file)
+                .expect("canonical asset path")
+                .starts_with(&root),
+            "{root:?} must be an ancestor of the asset"
+        );
+        assert_ne!(root, file);
+
+        // Still true of the mount-point-only probe, on every platform: no OS identifies a
+        // volume from a file path. This is exactly what the import path used to ask for.
+        assert_eq!(volume_identity_for_path(&file), None);
+        // Going through the mount root gives the file the identity of the volume it lives on,
+        // which is whatever the platform proves for that mount point.
+        assert_eq!(
+            file_volume_identity_resolver()(&file),
+            volume_identity_for_path(&root)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path the filesystem cannot even stat has no provable mount root. Guessing one would
+    /// hand the caller another volume's identity.
+    #[cfg(unix)]
+    #[test]
+    fn missing_path_has_no_provable_mount_root() {
+        assert_eq!(
+            mount_root_for_path(Path::new("/nonexistent-immich-shuttle-asset.jpg")),
+            None
+        );
+    }
+
+    /// One card must cost one probe. The import path resolves an identity per selected asset,
+    /// so the old per-path probe meant one 3s-bounded blocking lookup and one `diskutil`/
+    /// `mountvol` subprocess for every file in the import.
+    #[test]
+    fn resolver_probes_each_mount_root_once() {
+        fn counting_probe(probes: Arc<AtomicUsize>) -> impl Fn(&Path) -> Option<String> + Send {
+            move |root| {
+                probes.fetch_add(1, Ordering::SeqCst);
+                Some(format!("VOL-{}", root.display()))
+            }
+        }
+
+        let probes = probe_starts();
+        let roots = |path: &Path| path.parent().map(Path::to_path_buf);
+        let mut resolve =
+            file_volume_identity_resolver_with(roots, counting_probe(Arc::clone(&probes)));
+
+        assert_eq!(
+            resolve(Path::new("/card/IMG_0001.JPG")).as_deref(),
+            Some("VOL-/card")
+        );
+        assert_eq!(
+            resolve(Path::new("/card/IMG_0002.JPG")).as_deref(),
+            Some("VOL-/card")
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        // A second mount root is a second probe: the memo is per root, never one answer for
+        // every path the resolver sees.
+        assert_eq!(
+            resolve(Path::new("/other/IMG_0003.JPG")).as_deref(),
+            Some("VOL-/other")
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+
+        // No provable mount root means unknown identity and no probe at all.
+        assert_eq!(resolve(Path::new("/")), None);
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+    }
+
+    /// The memo must not outlive its resolver. A replacement card can be mounted at the path an
+    /// ejected card used, and inheriting the old identity would let a wipe rule approved for
+    /// the ejected card select the new card's files for deletion.
+    #[test]
+    fn a_new_resolver_reprobes_a_mount_root_it_has_seen_before() {
+        fn numbering_probe(probes: Arc<AtomicUsize>) -> impl Fn(&Path) -> Option<String> + Send {
+            move |_| {
+                let call = probes.fetch_add(1, Ordering::SeqCst);
+                Some(format!("VOL-UUID-{call}"))
+            }
+        }
+
+        let probes = probe_starts();
+        let asset = Path::new("/card/IMG_0001.JPG");
+        let roots = |path: &Path| path.parent().map(Path::to_path_buf);
+
+        let mut first =
+            file_volume_identity_resolver_with(roots, numbering_probe(Arc::clone(&probes)));
+        assert_eq!(first(asset).as_deref(), Some("VOL-UUID-0"));
+        assert_eq!(first(asset).as_deref(), Some("VOL-UUID-0"));
+
+        let mut second =
+            file_volume_identity_resolver_with(roots, numbering_probe(Arc::clone(&probes)));
+        assert_eq!(second(asset).as_deref(), Some("VOL-UUID-1"));
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+    }
+
+    /// A wedged volume must stop accumulating work. `list_removable_devices` asks for an
+    /// identity for every candidate on every 2s poll, and a timed-out lookup keeps its blocked
+    /// thread and its abandoned `diskutil`/`mountvol` child, so without this guard one dead
+    /// mount leaked both on every poll, forever.
+    #[test]
+    fn wedged_identity_probe_admits_one_lookup_per_mount() {
+        let starts = probe_starts();
+        let key = identity_probe_key("/Volumes/test-wedged-identity");
+
+        let (first_probe, first_release, first_started) =
+            parked_probe(Some("late".to_string()), Arc::clone(&starts));
+        assert_eq!(
+            resolve_identity_if_not_in_flight(&key, first_probe, Duration::from_millis(10)),
+            None
+        );
+        first_started.recv().expect("the first lookup ran");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        let (second_probe, _second_release, second_started) =
+            parked_probe(Some("later".to_string()), Arc::clone(&starts));
+        assert_eq!(
+            resolve_identity_if_not_in_flight(&key, second_probe, Duration::from_millis(10)),
+            None
+        );
+        // The second lookup closure was dropped without running: no second thread, no second
+        // subprocess, and the answer is the same fail-safe unknown.
+        assert!(second_started.try_recv().is_err());
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        drop(first_release);
+    }
+
+    /// A DCIM probe and an identity probe of the same mount answer different questions, and
+    /// `list_removable_devices` runs both on the same tick. Sharing one in-flight key would
+    /// make a slow DCIM probe report the card's identity as unknown.
+    #[test]
+    fn a_stalled_dcim_probe_does_not_suppress_the_identity_probe() {
+        let mount = "/Volumes/test-probe-key-namespace";
+        let starts = probe_starts();
+
+        let (dcim_probe, dcim_release, dcim_started) = parked_probe(true, Arc::clone(&starts));
+        assert!(!probe_mount_if_not_in_flight(
+            &dcim_probe_key(mount),
+            dcim_probe,
+            Duration::from_millis(10)
+        ));
+        dcim_started.recv().expect("the dcim probe ran");
+
+        let identity = resolve_identity_if_not_in_flight(
+            &identity_probe_key(mount),
+            || Some("VOL-UUID-1".to_string()),
+            VOLUME_ID_TIMEOUT,
+        );
+        assert_eq!(identity.as_deref(), Some("VOL-UUID-1"));
+
+        drop(dcim_release);
+    }
+
+    /// The mount path comes from the OS. Running it through `cmd /C` let a volume mounted at a
+    /// directory named `SD & calc` execute the suffix as a command under the app account.
+    #[test]
+    fn mountvol_probe_argv_has_no_shell_and_exactly_one_path() {
+        let (program, args) = mountvol_command(r"C:\mnt\SD & CARD", Some(r"D:\WINNT"));
+
+        assert_eq!(program, PathBuf::from(r"D:\WINNT\System32\mountvol.exe"));
+        assert_eq!(
+            args,
+            vec![r"C:\mnt\SD & CARD\".to_string(), "/L".to_string()]
+        );
+        assert!(!args.iter().any(|arg| arg.eq_ignore_ascii_case("/c")));
+        assert!(!program.to_string_lossy().contains("cmd"));
+
+        // An absent `SystemRoot` falls back to the default install path instead of resolving
+        // `mountvol.exe` through `PATH`, where anything earlier on the path would win.
+        let (fallback, args) = mountvol_command(r"C:\mnt\SD & CARD\", None);
+        assert_eq!(fallback, PathBuf::from(r"C:\Windows\System32\mountvol.exe"));
+        // The trailing separator `mountvol` requires is added once, never doubled.
+        assert_eq!(args[0], r"C:\mnt\SD & CARD\");
+    }
+
+    /// The Windows mount-root walk has no `st_dev` to compare, so it asks the OS which ancestor
+    /// is a mount point. Driving that walk through an injected acceptance test keeps it covered
+    /// on every platform instead of only on Windows hardware.
+    #[test]
+    fn mount_root_walk_takes_the_first_ancestor_the_os_accepts() {
+        let dir = std::env::temp_dir().join(format!("device-mount-walk-{}", Uuid::new_v4()));
+        let nested = dir.join("DCIM");
+        std::fs::create_dir_all(&nested).expect("temp tree");
+        let file = nested.join("IMG_0001.JPG");
+        std::fs::write(&file, b"asset").expect("temp asset");
+
+        let mut asked: Vec<PathBuf> = Vec::new();
+        let root = mount_root_for_path_with(&file, |candidate| {
+            asked.push(candidate.to_path_buf());
+            candidate == dir.as_path()
+        });
+        assert_eq!(root.as_deref(), Some(dir.as_path()));
+        // The file itself is never offered as a mount point: no OS accepts a file, so probing
+        // it would only spend a subprocess to be told no.
+        assert_eq!(asked.first().map(PathBuf::as_path), Some(nested.as_path()));
+
+        // A directory that is itself the mount point resolves to itself.
+        assert_eq!(
+            mount_root_for_path_with(&dir, |candidate| candidate == dir.as_path()).as_deref(),
+            Some(dir.as_path())
+        );
+        // No ancestor accepted means nothing proven, so the identity stays unknown.
+        assert_eq!(mount_root_for_path_with(&file, |_| false), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

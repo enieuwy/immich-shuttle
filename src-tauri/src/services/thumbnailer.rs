@@ -1353,14 +1353,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("immich_shuttle_prune_{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
 
-        // Five 1 KiB files written oldest-first; a short gap between writes keeps
-        // their mtimes strictly ordered (filesystem mtime resolution is sub-ms).
+        // Five 1 KiB files whose modification times are pinned explicitly,
+        // oldest first. Eviction order is exactly what this test asserts, and
+        // the production sweep orders by mtime, so the fixture ordering must
+        // not depend on write speed or on the filesystem's timestamp
+        // resolution: two equal mtimes would leave the unspecified `read_dir`
+        // order deciding which files survive.
         let mut paths = Vec::new();
         for i in 0..5u64 {
             let p = dir.join(format!("t{i}.jpg"));
             fs::write(&p, vec![0u8; 1024]).unwrap();
+            fs::File::open(&p)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + i * 60))
+                .unwrap();
             paths.push(p);
-            std::thread::sleep(std::time::Duration::from_millis(15));
         }
 
         // Budget of 2.5 KiB must leave the two newest (t3, t4) and drop t0..t2.

@@ -148,8 +148,24 @@ pub fn rotate_recent_logs(max_files: usize) -> Result<(), String> {
 mod tests {
     use super::{rotate_dir, tail_lines, trim_to_trailing_lines};
     use std::io::Write;
-    use std::{fs, thread, time::Duration};
+    use std::{
+        fs,
+        path::Path,
+        time::{Duration, SystemTime},
+    };
     use uuid::Uuid;
+
+    /// Pins a fixture's modification time. Rotation orders by `modified()`, so
+    /// the age order a test asserts on must be stated outright: writing the
+    /// files in sequence only orders them when the filesystem's timestamp
+    /// resolution is finer than the gap between the writes, and tied keys leave
+    /// the unspecified `read_dir` order deciding which files rotation deletes.
+    fn set_mtime(path: &Path, seconds_from_epoch: u64) {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds_from_epoch))
+            .unwrap();
+    }
 
     #[test]
     fn tail_lines_returns_recent_lines() {
@@ -232,18 +248,19 @@ mod tests {
         // Written first, so an age-ordered sweep would reach these before any
         // run log: none of them is ours to delete.
         let bystanders = ["app.log", "notes.txt", "crash.log", ".DS_Store"];
-        for name in bystanders {
+        for (index, name) in bystanders.iter().enumerate() {
             fs::write(dir.join(name), format!("{name} content\n")).unwrap();
+            set_mtime(&dir.join(name), 1_700_000_000 + index as u64);
         }
         // Malformed: the run-log shape without a canonical uuid, so not ours.
         fs::write(dir.join("run-upload.log"), "hand-written\n").unwrap();
-        thread::sleep(Duration::from_millis(5));
+        set_mtime(&dir.join("run-upload.log"), 1_700_000_100);
 
         let run_logs: Vec<String> = (0..5)
             .map(|index| {
                 let name = format!("run-{}.log", Uuid::new_v4());
                 fs::write(dir.join(&name), format!("run {index}\n")).unwrap();
-                thread::sleep(Duration::from_millis(5));
+                set_mtime(&dir.join(&name), 1_700_000_200 + index as u64 * 60);
                 name
             })
             .collect();

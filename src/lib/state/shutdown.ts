@@ -83,10 +83,9 @@ export type ShutdownDeps = {
  * failure — it means the import finished on its own while the user considered
  * the native quit confirmation, after the caller took its job snapshot.
  * `awaitTerminal` runs over a superset of the cancelled ids and re-checks the
- * real condition, so this case is safe to ignore. A missing job is also
- * terminal: the backend cannot await work that it has already removed. Any
- * OTHER rejection (lock failure, timeout, unknown job) means cancellation may
- * not have taken effect and must still block the close.
+ * real condition, so this case is safe to ignore. Any OTHER rejection (lock
+ * failure, timeout) means cancellation may not have taken effect and must still
+ * block the close.
  *
  * `IMPORT_NOT_RUNNING` is the same race one step narrower. `import_cancel`
  * reads the job status and then looks up the live worker in a SEPARATE critical
@@ -94,10 +93,19 @@ export type ShutdownDeps = {
  * with no cancel flag to raise. Nothing is left to stop, and `awaitTerminal`
  * still proves the id terminal, so refusing the quit here would strand the user
  * behind an import that has already stopped.
+ *
+ * `JOB_NOT_FOUND` is the same race at its widest: the job was evicted from the
+ * registry between the snapshot this shutdown took and the cancel it sent. The
+ * backend cannot run a worker it no longer has a job for, so there is nothing
+ * left to stop -- and `awaitTerminal` rejects the same way for the same id, a
+ * case shutdown already reads as terminal. Refusing here would report an
+ * incomplete shutdown for work that no longer exists.
  */
 function isAlreadyTerminal(reason: unknown): boolean {
   return (
-    isBackendError(reason, "TERMINAL_CANCEL") || isBackendError(reason, "IMPORT_NOT_RUNNING")
+    isBackendError(reason, "TERMINAL_CANCEL") ||
+    isBackendError(reason, "IMPORT_NOT_RUNNING") ||
+    isBackendError(reason, "JOB_NOT_FOUND")
   );
 }
 
