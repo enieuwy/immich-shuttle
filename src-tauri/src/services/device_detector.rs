@@ -444,6 +444,18 @@ fn file_volume_identity_resolver_with(
     }
 }
 
+/// The production resolver with only its identity probe replaced: the mount-root
+/// step, which is the part a wipe candidate depends on, stays real. A test can
+/// therefore prove WHICH path the probe is asked about without depending on the
+/// host having a provable volume id for its temp directory — a CI container's
+/// root filesystem usually has none.
+#[cfg(test)]
+pub(crate) fn file_volume_identity_resolver_probing(
+    probe: impl Fn(&Path) -> Option<String> + Send,
+) -> impl FnMut(&Path) -> Option<String> + Send {
+    file_volume_identity_resolver_with(mount_root_for_path, probe)
+}
+
 pub fn list_removable_devices() -> Vec<RemovableDevice> {
     let disks = Disks::new_with_refreshed_list();
     let candidates = disks

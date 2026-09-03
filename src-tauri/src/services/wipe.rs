@@ -225,12 +225,18 @@ impl Unprovable {
     }
 }
 
-/// A file the server confirmed it holds, paired with the identity that was
-/// hashed. Deletion is conditional on the identity still matching.
+/// A file the server confirmed it holds, paired with the checksum the server
+/// answered for and the identity that was hashed. Deletion is conditional on
+/// the bytes at the path STILL hashing to `checksum`, with the identity as a
+/// cheap first filter.
 #[derive(Debug, Clone)]
 pub struct VerifiedFile {
     pub path: String,
     pub identity: FileIdentity,
+    /// The SHA-1 the server confirmed. Re-computed immediately before the
+    /// delete: it is the only field that proves the CONTENTS, rather than
+    /// proving that a path still resolves to the same filesystem record.
+    pub checksum: String,
 }
 
 /// A trash handle configured to avoid extra OS permission prompts. On macOS the
@@ -257,15 +263,21 @@ fn trash_context() -> trash::TrashContext {
 /// upstream. This prevents an allowlist from silently stranding media the
 /// server already holds and reporting the upload as skipped.
 ///
-/// Every file is re-stat'd immediately before deletion and kept unless its
-/// identity still provably matches what was hashed for the server check — the
-/// stat and the delete are deliberately adjacent so the window a concurrent
-/// writer could slip into is as small as the loop body. A file that is kept is
-/// reported as `changed` only when the re-stat PROVES it differs; when the
-/// identity merely became unprovable (a remount, an unreadable stat) it is
-/// reported as `unprovable`, because telling the user their files changed when
-/// they only reconnected the card sends them looking for a problem that is not
-/// there.
+/// Every file is re-stat'd and then re-hashed immediately before deletion, and
+/// is kept unless the bytes at the path still hash to the checksum the server
+/// confirmed. The stat is the cheap filter — a length, mtime, or record change
+/// is positive proof without reading the file — and the hash is the
+/// authorization: metadata identity alone can be forged by a same-length,
+/// same-mtime replacement that reuses the inode, which ext4 hands out again
+/// for a file recreated in the same directory. Only the content proof makes
+/// the delete safe on every filesystem, and it is safe by definition: the
+/// server holds bytes with exactly that checksum.
+///
+/// A file that is kept is reported as `changed` only when the re-check PROVES
+/// it differs; when identity merely became unprovable (a remount, an
+/// unreadable stat, a read that failed) it is reported as `unprovable`,
+/// because telling the user their files changed when they only reconnected the
+/// card sends them looking for a problem that is not there.
 pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
     let trash = trash_context();
     let mut result = WipeResult {
@@ -285,8 +297,8 @@ pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
             continue;
         }
 
-        // Identity check last, so it is the most recent observation before the
-        // delete.
+        // Both re-checks sit immediately before the delete, so the window a
+        // concurrent writer could slip into is the loop body.
         let outcome = match fs::metadata(path) {
             Ok(metadata) => file.identity.check(&FileIdentity::of(&metadata)),
             // A stat that fails says nothing about the file's contents, so this
@@ -316,6 +328,34 @@ pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
                 result
                     .errors
                     .push(format!("Kept {}: {}", path.display(), reason.explain()));
+                continue;
+            }
+        }
+
+        // The authorization. `hash_file` reads and stats through ONE handle, so
+        // a replacement swapped in between this read and the stat cannot look
+        // like the verified file. A checksum that still matches makes the
+        // delete safe whatever the metadata says: the server holds these exact
+        // bytes.
+        match hash_file(&file.path) {
+            Ok((checksum, _)) if checksum == file.checksum => {}
+            Ok(_) => {
+                result.changed += 1;
+                result.errors.push(format!(
+                    "Kept {}: the file changed after it was verified on the server.",
+                    path.display()
+                ));
+                continue;
+            }
+            // A read that fails proves nothing about the contents, so this is
+            // lost proof rather than an observed change. Same outcome: keep.
+            Err(err) => {
+                result.unprovable += 1;
+                result.errors.push(format!(
+                    "Kept {}: could not re-read the file to prove it is the verified one \
+                     ({err}). Nothing was deleted — run the verify step again to re-check it.",
+                    path.display()
+                ));
                 continue;
             }
         }
@@ -431,9 +471,13 @@ pub async fn verify_uploaded(
     let present = client.bulk_upload_check(&checksums).await?.confirmed_live;
 
     let mut confirmed: Vec<VerifiedFile> = Vec::new();
-    for (index, ((path, _), identity)) in to_check.into_iter().zip(identities).enumerate() {
+    for (index, ((path, checksum), identity)) in to_check.into_iter().zip(identities).enumerate() {
         if present.contains(&index) {
-            confirmed.push(VerifiedFile { path, identity });
+            confirmed.push(VerifiedFile {
+                path,
+                identity,
+                checksum,
+            });
         } else {
             unverified.push(path);
         }
@@ -545,8 +589,8 @@ fn partition_present(total: usize, present: &std::collections::HashSet<usize>) -
 #[cfg(test)]
 mod tests {
     use super::{
-        file_record, hash_file, hash_forecast_files, partition_present, wipe_files, FileIdentity,
-        FileRecordId, IdentityCheck, Unprovable, VerifiedFile,
+        hash_file, hash_forecast_files, partition_present, wipe_files, FileIdentity, FileRecordId,
+        IdentityCheck, Unprovable, VerifiedFile,
     };
     use std::{
         fs,
@@ -566,16 +610,21 @@ mod tests {
     }
 
     /// A file as the wipe worker would receive it: verified against the server
-    /// with the identity captured at hash time.
+    /// with the checksum the server answered for and the identity captured at
+    /// hash time.
     fn verified(path: &Path) -> VerifiedFile {
-        let (_, identity) = hash_file(path.to_str().expect("path")).expect("hash");
+        let (checksum, identity) = hash_file(path.to_str().expect("path")).expect("hash");
         VerifiedFile {
             path: path.to_string_lossy().to_string(),
             identity,
+            checksum,
         }
     }
 
-    /// A file whose recorded identity cannot match anything on disk.
+    /// A file whose recorded identity cannot match anything on disk. The
+    /// checksum is a placeholder: this helper is used where the identity gate
+    /// (or a missing path) decides the outcome before any byte is read, and it
+    /// must work for a path that does not exist.
     fn verified_with_stale_identity(path: &Path) -> VerifiedFile {
         VerifiedFile {
             path: path.to_string_lossy().to_string(),
@@ -584,6 +633,7 @@ mod tests {
                 modified: None,
                 record: None,
             },
+            checksum: "0".repeat(40),
         }
     }
 
@@ -799,8 +849,12 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// A path that was unlinked and recreated names a different file, even when
-    /// the replacement matches the verified length and its mtime is restored.
+    /// A path that was unlinked and recreated is not the verified file, even
+    /// when the replacement matches the verified length and its mtime is
+    /// restored. The test states no premise about the inode: whether a
+    /// recreated file gets a fresh record is the filesystem's choice — APFS
+    /// hands out a new one, ext4 hands the old one straight back — so the
+    /// authorization cannot rest on it.
     #[test]
     fn keeps_a_replacement_file_with_the_same_length_and_mtime() {
         let path = temp_file("replaced-record", "jpg");
@@ -818,17 +872,49 @@ mod tests {
             replacement.modified().ok(),
             "test premise: length and mtime are indistinguishable"
         );
-        assert_ne!(
-            file.identity.record,
-            file_record(&replacement),
-            "test premise: only the file record gives the replacement away"
-        );
 
         let result = wipe_files(&[file]);
 
         assert_eq!(result.changed, 1, "a replacement is not the verified file");
         assert_eq!(result.deleted, 0);
         assert!(path.exists(), "the replacement must stay on disk");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The case the metadata check cannot see, pinned without depending on the
+    /// filesystem to reuse an inode: the recorded identity is taken from the
+    /// REPLACEMENT, so length, mtime, and file record all match exactly and
+    /// only the checksum is still the original's. This is what ext4 produces
+    /// for a same-size, mtime-restored recreate, and it must not delete.
+    #[test]
+    fn keeps_a_replacement_whose_whole_identity_matches_the_verified_file() {
+        let path = temp_file("record-reused", "jpg");
+        fs::write(&path, b"original").expect("write original");
+        let original = verified(&path);
+
+        fs::write(&path, b"replaced").expect("rewrite with the same length");
+        let mut file = verified(&path);
+        file.checksum = original.checksum.clone();
+        assert_eq!(
+            file.identity,
+            FileIdentity::of(&fs::metadata(&path).expect("stat")),
+            "test premise: every metadata field the check reads matches"
+        );
+        assert_ne!(
+            file.checksum,
+            hash_file(path.to_str().expect("path")).expect("hash").0,
+            "test premise: the bytes are not the ones the server confirmed"
+        );
+
+        let result = wipe_files(&[file]);
+
+        assert_eq!(
+            result.changed, 1,
+            "matching metadata is not proof of matching contents"
+        );
+        assert_eq!(result.deleted, 0);
+        assert!(path.exists());
 
         let _ = fs::remove_file(&path);
     }

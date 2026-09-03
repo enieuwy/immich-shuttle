@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.8.1 - 2026-09-03
+
+### Safety
+- **A deleted original is now proved by its contents, not by its metadata.** The last check before an original was moved to the Trash compared its length, modification time, and file record. On ext4 — the usual Linux filesystem — a file recreated in a directory is handed its predecessor's record straight back, so a same-length replacement whose timestamp was restored could match every field the check reads and be deleted even though the server had only ever confirmed the previous bytes. The app now re-reads each file immediately before deleting it and requires the checksum the server answered for. That costs one extra read of every file that is about to be deleted, on the delete path only, and it holds on every filesystem rather than on the ones that happen to issue a fresh record.
+
+### Maintenance
+- **Two tests described the host rather than the app.** One needed the temporary directory to sit on a filesystem with a volume id, which a Linux CI container's root filesystem does not have; the other needed a recreated file to receive a new record, which ext4 does not do. Both now pin the invariant itself, and the Linux test job passes.
+
 ## v0.8.0 - 2026-09-03
 
 An audit of the import, delete-after-import, and profile paths. Everything below is a fix.

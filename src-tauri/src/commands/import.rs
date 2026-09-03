@@ -5999,6 +5999,11 @@ mod tests {
     /// MOUNT-QUESTION: `volume_identity_for_path` answers only for a mount
     /// POINT, and every wipe candidate is a FILE, so asking it directly could
     /// never prove anything and delete-after-import could never store a prompt.
+    ///
+    /// The probe is recorded rather than real: whether this host's temp
+    /// filesystem HAS a volume id is not the invariant — a CI container's root
+    /// filesystem has none — and the mount-root step under test is production
+    /// code either way.
     #[test]
     fn wipe_candidates_are_asked_about_their_mount_not_their_own_path() {
         let _script = volume_script_guard();
@@ -6013,9 +6018,32 @@ mod tests {
             snapshot_wipe_volumes(&paths, device_detector::volume_identity_for_path).is_err(),
             "a file path is not a mount point, so the old question can never be answered"
         );
-        let volumes = snapshot_wipe_volumes(&paths, wipe_volume_identities())
-            .expect("the containing mount does have an identity");
+
+        let asked: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&asked);
+        let volumes = snapshot_wipe_volumes(
+            &paths,
+            device_detector::file_volume_identity_resolver_probing(move |mount: &Path| {
+                recorder
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(mount.to_path_buf());
+                Some("volume-id".to_string())
+            }),
+        )
+        .expect("the mount question can be answered");
         assert_eq!(volumes.len(), 1);
+
+        let asked = asked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(asked.len(), 1, "one probe per mount, not one per file");
+        assert_ne!(asked[0], photo, "the file itself is never the question");
+        assert!(
+            photo.starts_with(&asked[0]),
+            "the question must name a mount the file lives under, not {:?}",
+            asked[0]
+        );
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }
