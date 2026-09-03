@@ -104,16 +104,28 @@ fn trim_to_trailing_lines(path: &std::path::Path, keep: usize) -> Result<(), Str
     fs::write(path, trimmed).map_err(|e| format!("Could not trim log file: {e}"))
 }
 
+/// Exactly the per-run log files this app writes: `run-<canonical UUID>.log`.
+///
+/// The logs directory is user-visible — the UI opens it in the file manager —
+/// so deletion must be provably scoped to our own artifacts. Startup pruning
+/// and rotation both delete by this one predicate: anything else in that
+/// directory belongs to the user, and never enters a retention budget either.
+pub(crate) fn is_run_log_name(name: &str) -> bool {
+    name.strip_prefix("run-")
+        .and_then(|name| name.strip_suffix(".log"))
+        .is_some_and(crate::is_canonical_uuid)
+}
+
 // Keep directory traversal separate from `logs_dir()` so tests can rotate an isolated directory.
 fn rotate_dir(dir: &Path, max_files: usize) -> Result<(), String> {
     let mut entries = fs::read_dir(dir)
         .map_err(|e| format!("Could not list logs directory: {e}"))?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().is_file())
-        // Never rotate away the persistent app log. Rotation is meant to cap the
-        // per-run `run-<job>.log` files; app.log is the single durable log the
-        // UI reads and must survive regardless of its relative age.
-        .filter(|entry| entry.file_name().to_string_lossy() != "app.log")
+        // Rotation caps the per-run logs only. app.log is the single durable log
+        // the UI reads and must survive regardless of its relative age, and an
+        // unrelated file is not ours to delete at all.
+        .filter(|entry| is_run_log_name(&entry.file_name().to_string_lossy()))
         .collect::<Vec<_>>();
 
     entries.sort_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok());
@@ -208,33 +220,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Users can always read the durable app log after rotation, while only the newest run logs remain.
+    // Rotation deletes only this app's own oldest run logs. The logs directory is
+    // user-visible, so app.log, a user's own files, and anything whose name we
+    // cannot prove we wrote must survive - and must not consume the budget that
+    // decides how many real run logs are kept.
     #[test]
-    fn log_rotation_keeps_durable_app_log_and_newest_run_logs() {
+    fn log_rotation_only_removes_this_apps_oldest_run_logs() {
         let dir = std::env::temp_dir().join(format!("logs-rotate-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
 
-        let app_log = dir.join("app.log");
-        fs::write(&app_log, "durable app log\n").unwrap();
+        // Written first, so an age-ordered sweep would reach these before any
+        // run log: none of them is ours to delete.
+        let bystanders = ["app.log", "notes.txt", "crash.log", ".DS_Store"];
+        for name in bystanders {
+            fs::write(dir.join(name), format!("{name} content\n")).unwrap();
+        }
+        // Malformed: the run-log shape without a canonical uuid, so not ours.
+        fs::write(dir.join("run-upload.log"), "hand-written\n").unwrap();
         thread::sleep(Duration::from_millis(5));
 
-        for run_number in 1..=3 {
-            fs::write(
-                dir.join(format!("run-{run_number}.log")),
-                format!("run {run_number}\n"),
-            )
-            .unwrap();
-            if run_number < 3 {
+        let run_logs: Vec<String> = (0..5)
+            .map(|index| {
+                let name = format!("run-{}.log", Uuid::new_v4());
+                fs::write(dir.join(&name), format!("run {index}\n")).unwrap();
                 thread::sleep(Duration::from_millis(5));
-            }
-        }
+                name
+            })
+            .collect();
 
         rotate_dir(&dir, 2).unwrap();
 
-        assert!(app_log.exists());
-        assert!(!dir.join("run-1.log").exists());
-        assert!(dir.join("run-2.log").exists());
-        assert!(dir.join("run-3.log").exists());
+        for name in bystanders {
+            assert!(dir.join(name).exists(), "{name} must survive rotation");
+        }
+        assert!(dir.join("run-upload.log").exists());
+        for name in &run_logs[..3] {
+            assert!(!dir.join(name).exists(), "{name} is the oldest and must go");
+        }
+        for name in &run_logs[3..] {
+            assert!(dir.join(name).exists(), "{name} is newest and must stay");
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

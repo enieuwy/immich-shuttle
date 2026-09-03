@@ -21,13 +21,51 @@ use crate::services::staging::acquire_dir_lock;
 
 use crate::services::stdout_parser::{ProgressAccumulator, RunProgress};
 
-#[derive(Debug, Clone, Default)]
-pub struct SidecarResult {
-    /// stderr lines emitted by immich-go (diagnostics for a failed run).
-    pub error_lines: Vec<String>,
-    /// Whether immich-go exited with a non-zero status.
-    pub exit_nonzero: bool,
+/// Whether the sidecar's exit status was actually observed.
+///
+/// A lost termination event is NOT a clean exit. The plugin's `Terminated`
+/// event is the only proof that the process was reaped, so its absence leaves
+/// the run unproven. `Unknown` must never be read as success: doing so
+/// published an interrupted run as a completed one and let the incremental
+/// checkpoint advance its date floor past source media the run never
+/// processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// The process exited and the exit status was observed.
+    Exited { success: bool },
+    /// Termination was never confirmed: the event channel closed without a
+    /// termination event, or a kill was requested and could not be confirmed.
+    Unknown,
 }
+
+#[derive(Debug, Clone)]
+pub struct SidecarResult {
+    pub error_lines: Vec<String>,
+    pub outcome: RunOutcome,
+}
+
+/// A sidecar result that did not establish process termination.
+///
+/// The caller keeps the source admission lease for this process session when
+/// this variant occurs. A sidecar without a confirmed reap may still read staged
+/// files or upload originals, so it cannot be treated as a normal cancellation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunUploadError {
+    Cancelled,
+    UnconfirmedTermination(String),
+    Other(String),
+}
+
+impl std::fmt::Display for RunUploadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("Cancelled by user"),
+            Self::UnconfirmedTermination(error) | Self::Other(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for RunUploadError {}
 
 /// Keep enough stderr context to diagnose a failed run without retaining an
 /// unbounded stream from a noisy sidecar.
@@ -263,25 +301,72 @@ fn emit_progress(
     );
 }
 
+/// The sidecar control handle the run loop needs: a one-shot kill.
+///
+/// `CommandChild::kill` CONSUMES the handle and the plugin installs no killing
+/// `Drop`, so a failed kill leaves nothing to retry with — which is exactly
+/// why a kill error can never be read as confirmed termination.
+///
+/// The loop is generic over this trait for one reason: `CommandChild` has no
+/// public constructor, so the failed-kill and lost-termination paths are
+/// otherwise unreachable from a test. Production always wires it to
+/// `CommandChild`, unchanged.
+trait KillHandle {
+    fn kill(self) -> Result<(), String>;
+}
+
+impl KillHandle for CommandChild {
+    fn kill(self) -> Result<(), String> {
+        CommandChild::kill(self).map_err(|error| format!("could not kill sidecar: {error}"))
+    }
+}
+
+/// What waiting on the sidecar's lifecycle events established.
+#[derive(Debug)]
+enum ReapOutcome {
+    /// A `Terminated` event arrived, so the plugin's background waiter reaped
+    /// the process. `note` carries a kill error that the later termination
+    /// explained away — the process had already exited on its own.
+    Confirmed { note: Option<String> },
+    /// Termination was never observed, so the sidecar may still be uploading.
+    /// The caller must not treat the run as cleanly finished.
+    Unconfirmed { diagnostic: String },
+}
+
+/// The whole reap — the kill attempt included — is bounded by this deadline.
+/// The plugin emits `Terminated` as soon as its background waiter's `wait()`
+/// returns, so five seconds is far longer than a signalled process needs to be
+/// reaped. A kill error does not earn a longer wait: such a process may never
+/// exit at all, and an unbounded wait would hang cancellation and app
+/// shutdown instead of reporting the run as unproven.
+const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Stop a sidecar and wait for the plugin's background waiter to confirm that
 /// it reaped the process. `CommandChild` exposes no `wait`; its `Terminated`
 /// event is the lifecycle acknowledgement. If the event channel closes, the
 /// plugin API provides no way to positively confirm termination.
 ///
+/// A kill error does NOT end the wait. The kill consumed the handle, so the
+/// error means either "already exited" or "still running and unsignalled", and
+/// only a `Terminated` event tells the two apart. Returning on the error let
+/// the caller finalize the run — wiping the staging tree and admitting a retry
+/// — while immich-go could still be uploading.
+///
 /// The timeout and event-error paths remain distinct because they provide
 /// different evidence about the sidecar lifecycle.
-async fn kill_and_reap(
-    child: &mut Option<CommandChild>,
+async fn kill_and_reap<K: KillHandle>(
+    child: &mut Option<K>,
     rx: &mut Receiver<CommandEvent>,
-) -> Result<(), String> {
+) -> ReapOutcome {
     let Some(running_child) = child.take() else {
-        return Ok(());
+        // No handle left: the only path that takes it is a `Terminated` event
+        // that was already observed, so termination is already confirmed.
+        return ReapOutcome::Confirmed { note: None };
     };
-    running_child
-        .kill()
-        .map_err(|error| format!("could not kill sidecar: {error}"))?;
+    // Kept, not propagated: the wait below decides what the error meant.
+    let kill_error = running_child.kill().err();
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let terminated = tokio::time::timeout(REAP_TIMEOUT, async {
         let mut event_error = None;
         while let Some(event) = rx.recv().await {
             match event {
@@ -293,14 +378,31 @@ async fn kill_and_reap(
 
         Err(match event_error {
             Some(error) => format!("sidecar failed while waiting to terminate: {error}"),
-            None => {
-                "sidecar kill issued, but termination could not be confirmed because the event channel closed"
-                    .to_string()
-            }
+            None => "sidecar termination could not be confirmed because the event channel closed"
+                .to_string(),
         })
     })
     .await
-    .map_err(|_| "timed out waiting for sidecar termination after kill".to_string())?
+    .unwrap_or_else(|_| Err("timed out waiting for sidecar termination after kill".to_string()));
+
+    match terminated {
+        Ok(()) => ReapOutcome::Confirmed { note: kill_error },
+        Err(reason) => ReapOutcome::Unconfirmed {
+            diagnostic: match kill_error {
+                Some(kill_error) => format!("{kill_error}; {reason}"),
+                None => reason,
+            },
+        },
+    }
+}
+
+/// Collapse a reap into the single diagnostic line a caller reports, so the
+/// kill error a confirmed termination explained away is still recorded.
+fn reap_diagnostic(outcome: ReapOutcome) -> Option<String> {
+    match outcome {
+        ReapOutcome::Confirmed { note } => note,
+        ReapOutcome::Unconfirmed { diagnostic } => Some(diagnostic),
+    }
 }
 
 /// Build the immich-go `upload from-folder` argument vector for a run. Pure (no
@@ -419,61 +521,66 @@ fn build_upload_args(request: &UploadRequest, config_path: &Path) -> Vec<String>
     args
 }
 
-pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<SidecarResult, String> {
-    let config = write_api_key_config(&request.api_key)?;
-    // Pre-create the run log 0600 so immich-go's --log-file output (which can
-    // carry an x-api-key header) is not world-readable on shared machines.
-    create_private_log(&request.log_path)?;
-    let args = build_upload_args(&request, &config.path);
-
-    let sidecar = app
-        .shell()
-        .sidecar("immich-go")
-        .map_err(|e| format!("Could not prepare immich-go sidecar: {e}"))?
-        .env("GODEBUG", "netdns=cgo")
-        .args(args);
-
-    let (mut rx, child) = sidecar
-        .spawn()
-        .map_err(|e| format!("Could not spawn immich-go sidecar: {e}"))?;
-    let mut child = Some(child);
-
+/// Drive one sidecar run to completion: fold lifecycle events, poll the run log
+/// on a fixed cadence, and report progress through `emit`.
+///
+/// Split out of `run_upload` (which supplies the plugin's receiver and child,
+/// plus an emitter bound to the `AppHandle`) purely as a test seam: neither
+/// `CommandChild` nor `AppHandle` can be constructed here, so the
+/// lost-termination and failed-kill paths were otherwise unreachable. The
+/// production wiring and behaviour are unchanged.
+async fn drive_run<K, E>(
+    rx: &mut Receiver<CommandEvent>,
+    child: &mut Option<K>,
+    cancel_flag: &AtomicBool,
+    progress: &mut ProgressReader,
+    mut emit: E,
+) -> Result<SidecarResult, RunUploadError>
+where
+    K: KillHandle,
+    E: FnMut(&crate::models::job::JobProgress, Option<&str>),
+{
     let mut error_lines = StderrBuffer::new();
-    // immich-go's --no-ui stdout is a `\r`-refreshed aggregate that never
-    // line-flushes through the pipe, so progress is polled from the run log
-    // (append-only, written in real time) on a fixed cadence instead. The reader
-    // parses only newly-appended bytes each tick.
-    let mut progress =
-        ProgressReader::new(request.log_path.clone(), request.log_source_roots.clone());
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let exit_nonzero = loop {
-        if request.cancel_flag.load(Ordering::Relaxed) {
-            kill_and_reap(&mut child, &mut rx)
-                .await
-                .map_err(|error| format!("Could not cancel immich-go sidecar: {error}"))?;
-            return Err("Cancelled by user".to_string());
+    let outcome = loop {
+        if cancel_flag.load(Ordering::Relaxed) {
+            // An unconfirmed reap is not a cancelled run: the sidecar may still
+            // be uploading, so it must surface as an error rather than as the
+            // orderly cancellation the caller cleans up after.
+            if let ReapOutcome::Unconfirmed { diagnostic } = kill_and_reap(child, rx).await {
+                return Err(RunUploadError::UnconfirmedTermination(format!(
+                    "Could not cancel immich-go sidecar: {diagnostic}"
+                )));
+            }
+            return Err(RunUploadError::Cancelled);
         }
 
         tokio::select! {
             _ = ticker.tick() => {
                 let (snapshot, current_path) = progress.poll();
-                emit_progress(&app, &request.job_id, &snapshot, current_path);
+                emit(&snapshot, current_path);
             }
             maybe_event = rx.recv() => {
                 match maybe_event {
                     None => {
-                        // A closed channel gives no exit code, so let the completed
-                        // run log decide the verdict rather than failing a run whose
-                        // upload may have finished. The reap diagnostic is recorded
-                        // as a stderr line so it reaches the failure message and the
-                        // run log through the same path as immich-go's own output.
-                        let reap_error = kill_and_reap(&mut child, &mut rx).await.err();
-                        error_lines.push(&reap_error.unwrap_or_else(|| {
+                        // A closed channel yields no exit status, and the plugin
+                        // offers no other proof that the process was reaped, so
+                        // the run is unproven rather than clean. Reporting
+                        // `Unknown` (instead of the `false` a clean exit
+                        // produces) keeps the caller from publishing an
+                        // interrupted run as complete and from advancing the
+                        // incremental checkpoint past media it never processed.
+                        // Partial tallies still stand for diagnosis, and the
+                        // reap diagnostic is recorded as a stderr line so it
+                        // reaches the failure message and the run log through
+                        // the same path as immich-go's own output.
+                        let diagnostic = reap_diagnostic(kill_and_reap(child, rx).await);
+                        error_lines.push(&diagnostic.unwrap_or_else(|| {
                             "sidecar stopped without a termination event".to_string()
                         }));
-                        break false;
+                        break RunOutcome::Unknown;
                     }
 
                     Some(CommandEvent::Stderr(line_bytes)) => {
@@ -485,20 +592,68 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
 
                     Some(CommandEvent::Terminated(payload)) => {
                         let _ = child.take();
-                        break payload.code.unwrap_or(1) != 0;
+                        // A missing code means the process was signalled rather
+                        // than exiting on its own; that is a failed run, not a
+                        // clean one.
+                        break RunOutcome::Exited { success: payload.code == Some(0) };
                     }
                     Some(CommandEvent::Error(error)) => {
-                        let reap_error = kill_and_reap(&mut child, &mut rx).await.err();
-                        let detail = reap_error
-                            .map(|reap_error| format!("; {reap_error}"))
+                        let detail = reap_diagnostic(kill_and_reap(child, rx).await)
+                            .map(|diagnostic| format!("; {diagnostic}"))
                             .unwrap_or_default();
-                        return Err(format!("immich-go sidecar event failed: {error}{detail}"));
+                        return Err(RunUploadError::Other(format!(
+                            "immich-go sidecar event failed: {error}{detail}"
+                        )));
                     }
                     Some(_) => {}
                 }
             }
         }
     };
+
+    Ok(SidecarResult {
+        error_lines: error_lines.into_vec(),
+        outcome,
+    })
+}
+
+pub async fn run_upload(
+    app: AppHandle,
+    request: UploadRequest,
+) -> Result<SidecarResult, RunUploadError> {
+    let config = write_api_key_config(&request.api_key).map_err(RunUploadError::Other)?;
+    // Pre-create the run log 0600 so immich-go's --log-file output (which can
+    // carry an x-api-key header) is not world-readable on shared machines.
+    create_private_log(&request.log_path).map_err(RunUploadError::Other)?;
+    let args = build_upload_args(&request, &config.path);
+
+    let sidecar = app
+        .shell()
+        .sidecar("immich-go")
+        .map_err(|e| RunUploadError::Other(format!("Could not prepare immich-go sidecar: {e}")))?
+        .env("GODEBUG", "netdns=cgo")
+        .args(args);
+
+    let (mut rx, child) = sidecar
+        .spawn()
+        .map_err(|e| RunUploadError::Other(format!("Could not spawn immich-go sidecar: {e}")))?;
+    let mut child = Some(child);
+
+    // immich-go's --no-ui stdout is a `\r`-refreshed aggregate that never
+    // line-flushes through the pipe, so progress is polled from the run log
+    // (append-only, written in real time) on a fixed cadence instead. The reader
+    // parses only newly-appended bytes each tick.
+    let mut progress =
+        ProgressReader::new(request.log_path.clone(), request.log_source_roots.clone());
+
+    let result = drive_run(
+        &mut rx,
+        &mut child,
+        &request.cancel_flag,
+        &mut progress,
+        |snapshot, current_path| emit_progress(&app, &request.job_id, snapshot, current_path),
+    )
+    .await?;
 
     // Final authoritative snapshot so the UI lands on the run log's last counts.
     let snapshot = progress.finish();
@@ -509,10 +664,7 @@ pub async fn run_upload(app: AppHandle, request: UploadRequest) -> Result<Sideca
         snapshot.completed_paths.last().map(String::as_str),
     );
 
-    Ok(SidecarResult {
-        error_lines: error_lines.into_vec(),
-        exit_nonzero,
-    })
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -679,9 +831,196 @@ mod tests {
         assert!(!lines.iter().any(|line| line == &long_line));
     }
 
-    // The closed-channel arm of `run_upload` is not unit-testable: it needs a
-    // plugin-spawned `CommandChild` and an `AppHandle`, and `CommandChild`
-    // exposes no constructor. Its behaviour (fall through to log classification,
-    // record the reap diagnostic as a stderr line) is covered by the Playwright
-    // scenarios that drive a real run, not by a fabricated `SidecarResult`.
+    // ---- sidecar lifecycle (`drive_run` / `kill_and_reap`) ----
+
+    /// A kill handle whose result is scripted. `CommandChild` has no public
+    /// constructor, so this is the only way to reach the failed-kill and
+    /// lost-termination paths; like `CommandChild::kill` it consumes the
+    /// handle, so a failure leaves nothing to retry with.
+    struct FakeKill {
+        result: Result<(), String>,
+    }
+
+    impl KillHandle for FakeKill {
+        fn kill(self) -> Result<(), String> {
+            self.result
+        }
+    }
+
+    fn kills_ok() -> Option<FakeKill> {
+        Some(FakeKill { result: Ok(()) })
+    }
+
+    fn kill_fails() -> Option<FakeKill> {
+        Some(FakeKill {
+            result: Err("could not kill sidecar: os error 3".to_string()),
+        })
+    }
+
+    /// A fresh run-log directory, used as the invocation root.
+    fn log_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sidecar-run-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A reader over a run log holding `contents`, rooted at `dir` exactly as
+    /// production roots it at the path immich-go was invoked on.
+    fn reader_for(dir: &Path, contents: &str) -> ProgressReader {
+        let log_path = dir.join("run.log");
+        fs::write(&log_path, contents).unwrap();
+        ProgressReader::new(log_path, vec![dir.to_string_lossy().to_string()])
+    }
+
+    fn terminated(code: Option<i32>) -> CommandEvent {
+        CommandEvent::Terminated(tauri_plugin_shell::process::TerminatedPayload {
+            code,
+            signal: None,
+        })
+    }
+
+    /// The regression this enum exists for: a lost `Terminated` event used to
+    /// synthesize the same `exit_nonzero: false` a clean exit produces, so an
+    /// interrupted run was published as a successful one and its advanced date
+    /// floor let the next "only new" import skip unprocessed source media.
+    #[tokio::test]
+    async fn a_closed_event_channel_is_unknown_not_a_clean_exit() {
+        let dir = log_dir();
+        let mut progress = reader_for(
+            &dir,
+            &format!(
+                "2026-06-24 16:10:21 INF uploaded successfully file={}:IMG_0001.JPG\n",
+                dir.display()
+            ),
+        );
+
+        let (tx, mut rx) = tauri::async_runtime::channel::<CommandEvent>(4);
+        // Closing the channel without a termination event is the whole scenario.
+        drop(tx);
+        let mut child = kills_ok();
+
+        let result = drive_run(
+            &mut rx,
+            &mut child,
+            &AtomicBool::new(false),
+            &mut progress,
+            |_, _| {},
+        )
+        .await
+        .expect("a lost termination event is reported, not an error");
+
+        assert_eq!(result.outcome, RunOutcome::Unknown);
+        // The diagnostic must survive: it is the only evidence the user gets.
+        assert!(
+            result
+                .error_lines
+                .iter()
+                .any(|line| line.contains("event channel closed")),
+            "reap diagnostic missing: {:?}",
+            result.error_lines
+        );
+        // Partial tallies still stand for diagnosis.
+        assert_eq!(progress.finish().progress.uploaded, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_observed_exit_status_decides_success() {
+        for (code, expected) in [
+            (Some(0), RunOutcome::Exited { success: true }),
+            (Some(2), RunOutcome::Exited { success: false }),
+            // No code means the process was signalled, which is not a clean run.
+            (None, RunOutcome::Exited { success: false }),
+        ] {
+            let dir = log_dir();
+            let mut progress = reader_for(&dir, "");
+            let (tx, mut rx) = tauri::async_runtime::channel::<CommandEvent>(4);
+            tx.send(terminated(code)).await.unwrap();
+            let mut child = kills_ok();
+
+            let result = drive_run(
+                &mut rx,
+                &mut child,
+                &AtomicBool::new(false),
+                &mut progress,
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result.outcome, expected, "exit code {code:?}");
+            // The termination event consumed the handle, so nothing is left to kill.
+            assert!(child.is_none());
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// `CommandChild::kill` consumes the handle and the plugin installs no
+    /// killing `Drop`, so returning on the kill error released the run while
+    /// immich-go could still be uploading. The wait must continue instead.
+    #[tokio::test]
+    async fn a_failed_kill_waits_and_a_later_termination_confirms_it() {
+        let (tx, mut rx) = tauri::async_runtime::channel::<CommandEvent>(4);
+        // The receiver is still pending when the kill fails; the real
+        // already-exited race delivers `Terminated` shortly afterwards.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = tx.send(terminated(Some(0))).await;
+        });
+        let mut child = kill_fails();
+
+        let outcome = kill_and_reap(&mut child, &mut rx).await;
+
+        match outcome {
+            ReapOutcome::Confirmed { note } => assert!(
+                note.unwrap_or_default().contains("could not kill sidecar"),
+                "the kill error must stay on the record"
+            ),
+            other => panic!("a delivered termination event must confirm the reap: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_kill_without_a_termination_event_stays_unconfirmed() {
+        let (tx, mut rx) = tauri::async_runtime::channel::<CommandEvent>(4);
+        drop(tx);
+        let mut child = kill_fails();
+
+        match kill_and_reap(&mut child, &mut rx).await {
+            ReapOutcome::Unconfirmed { diagnostic } => {
+                assert!(diagnostic.contains("could not kill sidecar"));
+                assert!(diagnostic.contains("event channel closed"));
+            }
+            other => panic!("an unreaped sidecar must not read as confirmed: {other:?}"),
+        }
+    }
+
+    /// Caller-visible consequence of the above: an unconfirmed reap must not
+    /// pass as the orderly cancellation whose cleanup wipes the staging tree
+    /// and admits a retry alongside a sidecar that may still be running.
+    #[tokio::test]
+    async fn cancelling_with_an_unconfirmed_reap_is_an_error_not_a_clean_cancel() {
+        let dir = log_dir();
+        let mut progress = reader_for(&dir, "");
+        let (tx, mut rx) = tauri::async_runtime::channel::<CommandEvent>(4);
+        drop(tx);
+        let mut child = kill_fails();
+
+        let error = drive_run(
+            &mut rx,
+            &mut child,
+            &AtomicBool::new(true),
+            &mut progress,
+            |_, _| {},
+        )
+        .await
+        .expect_err("an unreaped sidecar cannot be reported as a finished run");
+
+        assert!(
+            matches!(&error, RunUploadError::UnconfirmedTermination(message) if message.starts_with("Could not cancel immich-go sidecar")),
+            "unexpected error: {error}"
+        );
+        assert_ne!(error, RunUploadError::Cancelled);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

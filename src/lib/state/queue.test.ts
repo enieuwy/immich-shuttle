@@ -45,7 +45,8 @@ vi.mock("$lib/api", () => ({
 }));
 
 import * as api from "$lib/api";
-import { queueState, selectNewlyTerminal } from "./queue";
+import { handleTerminalTransitions, queueState, selectNewlyTerminal } from "./queue";
+import { sendNotification } from "@tauri-apps/plugin-notification";
 import { profilesState } from "./profiles";
 import { sourceState } from "./source";
 import { albumsState } from "./albums";
@@ -198,6 +199,27 @@ describe("queueState", () => {
     vi.mocked(api.historySourceLastImport).mockResolvedValueOnce(null);
     await queueState.startImport();
     expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.date_range).toBeNull();
+
+    importOptionsState.setOnlyNewSinceLastImport(false);
+  });
+
+  it("refuses the import when the only-new checkpoint cannot be read", async () => {
+    await activateProfileWithSource();
+    importOptionsState.clearDateRange();
+    importOptionsState.setOnlyNewSinceLastImport(true);
+
+    // An unreadable store used to arrive as `null`, which is also the first-run
+    // answer: the floor silently vanished and the whole card was re-uploaded.
+    // The requested incremental window must never be widened without saying so.
+    const callsBefore = vi.mocked(api.importStart).mock.calls.length;
+    vi.mocked(api.historySourceLastImport).mockRejectedValueOnce(
+      new Error("history_source_last_import failed: Could not read store at /tmp/store.json"),
+    );
+
+    await expect(queueState.startImport()).rejects.toThrow(
+      'Could not read the last-import checkpoint for this source, so "only new since last import" cannot be applied.',
+    );
+    expect(vi.mocked(api.importStart).mock.calls.length).toBe(callsBefore);
 
     importOptionsState.setOnlyNewSinceLastImport(false);
   });
@@ -655,16 +677,16 @@ describe("queueState", () => {
   });
 });
 
-describe("selectNewlyTerminal", () => {
-  const job = (id: string, status: ImportJob["status"]): ImportJob =>
-    ({
-      id,
-      status,
-      progress: { total: 1, uploaded: 1, duplicates: 0, errors: 0 },
-      awaiting_wipe_confirmation: false,
-      pending_wipe_count: 0,
-    }) as ImportJob;
+const job = (id: string, status: ImportJob["status"]): ImportJob =>
+  ({
+    id,
+    status,
+    progress: { total: 1, uploaded: 1, duplicates: 0, errors: 0 },
+    awaiting_wipe_confirmation: false,
+    pending_wipe_count: 0,
+  }) as ImportJob;
 
+describe("selectNewlyTerminal", () => {
   it("detects running -> completed and running -> failed", () => {
     const prev = [job("a", "running"), job("b", "running")];
     const next = [job("a", "completed"), job("b", "failed")];
@@ -686,5 +708,34 @@ describe("selectNewlyTerminal", () => {
     const prev = [job("a", "completed")];
     const next = [job("a", "completed")];
     expect(selectNewlyTerminal(prev, next)).toEqual([]);
+  });
+});
+
+describe("handleTerminalTransitions", () => {
+  it("routes a rejecting notification backend into the catch", async () => {
+    // The send used to be fired without `await`, so the try/catch around it
+    // could only ever see a synchronous throw. A rejecting notification backend
+    // escaped it entirely, and the call site is `void handleTerminalTransitions`
+    // — so the rejection became the unhandled rejection the catch promises to
+    // prevent. Awaiting the send makes an async rejection behave exactly like a
+    // synchronous throw: it reaches the catch, which abandons the rest of the
+    // best-effort batch. The second job's send NOT firing is what proves the
+    // rejection was handled here rather than leaked.
+    // `failed` jobs are used so no history checkpoint version is bumped.
+    vi.mocked(sendNotification).mockReset();
+    vi.mocked(sendNotification).mockImplementationOnce(
+      () => Promise.reject(new Error("notification backend unavailable")) as never,
+    );
+
+    await expect(
+      handleTerminalTransitions(
+        [job("notify-a", "running"), job("notify-b", "running")],
+        [job("notify-a", "failed"), job("notify-b", "failed")],
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(vi.mocked(sendNotification).mock.calls).toEqual([
+      [{ title: "Import failed", body: "The import did not finish. Check the logs for details." }],
+    ]);
   });
 });

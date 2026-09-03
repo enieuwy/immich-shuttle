@@ -31,7 +31,7 @@
   import { queueState } from "$lib/state/queue";
   import { runImportShutdown, SHUTDOWN_INCOMPLETE_MESSAGE } from "$lib/state/shutdown";
   import { selectionState } from "$lib/state/selection";
-  import { sourceState } from "$lib/state/source";
+  import { importOptionsForSource, sourceState } from "$lib/state/source";
   import { previewState } from "$lib/state/preview";
   import { openProfileEditor, panelTab } from "$lib/state/ui";
   import { paletteState, themeState } from "$lib/state/theme";
@@ -79,10 +79,12 @@
       return;
     }
 
-    const selection = selectedPaths;
-    const pendingStart = queueState.startImport(
-      selection.length > 0 ? { selectFiles: selection } : {},
-    );
+    const options = importOptionsForSource($sourceState, selectedPaths);
+    if (!options) {
+      importError = "The source scan did not finish. Retry the scan before starting the import.";
+      return;
+    }
+    const pendingStart = queueState.startImport(options);
     try {
       await pendingStart;
       selectionState.clear();

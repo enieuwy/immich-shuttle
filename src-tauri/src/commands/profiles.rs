@@ -1,3 +1,4 @@
+use reqwest::Url;
 use uuid::Uuid;
 
 use crate::{
@@ -10,7 +11,10 @@ use crate::{
 
 #[tauri::command]
 pub async fn profiles_list() -> Result<Vec<Profile>, String> {
-    profile_store::list_profiles()
+    profile_store::list_profiles()?
+        .into_iter()
+        .map(normalize_loaded_profile)
+        .collect()
 }
 
 /// Scan the local network for reachable Immich servers, returning confirmed
@@ -27,22 +31,32 @@ pub async fn profile_upsert(input: ProfileInput) -> Result<Profile, String> {
         return Err("Server URL is required".to_string());
     }
 
+    let is_new_profile = input.id.is_none();
     let id = input
         .id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let profile = profile_from_input(&input, id.clone());
+    let profile = profile_from_input(&input, id.clone())?;
 
     let api_key = input
         .api_key
         .filter(|api_key| !api_key.trim().is_empty())
         .map(|api_key| api_key.trim().to_string());
     let _guard = profile_store::lock_config();
-    let previous_api_key = if api_key.is_some() {
-        keychain::get_api_key(&id)?
-    } else {
+    // A blank key means "keep the stored one", which only exists to keep. A new
+    // profile mints its own id, so nothing can be stored under it; committing
+    // one anyway produces a selectable profile whose every authenticated
+    // command fails through `require_api_key`, with no way back but delete.
+    let previous_api_key = if is_new_profile {
         None
+    } else {
+        keychain::get_api_key(&id)?
     };
+    if api_key.is_none() && previous_api_key.is_none() {
+        // Rejected before any write: the config must not gain a profile the
+        // user cannot use.
+        return Err("API key is required".to_string());
+    }
 
     let stored_key = if let Some(api_key) = api_key {
         keychain::store_api_key(&id, &api_key)?;
@@ -69,27 +83,43 @@ pub async fn profile_upsert(input: ProfileInput) -> Result<Profile, String> {
     }
 }
 
-fn profile_from_input(input: &ProfileInput, id: String) -> Profile {
-    Profile {
+fn normalized_server_url(value: &str) -> Result<String, String> {
+    let mut url = Url::parse(value.trim()).map_err(|_| "Invalid server URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        return Err("Invalid server URL".to_string());
+    }
+
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    Ok(normalize_server_url(url.as_str()))
+}
+
+fn normalized_optional_server_url(value: Option<&str>) -> Result<Option<String>, String> {
+    value
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(normalized_server_url)
+        .transpose()
+}
+
+fn normalize_loaded_profile(mut profile: Profile) -> Result<Profile, String> {
+    profile.server_url = normalized_server_url(&profile.server_url)?;
+    profile.lan_server_url = normalized_optional_server_url(profile.lan_server_url.as_deref())?;
+    profile.wan_server_url = normalized_optional_server_url(profile.wan_server_url.as_deref())?;
+    Ok(profile)
+}
+
+fn profile_from_input(input: &ProfileInput, id: String) -> Result<Profile, String> {
+    Ok(Profile {
         id,
         display_name: input
             .display_name
             .clone()
             .unwrap_or_else(|| "Immich User".to_string()),
-        server_url: normalize_server_url(&input.server_url),
-        lan_server_url: input
-            .lan_server_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .map(normalize_server_url),
-        wan_server_url: input
-            .wan_server_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .map(normalize_server_url),
-    }
+        server_url: normalized_server_url(&input.server_url)?,
+        lan_server_url: normalized_optional_server_url(input.lan_server_url.as_deref())?,
+        wan_server_url: normalized_optional_server_url(input.wan_server_url.as_deref())?,
+    })
 }
 
 #[tauri::command]
@@ -114,10 +144,10 @@ pub async fn profile_delete(id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn profile_validate(url: String, api_key: String) -> Result<ServerInfo, String> {
-    let normalized_url = normalize_server_url(&url);
-    if normalized_url.is_empty() {
+    if url.trim().is_empty() {
         return Err("Server URL is required".to_string());
     }
+    let normalized_url = normalized_server_url(&url)?;
     if api_key.trim().is_empty() {
         return Err("API key is required".to_string());
     }
@@ -142,8 +172,36 @@ pub async fn profile_validate(url: String, api_key: String) -> Result<ServerInfo
 
 #[cfg(test)]
 mod tests {
-    use super::profile_from_input;
-    use crate::models::profile::ProfileInput;
+    use super::{profile_from_input, profile_upsert, profile_validate, profiles_list};
+    use crate::models::profile::{Profile, ProfileInput};
+    use crate::services::{keychain, profile_store};
+
+    /// Both process-wide test seams, always taken in this order so the
+    /// keychain tests (credential lock only) cannot deadlock against these.
+    fn isolate(
+        suffix: &str,
+    ) -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+        std::path::PathBuf,
+    ) {
+        let config_guard = profile_store::test_config::lock();
+        let credential_guard = keychain::test_store::exclusive();
+        keychain::test_store::reset();
+        let dir = profile_store::test_config::use_temp_config_home(suffix);
+        (config_guard, credential_guard, dir)
+    }
+
+    fn input(id: Option<&str>, server_url: &str, api_key: Option<&str>) -> ProfileInput {
+        ProfileInput {
+            id: id.map(str::to_string),
+            display_name: None,
+            server_url: server_url.to_string(),
+            lan_server_url: None,
+            wan_server_url: None,
+            api_key: api_key.map(str::to_string),
+        }
+    }
 
     #[test]
     fn profile_builder_normalizes_optional_lan_and_wan_urls() {
@@ -157,7 +215,8 @@ mod tests {
                 api_key: None,
             },
             "profile-id".to_string(),
-        );
+        )
+        .expect("valid profile URLs");
 
         assert_eq!(
             profile.lan_server_url.as_deref(),
@@ -181,7 +240,8 @@ mod tests {
                 api_key: None,
             },
             "profile-id".to_string(),
-        );
+        )
+        .expect("valid profile URLs");
 
         assert_eq!(profile.display_name, "Immich User");
         assert_eq!(profile.lan_server_url, None);
@@ -197,12 +257,144 @@ mod tests {
                 api_key: None,
             },
             "profile-id".to_string(),
-        );
+        )
+        .expect("valid profile URLs");
 
         assert_eq!(empty_url_profile.lan_server_url, None);
         assert_eq!(
             empty_url_profile.wan_server_url.as_deref(),
             Some("https://wan.example.com")
         );
+    }
+
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn profile_upsert_persists_urls_without_userinfo() {
+        let (_config, _credentials, dir) = isolate("upsert-userinfo");
+        let saved = profile_upsert(ProfileInput {
+            id: None,
+            display_name: None,
+            server_url: "https://user:password@immich.example.com/api/".to_string(),
+            lan_server_url: Some("http://lan-user:lan-password@lan.example.com:2283/".to_string()),
+            wan_server_url: Some("https://wan-user:wan-password@wan.example.com/api".to_string()),
+            api_key: Some("api-key".to_string()),
+        })
+        .await
+        .expect("save profile");
+        let stored = profile_store::get_profile(&saved.id).expect("load saved profile");
+
+        assert_eq!(stored.server_url, "https://immich.example.com");
+        assert_eq!(
+            stored.lan_server_url.as_deref(),
+            Some("http://lan.example.com:2283")
+        );
+        assert_eq!(
+            stored.wan_server_url.as_deref(),
+            Some("https://wan.example.com")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn profiles_list_sanitizes_legacy_profile_urls() {
+        let (_config, _credentials, dir) = isolate("list-legacy-userinfo");
+        profile_store::upsert_profile(Profile {
+            id: "legacy".to_string(),
+            display_name: "Legacy".to_string(),
+            server_url: "https://user:password@immich.example.com".to_string(),
+            lan_server_url: Some("http://lan-user:lan-password@lan.example.com:2283".to_string()),
+            wan_server_url: Some("https://wan-user:wan-password@wan.example.com".to_string()),
+        })
+        .expect("write legacy profile");
+
+        let profiles = profiles_list().await.expect("list legacy profile");
+        let profile = profiles.first().expect("legacy profile");
+        assert_eq!(profile.server_url, "https://immich.example.com");
+        assert_eq!(
+            profile.lan_server_url.as_deref(),
+            Some("http://lan.example.com:2283")
+        );
+        assert_eq!(
+            profile.wan_server_url.as_deref(),
+            Some("https://wan.example.com")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn invalid_server_urls_are_rejected_without_credential_echoes() {
+        let (_config, _credentials, dir) = isolate("reject-invalid-userinfo");
+        let error = profile_upsert(input(None, "https://user:password@[", Some("api-key")))
+            .await
+            .expect_err("invalid URL must not be persisted");
+
+        assert_eq!(error, "Invalid server URL");
+        assert!(!error.contains("user"));
+        assert!(!error.contains("password"));
+        assert!(profile_store::list_profiles()
+            .expect("list profiles")
+            .is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn invalid_url_validation_does_not_echo_userinfo() {
+        let error = profile_validate("https://user:password@[".to_string(), "api-key".to_string())
+            .await
+            .expect_err("invalid URL must be rejected before connecting");
+
+        assert_eq!(error, "Invalid server URL");
+        assert!(!error.contains("user"));
+        assert!(!error.contains("password"));
+    }
+
+    // A profile with no credential is selectable but unusable, so creating one
+    // must fail before anything reaches the config file.
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn creating_a_profile_without_an_api_key_writes_nothing() {
+        let (_config, _credentials, dir) = isolate("upsert-missing-key");
+
+        for blank in [None, Some(""), Some("   ")] {
+            let error = profile_upsert(input(None, "https://immich.example.com", blank))
+                .await
+                .expect_err("a new profile without an API key must be rejected");
+            assert_eq!(error, "API key is required");
+        }
+
+        assert!(profile_store::list_profiles()
+            .expect("list profiles")
+            .is_empty());
+        assert!(!dir.join("immich-shuttle/config.json").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Editing keeps blank-means-keep: the dialog never repopulates the key
+    // field, so saving an unrelated URL change must not clear the credential.
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn editing_with_a_blank_api_key_keeps_the_stored_credential() {
+        let (_config, _credentials, dir) = isolate("upsert-blank-key");
+        let created = profile_upsert(input(
+            None,
+            "https://immich.example.com",
+            Some("original-key"),
+        ))
+        .await
+        .expect("create profile with an API key");
+
+        let updated = profile_upsert(input(Some(&created.id), "https://moved.example.com", None))
+            .await
+            .expect("editing an existing profile with a blank key must succeed");
+
+        assert_eq!(updated.id, created.id);
+        assert_eq!(updated.server_url, "https://moved.example.com");
+        assert_eq!(
+            keychain::test_store::peek(&created.id).as_deref(),
+            Some("original-key")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

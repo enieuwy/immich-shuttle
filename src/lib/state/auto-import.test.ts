@@ -32,7 +32,7 @@ vi.mock("$lib/api", () => ({
 
 import * as api from "$lib/api";
 import { autoImportState } from "./auto-import";
-import { deviceRulesState } from "./device-rules";
+import { deviceRulesState, type DeviceRule } from "./device-rules";
 import { errorsState } from "./errors";
 import { profilesState } from "./profiles";
 import { queueState } from "./queue";
@@ -45,6 +45,7 @@ const card: RemovableDevice = {
   total_space: 64 * 1024 ** 3,
   available_space: 12 * 1024 ** 3,
   has_dcim: true,
+  volume_id: "11111111-1111-1111-1111-111111111111",
 };
 
 const thumbDrive: RemovableDevice = {
@@ -53,17 +54,31 @@ const thumbDrive: RemovableDevice = {
   total_space: 256 * 1024 ** 3,
   available_space: 240 * 1024 ** 3,
   has_dcim: false,
+  volume_id: "99999999-9999-9999-9999-999999999999",
 };
 
+const savedRule: DeviceRule = {
+  profileId: "p2",
+  albumName: "Family",
+  keepFiles: false,
+  stackRawJpeg: false,
+  stackBurst: true,
+  organization: "folder_path",
+};
+
+// `p1` is the active profile; `p2` exists only so a saved rule's `profileId` override has
+// something to resolve to.
 async function withActiveProfile() {
-  await profilesState.saveProfile({
-    id: "p1",
-    display_name: "Test",
-    server_url: "https://immich.example.com",
-    api_key: null,
-    lan_server_url: null,
-    wan_server_url: null,
-  });
+  for (const id of ["p1", "p2"]) {
+    await profilesState.saveProfile({
+      id,
+      display_name: id === "p1" ? "Test" : "Family",
+      server_url: "https://immich.example.com",
+      api_key: null,
+      lan_server_url: null,
+      wan_server_url: null,
+    });
+  }
   profilesState.setActiveProfile("p1");
 }
 
@@ -74,6 +89,7 @@ beforeEach(async () => {
   autoImportState._reset();
   deviceRulesState._reset();
   await withActiveProfile();
+  vi.mocked(api.devicesListRemovable).mockResolvedValue([card]);
 });
 
 describe("autoImportState", () => {
@@ -104,7 +120,12 @@ describe("autoImportState", () => {
   });
 
   it("surfaces a second card inserted alongside the first once resolved", async () => {
-    const card2: RemovableDevice = { ...card, name: "SONY", mount_path: "/Volumes/SONY" };
+    const card2: RemovableDevice = {
+      ...card,
+      name: "SONY",
+      mount_path: "/Volumes/SONY",
+      volume_id: "22222222-2222-2222-2222-222222222222",
+    };
     autoImportState.setEnabled(true);
     autoImportState.observe([]); // baseline empty
 
@@ -208,41 +229,17 @@ describe("autoImportState", () => {
   });
 
   it("pre-fills the candidate rule when the inserted card has a saved rule", () => {
-    deviceRulesState.saveRule(card, {
-      profileId: "p2",
-      albumName: "Family",
-      keepFiles: false,
-      stackRawJpeg: false,
-      stackBurst: true,
-      organization: "folder_path",
-    });
+    deviceRulesState.saveRule(card, savedRule);
     autoImportState.setEnabled(true);
     autoImportState.observe([]);
     autoImportState.observe([card]);
 
     expect(get(autoImportState).candidateRule?.profileId).toBe("p2");
+    expect(get(autoImportState).candidateRuleNeedsConfirmation).toBe(false);
   });
 
   it("accept replays a saved rule's profile, album, and wipe policy", async () => {
-    deviceRulesState.saveRule(card, {
-      profileId: "p2",
-      albumName: "Family",
-      keepFiles: false,
-      stackRawJpeg: false,
-      stackBurst: true,
-      organization: "folder_path",
-    });
-    // p2 must exist for the profileId override to resolve.
-    await profilesState.saveProfile({
-      id: "p2",
-      display_name: "Family",
-      server_url: "https://immich.example.com",
-      api_key: null,
-      lan_server_url: null,
-      wan_server_url: null,
-    });
-    profilesState.setActiveProfile("p1");
-
+    deviceRulesState.saveRule(card, savedRule);
     autoImportState.setEnabled(true);
     autoImportState.observe([]);
     autoImportState.observe([card]);
@@ -258,5 +255,158 @@ describe("autoImportState", () => {
       stack_burst: true,
       organization: "folder_path",
     });
+  });
+
+  it("does not offer one card's rule to a different card with the same label", () => {
+    const twin: RemovableDevice = {
+      ...card,
+      mount_path: "/Volumes/CANON_EOS 1",
+      volume_id: "22222222-2222-2222-2222-222222222222",
+    };
+    deviceRulesState.saveRule(card, savedRule);
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([twin]);
+
+    expect(get(autoImportState).candidate?.mount_path).toBe(twin.mount_path);
+    expect(get(autoImportState).candidateRule).toBeNull();
+  });
+
+  it("does not offer a rule to the next Untitled card that reuses the mount path", () => {
+    const first: RemovableDevice = {
+      ...card,
+      name: "Untitled",
+      mount_path: "/Volumes/Untitled",
+      volume_id: "aaaaaaaa-0000-0000-0000-000000000001",
+    };
+    const second: RemovableDevice = {
+      ...first,
+      volume_id: "aaaaaaaa-0000-0000-0000-000000000002",
+    };
+    deviceRulesState.saveRule(first, savedRule);
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([first]);
+    expect(get(autoImportState).candidateRule).toEqual(savedRule);
+
+    // Card pulled, a different card inserted into the same slot.
+    autoImportState.dismiss();
+    autoImportState.observe([]);
+    autoImportState.observe([second]);
+
+    expect(get(autoImportState).candidate?.mount_path).toBe(second.mount_path);
+    expect(get(autoImportState).candidateRule).toBeNull();
+  });
+
+  it("still finds a card's rule when it remounts at a different path", () => {
+    deviceRulesState.saveRule(card, savedRule);
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([{ ...card, mount_path: "/Volumes/CANON_EOS 2" }]);
+
+    expect(get(autoImportState).candidateRule).toEqual(savedRule);
+  });
+
+  it("does not auto-import a card when the platform could not identify it", () => {
+    const anonymous: RemovableDevice = { ...card, volume_id: null };
+    // A legacy entry that matches this card's label is present and must stay unused.
+    deviceRulesState._reset({ "name:CANON_EOS": savedRule });
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([anonymous]);
+
+    expect(get(autoImportState).candidate).toBeNull();
+    expect(deviceRulesState.saveRule(anonymous, savedRule)).toBe(false);
+  });
+
+  it("re-prompts a replacement card at the same mount without the prior card's rule", async () => {
+    const replacement: RemovableDevice = {
+      ...card,
+      volume_id: "22222222-2222-2222-2222-222222222222",
+    };
+    deviceRulesState.saveRule(card, savedRule);
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+    expect(get(autoImportState).candidateRule).toEqual(savedRule);
+
+    // The detector now observes a different card at the identical mount and capacity.
+    autoImportState.observe([replacement]);
+    expect(get(autoImportState).candidate).toEqual(replacement);
+    expect(get(autoImportState).candidateRule).toBeNull();
+
+    vi.mocked(api.devicesListRemovable).mockResolvedValue([replacement]);
+    await autoImportState.accept();
+    expect(vi.mocked(api.importStart).mock.lastCall?.[0]).toMatchObject({
+      source_paths: [replacement.mount_path],
+      profile_id: "p1",
+      keep_files: true,
+    });
+  });
+
+  it("rejects acceptance when a fresh device check finds a replacement card", async () => {
+    const replacement: RemovableDevice = {
+      ...card,
+      volume_id: "22222222-2222-2222-2222-222222222222",
+    };
+    deviceRulesState._reset({ "name:CANON_EOS": savedRule });
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+
+    // No new observation has arrived, so accept itself must still verify the mounted card.
+    vi.mocked(api.devicesListRemovable).mockResolvedValue([replacement]);
+    await autoImportState.accept();
+
+    expect(vi.mocked(api.importStart)).not.toHaveBeenCalled();
+    expect(get(autoImportState).candidate).toBeNull();
+    expect(deviceRulesState.lookup(card)).toEqual({ rule: savedRule, needsConfirmation: true });
+  });
+
+  it("offers a legacy rule as unconfirmed and keeps originals without a fresh confirmation", async () => {
+    deviceRulesState._reset({ "name:CANON_EOS": savedRule });
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+
+    expect(get(autoImportState).candidateRule).toEqual(savedRule);
+    expect(get(autoImportState).candidateRuleNeedsConfirmation).toBe(true);
+
+    await autoImportState.accept();
+
+    const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
+    // The destination the user read on the banner is honoured; the delete policy is not.
+    expect(payload).toMatchObject({ profile_id: "p2", into_album: "Family", keep_files: true });
+    // The migrated rule records what was actually confirmed, so the next insert of this
+    // card cannot resurrect the unconfirmed delete policy.
+    expect(deviceRulesState.lookup(card)).toEqual({
+      rule: { ...savedRule, keepFiles: true },
+      needsConfirmation: false,
+    });
+  });
+
+  it("applies a legacy rule's delete policy only when the user confirms it", async () => {
+    deviceRulesState._reset({ "name:CANON_EOS": savedRule });
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+
+    await autoImportState.accept(true);
+
+    expect(vi.mocked(api.importStart).mock.lastCall?.[0]).toMatchObject({ keep_files: false });
+    expect(deviceRulesState.lookup(card)).toEqual({ rule: savedRule, needsConfirmation: false });
+  });
+
+  it("does not migrate a legacy rule when the import fails to start", async () => {
+    deviceRulesState._reset({ "name:CANON_EOS": savedRule });
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+    vi.spyOn(queueState, "startImport").mockRejectedValueOnce(new Error("start failed"));
+
+    await autoImportState.accept(true);
+
+    expect(get(autoImportState).candidateRuleNeedsConfirmation).toBe(true);
+    expect(deviceRulesState.lookup(card)).toEqual({ rule: savedRule, needsConfirmation: true });
   });
 });

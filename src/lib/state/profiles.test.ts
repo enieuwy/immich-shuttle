@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 
 import * as api from "$lib/api";
@@ -34,6 +34,11 @@ vi.mock("$lib/api", () => ({
 import { activeProfile, getProfilesSnapshot, profilesState } from "./profiles";
 
 describe("profilesState", () => {
+  beforeEach(async () => {
+    for (const profile of getProfilesSnapshot().profiles) {
+      await profilesState.deleteProfile(profile.id);
+    }
+  });
   it("loads profiles and sets first active profile", async () => {
     await profilesState.loadProfiles();
     expect(get(activeProfile)?.id).toBe("p1");
@@ -58,6 +63,9 @@ describe("profilesState", () => {
   });
 
   it("deletes active profile and clears active when no profiles left", async () => {
+    for (const profile of getProfilesSnapshot().profiles) {
+      await profilesState.deleteProfile(profile.id);
+    }
     await profilesState.saveProfile({
       id: "only",
       server_url: "https://one.example.com",
@@ -67,7 +75,9 @@ describe("profilesState", () => {
       wan_server_url: null,
     });
     await profilesState.deleteProfile("only");
-    expect(get(activeProfile)?.id).not.toBe("only");
+    expect(getProfilesSnapshot().profiles).toEqual([]);
+    expect(getProfilesSnapshot().activeProfileId).toBeNull();
+    expect(get(activeProfile)).toBeNull();
   });
 
   it("does not resurrect a profile deleted while an older load is still in flight", async () => {

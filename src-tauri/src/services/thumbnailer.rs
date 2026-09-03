@@ -18,7 +18,10 @@
 //!   with no embedded preview) → a placeholder result (`data_url: None`) that the
 //!   UI renders as a typed tile.
 //!
-//! Results are cached on disk keyed by path+mtime+size so re-scans are instant.
+//! Results are cached on disk keyed by an identity that a hit can prove: path,
+//! mtime, size, filesystem identity, and a bounded head/tail fingerprint of the
+//! bytes (see `cache_key`), so re-scans are instant but a replaced file never
+//! shows the previous photo.
 
 use std::{
     collections::HashMap,
@@ -215,30 +218,112 @@ fn prune_ql_scratch_dirs_older_than(dir: &Path, max_age: Duration) {
     }
 }
 
-fn cache_key(path: &Path, max: u32) -> String {
-    // One `metadata()` call derives both mtime and size: cache entries are
-    // documented as keyed by path+mtime+size (see module docs), and a second
-    // stat here would risk racing a concurrent write between the two reads.
-    let metadata = fs::metadata(path).ok();
-    let mtime = metadata
-        .as_ref()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    // A file replaced in place while keeping its mtime (restore from backup,
-    // coarse filesystem timestamp resolution, `cp -p`) must still miss the old
-    // cache entry, so the byte length is part of the key too.
-    let size = metadata.map(|m| m.len()).unwrap_or(0);
+/// Bytes sampled from each end of a source file for the cache-key fingerprint.
+/// 64 KiB per end covers every container header (EXIF/IFD/preview offsets) and
+/// the trailing entropy-coded data, so an in-place rewrite is caught while a
+/// lookup on a 100 MB RAW still costs two short reads.
+const CACHE_FINGERPRINT_WINDOW: u64 = 64 * 1024;
+
+/// The contract a cache hit has to honour: the entry was rendered from *these
+/// bytes*. Path+mtime+length cannot promise that — `cp -p`, a restore tool, or
+/// removable media with coarse mtimes and reused DCIM names all hand back the
+/// same triple for different content, and the grid the user picks uploads from
+/// would then show the previous photo while the import sends the current one.
+/// So the key also commits to:
+/// - the filesystem identity of the name (unix `st_dev`+`st_ino`; on Windows
+///   the stable `MetadataExt` surface, i.e. creation time + attributes, since
+///   volume serial and file index are still unstable), which changes when the
+///   name is re-pointed at a different file, and
+/// - a bounded head/tail fingerprint, which changes when the same inode is
+///   rewritten in place with same-length bytes.
+///
+/// `None` means the identity could not be read. The caller must then render
+/// without publishing anything: a weaker key could be served later to a request
+/// that would have built a strong one, which is exactly the stale-tile bug.
+fn cache_key(path: &Path, max: u32) -> Option<String> {
+    // One open handle serves the stat and both window reads, so no component of
+    // the key can be read from a different file than the others.
+    let file = fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let size = metadata.len();
+
     let mut hasher = Sha1::new();
+    // Version tag: entries keyed by the old path+mtime+size scheme cannot be
+    // proven to match their source, so they must not be reachable any more.
+    hasher.update(b"thumb-v2:");
     hasher.update(path.to_string_lossy().as_bytes());
     hasher.update(b":");
-    hasher.update(mtime.to_le_bytes());
+    hasher.update(unix_nanos(metadata.modified().ok()?).to_le_bytes());
     hasher.update(b":");
     hasher.update(size.to_le_bytes());
     hasher.update(b":");
     hasher.update(max.to_le_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher.update(b":");
+    file_identity(&metadata, &mut hasher);
+    hasher.update(b":");
+    hash_source_edges(&file, size, &mut hasher)?;
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Signed nanoseconds from the epoch: a pre-1970 mtime (some cameras, some
+/// restore tools) must still yield a usable key instead of an uncacheable file.
+fn unix_nanos(time: SystemTime) -> i128 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i128,
+        Err(before) => -(before.duration().as_nanos() as i128),
+    }
+}
+
+/// Mix in the platform's notion of *which file* this name resolves to.
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata, hasher: &mut Sha1) {
+    use std::os::unix::fs::MetadataExt;
+    hasher.update(metadata.dev().to_le_bytes());
+    hasher.update(metadata.ino().to_le_bytes());
+}
+
+#[cfg(windows)]
+fn file_identity(metadata: &fs::Metadata, hasher: &mut Sha1) {
+    use std::os::windows::fs::MetadataExt;
+    hasher.update(metadata.creation_time().to_le_bytes());
+    hasher.update(metadata.file_attributes().to_le_bytes());
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_metadata: &fs::Metadata, _hasher: &mut Sha1) {}
+
+/// Fingerprint the head and tail of `file` into `hasher`. Files of at most two
+/// windows are hashed whole; larger ones read exactly two windows, never the
+/// whole file. One buffer is allocated and reused for both ends.
+fn hash_source_edges(file: &fs::File, size: u64, hasher: &mut Sha1) -> Option<()> {
+    if size <= 2 * CACHE_FINGERPRINT_WINDOW {
+        let mut buf = vec![0u8; size as usize];
+        return hash_window(file, 0, &mut buf, hasher);
+    }
+    let mut buf = vec![0u8; CACHE_FINGERPRINT_WINDOW as usize];
+    hash_window(file, 0, &mut buf, hasher)?;
+    hash_window(file, size - CACHE_FINGERPRINT_WINDOW, &mut buf, hasher)
+}
+
+/// Read up to `buf.len()` bytes at `offset` and hash them with the count that
+/// was actually read, so a source truncated mid-lookup cannot produce the same
+/// digest as a whole one. A read error makes the source uncacheable (`None`)
+/// rather than silently weakening the key.
+fn hash_window(file: &fs::File, offset: u64, buf: &mut [u8], hasher: &mut Sha1) -> Option<()> {
+    let mut handle = file;
+    handle.seek(SeekFrom::Start(offset)).ok()?;
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match handle.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    hasher.update((filled as u64).to_le_bytes());
+    hasher.update(&buf[..filled]);
+    Some(())
 }
 
 fn ext_lower(path: &Path) -> String {
@@ -289,6 +374,14 @@ pub(crate) enum ThumbnailOutcome {
     Failed(String),
 }
 
+/// Where a thumbnail's pixels came from: an existing cache entry, or a fresh
+/// render of the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThumbnailSource {
+    Cache,
+    Rendered,
+}
+
 fn placeholder(path_str: &str) -> ThumbResult {
     ThumbResult {
         path: path_str.to_string(),
@@ -303,11 +396,23 @@ fn placeholder(path_str: &str) -> ThumbResult {
 /// The thumbnail itself never errors: any failure yields a placeholder so one bad
 /// file cannot break a batch.
 pub(crate) fn thumbnail_with_outcome(path_str: &str, max: u32) -> (ThumbResult, ThumbnailOutcome) {
+    let (result, outcome, _) = thumbnail_with_source(path_str, max);
+    (result, outcome)
+}
+
+/// Same as `thumbnail_with_outcome`, plus where the pixels came from. Callers
+/// only need the result; the provenance exists so tests can prove that a
+/// `Cache` answer really implies the source bytes are unchanged.
+fn thumbnail_with_source(
+    path_str: &str,
+    max: u32,
+) -> (ThumbResult, ThumbnailOutcome, ThumbnailSource) {
     let path = Path::new(path_str);
     if !path.is_file() {
         return (
             placeholder(path_str),
             ThumbnailOutcome::Failed("path_not_file".to_string()),
+            ThumbnailSource::Rendered,
         );
     }
 
@@ -317,12 +422,18 @@ pub(crate) fn thumbnail_with_outcome(path_str: &str, max: u32) -> (ThumbResult, 
             return (
                 placeholder(path_str),
                 ThumbnailOutcome::Failed(format!("cache_dir: {reason}")),
+                ThumbnailSource::Rendered,
             );
         }
     };
+    // No key means no provable identity (see `cache_key`). Render into a
+    // single-use scratch slot and delete it: publishing under a weaker key
+    // would let a later request with a readable identity be answered from it.
     let key = cache_key(path, max);
-    let jpg = cache.join(format!("{key}.jpg"));
-    let png = cache.join(format!("{key}.png"));
+    let uncacheable = key.is_none();
+    let slot = key.unwrap_or_else(|| format!("uncacheable-{}", uuid::Uuid::new_v4()));
+    let jpg = cache.join(format!("{slot}.jpg"));
+    let png = cache.join(format!("{slot}.png"));
 
     let cache_files = CacheFileGuard::new([jpg.clone(), png.clone()]);
     let (file, wrote_cache, generation_outcome) = if jpg.is_file() {
@@ -339,6 +450,11 @@ pub(crate) fn thumbnail_with_outcome(path_str: &str, max: u32) -> (ThumbResult, 
             }
         });
         (generated, true, outcome)
+    };
+    let source = if wrote_cache {
+        ThumbnailSource::Rendered
+    } else {
+        ThumbnailSource::Cache
     };
 
     // Fully read the cache file before allowing post-write pruning to remove it.
@@ -366,21 +482,26 @@ pub(crate) fn thumbnail_with_outcome(path_str: &str, max: u32) -> (ThumbResult, 
         }
     });
     drop(cache_files);
-    if wrote_cache && file.is_some() {
+    if uncacheable {
+        let _ = fs::remove_file(&jpg);
+        let _ = fs::remove_file(&png);
+    } else if wrote_cache && file.is_some() {
         prune_cache_after_write(&cache);
     }
 
     match decode_result {
-        Some(Ok(result)) => (result, ThumbnailOutcome::Ok),
+        Some(Ok(result)) => (result, ThumbnailOutcome::Ok, source),
         Some(Err(reason)) => (
             placeholder(path_str),
             ThumbnailOutcome::Failed(format!("cache_entry_decode: {reason}")),
+            source,
         ),
         None => (
             placeholder(path_str),
             generation_outcome.unwrap_or_else(|| {
                 ThumbnailOutcome::Failed("thumbnail_generation_failed".to_string())
             }),
+            source,
         ),
     }
 }
@@ -1068,12 +1189,41 @@ mod tests {
     }
 
     fn jpeg_of(w: u32, h: u32) -> Vec<u8> {
-        let img = image::RgbImage::from_pixel(w, h, image::Rgb([20, 40, 80]));
+        jpeg_of_color(w, h, [20, 40, 80])
+    }
+
+    fn jpeg_of_color(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb(rgb));
         let mut buf = Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(img)
             .write_to(&mut buf, image::ImageFormat::Jpeg)
             .unwrap();
         buf.into_inner()
+    }
+
+    /// Grow a JPEG to exactly `len` bytes by inserting a comment (COM) segment
+    /// after the SOI marker. Every decoder skips COM, so both variants stay
+    /// renderable by whichever backend the platform uses — unlike padding after
+    /// EOI, which some decoders reject.
+    fn jpeg_padded_to(data: &[u8], len: usize) -> Vec<u8> {
+        let extra = len - data.len();
+        if extra == 0 {
+            return data.to_vec();
+        }
+        assert!(
+            (4..=65_537).contains(&extra),
+            "padding {extra} does not fit one COM segment"
+        );
+        let payload = extra - 4;
+        let mut out = Vec::with_capacity(len);
+        out.extend_from_slice(&data[..2]);
+        out.extend_from_slice(&[0xFF, 0xFE]);
+        out.extend_from_slice(&((payload as u16) + 2).to_be_bytes());
+        // SOI (2) + marker (2) + length field (2) are already in `out`.
+        out.resize(6 + payload, b' ');
+        out.extend_from_slice(&data[2..]);
+        assert_eq!(out.len(), len);
+        out
     }
 
     #[test]
@@ -1285,20 +1435,109 @@ mod tests {
             .unwrap()
             .set_modified(fixed_mtime)
             .unwrap();
-        let key_small = cache_key(&path, 64);
+        let key_small = cache_key(&path, 64).unwrap();
 
         fs::write(&path, vec![0u8; 32]).unwrap();
         fs::File::open(&path)
             .unwrap()
             .set_modified(fixed_mtime)
             .unwrap();
-        let key_big = cache_key(&path, 64);
+        let key_big = cache_key(&path, 64).unwrap();
 
         let _ = fs::remove_file(&path);
         assert_ne!(
             key_small, key_big,
             "cache_key must change when only file size changes"
         );
+    }
+
+    #[test]
+    fn same_length_rewrite_with_restored_mtime_is_not_served_from_cache() {
+        // The grid the user picks uploads from must never show the previous
+        // photo. `cp -p`, a restore tool, or a coarse-mtime removable
+        // filesystem can leave path, length and mtime all unchanged while the
+        // bytes are different, so the key has to commit to the bytes too.
+        let _guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let src = std::env::temp_dir().join(format!("immich_shuttle_swap_{}.jpg", Uuid::new_v4()));
+        let blue = jpeg_of_color(48, 48, [10, 20, 200]);
+        let amber = jpeg_of_color(48, 48, [240, 190, 30]);
+        let len = blue.len().max(amber.len()) + 64;
+
+        fs::write(&src, jpeg_padded_to(&blue, len)).unwrap();
+        // Pin the mtime so the two writes are indistinguishable by mtime, size
+        // and path -- exactly the case the old key could not tell apart.
+        let fixed_mtime = std::time::SystemTime::now();
+        fs::File::open(&src)
+            .unwrap()
+            .set_modified(fixed_mtime)
+            .unwrap();
+        let key_before = cache_key(&src, 64).unwrap();
+        let (first, first_outcome, _) = thumbnail_with_source(src.to_str().unwrap(), 64);
+        assert_eq!(first_outcome, ThumbnailOutcome::Ok);
+
+        fs::write(&src, jpeg_padded_to(&amber, len)).unwrap();
+        fs::File::open(&src)
+            .unwrap()
+            .set_modified(fixed_mtime)
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&src).unwrap().len(),
+            len as u64,
+            "the replacement must keep the original byte length"
+        );
+        let key_after = cache_key(&src, 64).unwrap();
+        let (second, second_outcome, second_source) =
+            thumbnail_with_source(src.to_str().unwrap(), 64);
+
+        let cache = cache_dir().unwrap();
+        let _ = fs::remove_file(&src);
+        for key in [&key_before, &key_after] {
+            let _ = fs::remove_file(cache.join(format!("{key}.jpg")));
+            let _ = fs::remove_file(cache.join(format!("{key}.png")));
+        }
+        assert_eq!(second_outcome, ThumbnailOutcome::Ok);
+        assert_eq!(
+            second_source,
+            ThumbnailSource::Rendered,
+            "a same-length, same-mtime rewrite must miss the cache"
+        );
+        assert_ne!(
+            first.data_url, second.data_url,
+            "the second tile must show the new bytes, not the cached photo"
+        );
+    }
+
+    #[test]
+    fn untouched_file_is_served_from_cache_on_the_second_request() {
+        // The strengthened key must still hit for an unchanged file: the grid
+        // renders hundreds of tiles and cannot re-decode every one on re-scan.
+        let _guard = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let src = std::env::temp_dir().join(format!("immich_shuttle_hit_{}.jpg", Uuid::new_v4()));
+        fs::write(&src, jpeg_of(48, 48)).unwrap();
+
+        let (first, first_outcome, first_source) = thumbnail_with_source(src.to_str().unwrap(), 64);
+        let (second, second_outcome, second_source) =
+            thumbnail_with_source(src.to_str().unwrap(), 64);
+
+        let key = cache_key(&src, 64).unwrap();
+        let cache = cache_dir().unwrap();
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(cache.join(format!("{key}.jpg")));
+        let _ = fs::remove_file(cache.join(format!("{key}.png")));
+
+        assert_eq!(first_outcome, ThumbnailOutcome::Ok);
+        assert_eq!(second_outcome, ThumbnailOutcome::Ok);
+        assert_eq!(first_source, ThumbnailSource::Rendered);
+        assert_eq!(
+            second_source,
+            ThumbnailSource::Cache,
+            "an untouched file must hit the cache on the second request"
+        );
+        assert_eq!(first.data_url, second.data_url);
     }
 
     #[test]
@@ -1328,7 +1567,7 @@ mod tests {
         fs::write(&src, jpeg_of(32, 32)).unwrap();
 
         let cache = cache_dir().unwrap();
-        let key = cache_key(&src, MAX_PX);
+        let key = cache_key(&src, MAX_PX).unwrap();
         let jpg = cache.join(format!("{key}.jpg"));
         fs::write(&jpg, b"not a real jpeg").unwrap();
 
@@ -1359,7 +1598,7 @@ mod tests {
         fs::write(&src, jpeg_of(32, 32)).unwrap();
 
         let cache = cache_dir().unwrap();
-        let key = cache_key(&src, MAX_PX);
+        let key = cache_key(&src, MAX_PX).unwrap();
         let jpg = cache.join(format!("{key}.jpg"));
         fs::write(&jpg, b"not a real jpeg").unwrap();
 

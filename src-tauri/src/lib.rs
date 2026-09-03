@@ -22,7 +22,7 @@ fn is_older_than(path: &Path, age: Duration) -> bool {
         .is_some_and(|modified| modified.elapsed().is_ok_and(|elapsed| elapsed >= age))
 }
 
-fn is_canonical_uuid(value: &str) -> bool {
+pub(crate) fn is_canonical_uuid(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|uuid| uuid.hyphenated().to_string() == value)
 }
 
@@ -30,12 +30,6 @@ fn is_temp_artifact_name(name: &str) -> bool {
     ["immich-shuttle-stage-", "immich-shuttle-"]
         .iter()
         .any(|prefix| name.strip_prefix(prefix).is_some_and(is_canonical_uuid))
-}
-
-fn is_run_log_name(name: &str) -> bool {
-    name.strip_prefix("run-")
-        .and_then(|name| name.strip_suffix(".log"))
-        .is_some_and(is_canonical_uuid)
 }
 
 /// Ownership state of a per-run temp artifact, determined via its `.lock` file.
@@ -112,7 +106,10 @@ fn prune_stale_run_logs() {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if is_run_log_name(name) && path.is_file() && is_older_than(&path, STALE_RUN_LOG_AGE) {
+        if crate::services::logs::is_run_log_name(name)
+            && path.is_file()
+            && is_older_than(&path, STALE_RUN_LOG_AGE)
+        {
             let _ = fs::remove_file(path);
         }
     }
@@ -222,6 +219,7 @@ fn install_application_termination_guard(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::logs::is_run_log_name;
 
     const UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
 
@@ -331,6 +329,7 @@ pub fn run() {
             commands::history::history_source_last_import,
             commands::import::scan_sources_stream,
             commands::import::scan_cancel,
+            commands::import::forecast_cancel,
             commands::preview::preview_thumbnails,
             commands::preview::preview_dates,
             commands::preview::preview_cancel,

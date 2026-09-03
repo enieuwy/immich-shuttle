@@ -31,6 +31,10 @@ type ImportOptionsState = {
   excludeExtensions: string[];
 };
 
+/** A whole-store value, as read with `get(importOptionsState)`. Named so a
+ *  caller can hold one across an await and hand it back to `restore`. */
+export type ImportOptionsSnapshot = ImportOptionsState;
+
 const initialState: ImportOptionsState = {
   keepFiles: true,
   stackRawJpeg: true,
@@ -194,6 +198,17 @@ export const importOptionsState = {
       includeExtensions: request.include_extensions ?? [],
       excludeExtensions: request.exclude_extensions ?? [],
     });
+  },
+  /**
+   * Put a value previously read from this store back, wholesale. The undo for
+   * hydrateFromRequest: a History replay that gets abandoned has to drop the
+   * record's options -- `keepFiles: false` above all -- and no combination of
+   * the setters above expresses "exactly what was here before" atomically.
+   * Deliberately does NOT persist: the durable subset in localStorage was never
+   * touched by hydrateFromRequest either, so restoring must not write it back.
+   */
+  restore(snapshot: ImportOptionsSnapshot) {
+    state.set(snapshot);
   },
 };
 

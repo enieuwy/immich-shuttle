@@ -16,6 +16,15 @@ const alreadyTerminal = () =>
     new Error("import_cancel failed: Cannot cancel a terminal import: job-1"),
   );
 
+/** The rejection `import_cancel` produces when the worker finalized between the
+ *  status read and the running-worker lookup — two separate critical sections,
+ *  so the status still said "running" while the worker was already gone.
+ *  Hard-coded for the same reason as `alreadyTerminal` above. */
+const noLongerRunning = () =>
+  Promise.reject(
+    new Error("import_cancel failed: Import is no longer running: job-1"),
+  );
+
 function deps(overrides: Partial<ShutdownDeps> = {}): ShutdownDeps {
   return {
     pendingStarts: [],
@@ -55,6 +64,20 @@ describe("runImportShutdown", () => {
   it("closes when a job went terminal while the confirm prompt was open", async () => {
     const outcome = await runImportShutdown(
       deps({ runningJobIds: ["job-1"], cancelImport: vi.fn(alreadyTerminal) }),
+    );
+
+    expect(outcome).toEqual({ kind: "complete" });
+  });
+
+  /**
+   * The same race one step narrower: `import_cancel` reads the status and looks
+   * up the live worker in two separate critical sections, so a worker that
+   * finalizes in that gap rejects with the missing-worker text instead of the
+   * terminal-cancel one. Nothing is left to stop, so the quit must still close.
+   */
+  it("closes when the worker finalized between the status read and the worker lookup", async () => {
+    const outcome = await runImportShutdown(
+      deps({ runningJobIds: ["job-1"], cancelImport: vi.fn(noLongerRunning) }),
     );
 
     expect(outcome).toEqual({ kind: "complete" });

@@ -66,6 +66,19 @@ pub struct ImportRecord {
     pub uploaded: u32,
     pub duplicates: u32,
     pub errors: u32,
+    /// Set when the run ended with an aggregate fault: work it was asked to do
+    /// that it never proved it did — a non-zero or unobserved sidecar exit, a
+    /// source it could not enumerate, or a selection it could not stage.
+    ///
+    /// Separate from `errors`, which counts per-FILE failures only. A run that
+    /// uploaded one photo and then aborted while enumerating the rest has
+    /// `errors == 0`, so without this flag the receipt claims a clean run and
+    /// the user may reformat the card on the strength of it.
+    ///
+    /// `#[serde(default)]`: records written before this field existed read as
+    /// `false`, which is the honest answer — nothing recorded a fault for them.
+    #[serde(default)]
+    pub incomplete: bool,
     /// The full import request that produced this run, persisted so History can
     /// replay it. Optional: records written before this field existed (and runs
     /// where the request was unavailable) deserialize as `None`.
@@ -103,6 +116,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn old_history_records_default_to_clean_but_new_records_persist_incomplete() {
+        // History is a JSON file that outlives a binary. A record written before
+        // aggregate terminal faults became explicit has no `incomplete` field,
+        // so it must keep loading rather than making every stored receipt fail.
+        let old: ImportRecord = serde_json::from_str(
+            r#"{
+                "id":"old",
+                "started_at":1,
+                "finished_at":2,
+                "profile_id":"p1",
+                "source_paths":[],
+                "album_ids":[],
+                "status":"completed",
+                "total":1,
+                "uploaded":1,
+                "duplicates":0,
+                "errors":0
+            }"#,
+        )
+        .expect("a record written before incomplete existed still loads");
+        assert!(!old.incomplete);
+
+        let mut unclean = old;
+        unclean.incomplete = true;
+        let wire = serde_json::to_value(&unclean).expect("a new record serializes");
+        assert_eq!(wire["incomplete"], true);
+    }
     #[test]
     fn a_newer_builds_status_survives_a_load_and_rewrite() {
         // `append_history` reloads every record and rewrites the whole store, so

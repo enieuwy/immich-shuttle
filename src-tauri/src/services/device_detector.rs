@@ -130,6 +130,154 @@ fn should_include_mount(path: &str, removable: bool) -> bool {
     }
     false
 }
+/// Upper bound on one volume-identity lookup. Identity lookups read the filesystem or shell
+/// out to platform tooling, either of which can hang on a wedged volume.
+const VOLUME_ID_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Runs `resolve` on a worker thread and abandons it after `timeout`. An abandoned or
+/// panicking lookup reads as "identity unknown", so device enumeration does not stall.
+fn resolve_with_timeout(
+    resolve: impl FnOnce() -> Option<String> + Send + 'static,
+    timeout: Duration,
+) -> Option<String> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(resolve());
+    });
+    rx.recv_timeout(timeout).ok().flatten()
+}
+
+/// Pulls `VolumeUUID` out of `diskutil info -plist`. Scanning for the key and the following
+/// `<string>` keeps a whole plist parser out of the dependency list for one scalar, and the
+/// surrounding document shape is fixed by `diskutil`.
+#[cfg(target_os = "macos")]
+fn parse_diskutil_volume_uuid(plist: &str) -> Option<String> {
+    let after_key = plist.split("<key>VolumeUUID</key>").nth(1)?;
+    let open = after_key.find("<string>")? + "<string>".len();
+    let close = after_key[open..].find("</string>")? + open;
+    let uuid = after_key[open..close].trim();
+    (!uuid.is_empty()).then(|| uuid.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn probe_volume_id(mount: &str) -> Option<String> {
+    use std::process::Command;
+
+    let output = Command::new("/usr/sbin/diskutil")
+        .args(["info", "-plist", mount])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_diskutil_volume_uuid(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `/proc/self/mounts` escapes whitespace in its path fields as octal, so the raw field can
+/// never be compared against a real path.
+#[cfg(target_os = "linux")]
+fn unescape_mount_field(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let digits: String = chars.clone().take(3).collect();
+        if digits.len() == 3 && digits.bytes().all(|b| b.is_ascii_digit() && b < b'8') {
+            if let Ok(code) = u8::from_str_radix(&digits, 8) {
+                out.push(code as char);
+                chars.nth(2);
+                continue;
+            }
+        }
+        out.push('\\');
+    }
+    out
+}
+
+/// Field 1 of `/proc/self/mounts` is the backing device node, field 2 the mount point. The
+/// last matching line wins: a later mount over the same directory is the one in effect.
+#[cfg(target_os = "linux")]
+fn parse_mount_source(mounts: &str, mount: &str) -> Option<String> {
+    mounts.lines().rev().find_map(|line| {
+        let mut fields = line.split(' ');
+        let source = fields.next()?;
+        let target = fields.next()?;
+        (unescape_mount_field(target) == mount).then(|| unescape_mount_field(source))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn probe_volume_id(mount: &str) -> Option<String> {
+    use std::fs;
+
+    let mounts = fs::read_to_string("/proc/self/mounts").ok()?;
+    let source = parse_mount_source(&mounts, mount)?;
+    let device = fs::canonicalize(source).ok()?;
+    for entry in fs::read_dir("/dev/disk/by-uuid").ok()?.flatten() {
+        if fs::canonicalize(entry.path()).ok().as_deref() == Some(device.as_path()) {
+            return Some(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// `mountvol <path> /L` prints the volume GUID path (`\\?\Volume{…}\`), the Windows-stable
+/// per-volume identity. `mountvol` ships with the OS, so this needs no crate and no FFI.
+#[cfg(target_os = "windows")]
+fn parse_mountvol_guid(output: &str) -> Option<String> {
+    output
+        .split_whitespace()
+        .find(|token| token.starts_with(r"\\?\Volume{"))
+        .map(|token| token.trim_end_matches('\\').to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn probe_volume_id(mount: &str) -> Option<String> {
+    use std::process::Command;
+
+    // `mountvol` only accepts a directory path with a trailing separator.
+    let mut path = mount.to_string();
+    if !path.ends_with('\\') {
+        path.push('\\');
+    }
+    let output = Command::new("cmd")
+        .args(["/C", "mountvol", &path, "/L"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_mountvol_guid(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn probe_volume_id(_mount: &str) -> Option<String> {
+    None
+}
+
+/// Resolves a volume identity through one fresh, bounded platform probe.
+///
+/// Callers must treat `None` as untrusted. This function deliberately keeps no result cache:
+/// a mount path can be reused by a different card before a device refresh observes an eject.
+fn resolve_volume_identity(
+    path: &Path,
+    resolve: impl FnOnce(String) -> Option<String> + Send + 'static,
+) -> Option<String> {
+    let mount = path.to_str()?.to_owned();
+    resolve_with_timeout(move || resolve(mount), VOLUME_ID_TIMEOUT)
+}
+
+/// Returns the stable identity for the volume mounted at `path`.
+///
+/// This always performs a fresh, bounded OS probe. A replacement at the same mount path must
+/// never inherit the former volume's identity. It returns `None` when the OS cannot prove an
+/// identity or the probe fails or times out.
+pub fn volume_identity_for_path(path: &Path) -> Option<String> {
+    resolve_volume_identity(path, |mount| probe_volume_id(&mount))
+}
 
 pub fn list_removable_devices() -> Vec<RemovableDevice> {
     let disks = Disks::new_with_refreshed_list();
@@ -149,14 +297,18 @@ pub fn list_removable_devices() -> Vec<RemovableDevice> {
                 total_space: disk.total_space(),
                 available_space: disk.available_space(),
                 has_dcim: false,
+                volume_id: None,
             })
         })
         .collect::<Vec<_>>();
 
+    // Do not cache identities across refreshes. A new card can replace an old card at the
+    // same mount path and report the same capacity before the detector sees an eject.
     candidates
         .into_iter()
         .map(|mut device| {
             device.has_dcim = has_dcim(&device.mount_path);
+            device.volume_id = volume_identity_for_path(Path::new(&device.mount_path));
             device
         })
         .collect()
@@ -308,5 +460,107 @@ mod tests {
         assert!(should_include_mount("/mnt/card", false));
         assert!(!should_include_mount("/", false));
         assert!(!should_include_mount("/home/ellis", false));
+    }
+
+    /// A path that is not a mount point anywhere. An identity the platform cannot prove
+    /// must read as unknown; an error or a panic here would take down device enumeration.
+    #[test]
+    fn unresolvable_mount_yields_no_identity() {
+        assert_eq!(
+            volume_identity_for_path(Path::new("/nonexistent-immich-shuttle-mount")),
+            None
+        );
+    }
+
+    /// A recycled mount path and capacity must still get a new identity probe. Otherwise a
+    /// rule for the ejected card can select post-import deletion for the replacement card.
+    #[test]
+    fn volume_identity_is_fresh_for_every_detector_refresh() {
+        fn counting_probe(calls: Arc<AtomicUsize>) -> impl FnOnce(String) -> Option<String> + Send {
+            move |_| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                Some(format!("VOL-UUID-{call}"))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mount = Path::new("/Volumes/test-identity-refresh");
+
+        let first = resolve_volume_identity(mount, counting_probe(Arc::clone(&calls)));
+        let second = resolve_volume_identity(mount, counting_probe(Arc::clone(&calls)));
+
+        assert_eq!(first.as_deref(), Some("VOL-UUID-0"));
+        assert_eq!(second.as_deref(), Some("VOL-UUID-1"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A wedged volume must not stall enumeration: an abandoned lookup reads as unknown.
+    #[test]
+    fn hung_identity_lookup_times_out_to_unknown() {
+        let started = Instant::now();
+        let resolved = resolve_with_timeout(
+            || {
+                thread::sleep(Duration::from_millis(250));
+                Some("late".to_string())
+            },
+            Duration::from_millis(10),
+        );
+
+        assert_eq!(resolved, None);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    /// The one scalar we read out of `diskutil info -plist`. A volume with no UUID (many
+    /// FAT-formatted cards) must read as unknown rather than as an empty identity that
+    /// every such card would share.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn diskutil_plist_volume_uuid_is_extracted() {
+        let plist = concat!(
+            "<plist><dict>\n",
+            "\t<key>VolumeName</key>\n\t<string>Untitled</string>\n",
+            "\t<key>VolumeUUID</key>\n\t<string>0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9</string>\n",
+            "</dict></plist>\n"
+        );
+
+        assert_eq!(
+            parse_diskutil_volume_uuid(plist).as_deref(),
+            Some("0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9")
+        );
+        assert_eq!(parse_diskutil_volume_uuid("<plist><dict/></plist>"), None);
+        assert_eq!(
+            parse_diskutil_volume_uuid("<key>VolumeUUID</key><string>  </string>"),
+            None
+        );
+    }
+
+    /// `/proc/self/mounts` octal-escapes whitespace, so the raw field never matches a real
+    /// path and the device node would be looked up against the wrong line.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_source_is_read_from_the_last_matching_proc_line() {
+        let mounts = concat!(
+            "/dev/sda1 / ext4 rw 0 0\n",
+            "/dev/sdb1 /media/ellis/SD\\040CARD vfat rw 0 0\n",
+            "/dev/sdc1 /media/ellis/SD\\040CARD vfat rw 0 0\n"
+        );
+
+        assert_eq!(
+            parse_mount_source(mounts, "/media/ellis/SD CARD").as_deref(),
+            Some("/dev/sdc1")
+        );
+        assert_eq!(parse_mount_source(mounts, "/media/ellis/SD"), None);
+    }
+
+    /// `mountvol /L` pads the GUID path with whitespace and a trailing separator.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn mountvol_guid_path_is_extracted() {
+        let output = "\r\n    \\\\?\\Volume{9a1b2c3d-0000-0000-0000-100000000000}\\\r\n";
+        assert_eq!(
+            parse_mountvol_guid(output).as_deref(),
+            Some("\\\\?\\Volume{9a1b2c3d-0000-0000-0000-100000000000}")
+        );
+        assert_eq!(parse_mountvol_guid("There is no volume mounted"), None);
     }
 }

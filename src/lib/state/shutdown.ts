@@ -87,9 +87,18 @@ export type ShutdownDeps = {
  * terminal: the backend cannot await work that it has already removed. Any
  * OTHER rejection (lock failure, timeout, unknown job) means cancellation may
  * not have taken effect and must still block the close.
+ *
+ * `IMPORT_NOT_RUNNING` is the same race one step narrower. `import_cancel`
+ * reads the job status and then looks up the live worker in a SEPARATE critical
+ * section, so a worker that finalizes in that gap leaves a still-running status
+ * with no cancel flag to raise. Nothing is left to stop, and `awaitTerminal`
+ * still proves the id terminal, so refusing the quit here would strand the user
+ * behind an import that has already stopped.
  */
 function isAlreadyTerminal(reason: unknown): boolean {
-  return isBackendError(reason, "TERMINAL_CANCEL");
+  return (
+    isBackendError(reason, "TERMINAL_CANCEL") || isBackendError(reason, "IMPORT_NOT_RUNNING")
+  );
 }
 
 /**

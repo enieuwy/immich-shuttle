@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 
 import { avatarDisplayState, paletteState } from "./theme";
@@ -36,8 +36,14 @@ describe("paletteState", () => {
 });
 
 describe("avatarDisplayState", () => {
-  it("defaults to initials and persists an explicit choice", () => {
-    expect(["initials", "photos"]).toContain(avatarDisplayState.display);
+  it("defaults to initials when local storage has no choice", async () => {
+    localStorage.clear();
+    vi.resetModules();
+    const { avatarDisplayState } = await import("./theme");
+    expect(avatarDisplayState.display).toBe("initials");
+  });
+
+  it("persists an explicit display choice", () => {
     avatarDisplayState.setDisplay("photos");
     expect(avatarDisplayState.display).toBe("photos");
     expect(localStorage.getItem("immich-shuttle-avatar-display")).toBe("photos");

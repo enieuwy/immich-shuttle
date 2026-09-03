@@ -19,6 +19,13 @@ use std::{
 };
 use uuid::Uuid;
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_NEXT_LINK_FAILURE_AFTER_DESTINATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_STAGING_DESTINATION_REMOVAL_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCED_PARTIAL_DESTINATION: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 /// The paths immich-go saw for successfully linked files and their user-selected
 /// originals. The run log is parsed after the staging directory is removed, so
 /// callers must take this map before moving the guard into cleanup.
@@ -48,6 +55,20 @@ impl StagingPathMap {
     }
 }
 
+/// One selection that could not be staged, and why.
+///
+/// Finalization derives its errors from the immich-go run log, which can never
+/// mention a file that was never offered to it. Without this record a silently
+/// omitted selection is reported to the user as a clean success.
+#[derive(Debug, Clone)]
+pub struct StagingFailure {
+    /// The selected path exactly as the caller gave it, so the caller can match
+    /// the failure back to the entry the user picked.
+    pub source: String,
+    /// User-facing reason this selection never reached the staging directory.
+    pub message: String,
+}
+
 /// Owns a temporary staging directory and removes it when dropped.
 ///
 /// Normal callers should move this into [`cleanup_staging_dir`] on a blocking
@@ -57,6 +78,13 @@ pub struct StagingDir {
     path: Option<PathBuf>,
     lock: Option<fs::File>,
     links: StagingPathMap,
+    /// How many selections staging was asked for. Compared against `links` and
+    /// `failures`, this is what lets a caller see that a run staged fewer files
+    /// than the user picked.
+    pub requested: usize,
+    /// One entry per selection that was omitted. Always populated, including on
+    /// a run that staged something.
+    pub failures: Vec<StagingFailure>,
 }
 
 impl StagingDir {
@@ -156,6 +184,8 @@ pub fn create_staging_dir(
         path: Some(root),
         lock: Some(lock),
         links: StagingPathMap::default(),
+        requested: selected.len(),
+        failures: Vec::new(),
     };
 
     let base = common_ancestor(selected);
@@ -177,6 +207,10 @@ pub fn create_staging_dir(
         }
         let src = Path::new(entry);
         if !src.is_file() {
+            guard.failures.push(StagingFailure {
+                source: entry.clone(),
+                message: "Not a file: it is missing, a folder, or unreadable".to_string(),
+            });
             continue;
         }
         let rel = base
@@ -187,33 +221,96 @@ pub fn create_staging_dir(
         // Strip any `..`/`.`/root components so a crafted selection can never
         // resolve to a destination outside the temp staging sandbox.
         let Some(rel) = safe_relative(&rel) else {
+            guard.failures.push(StagingFailure {
+                source: entry.clone(),
+                message: "The selection has no usable file name".to_string(),
+            });
             continue;
         };
         // Disambiguate name collisions — e.g. the same filename picked from two
         // drives with no common ancestor, which both collapse to the same
         // relative path — by nesting later hits under a numeric subfolder, so a
         // second file never silently overwrites the first in the staging dir.
-        let mut dest = guard.path().join(&rel);
-        let mut n = 1_usize;
-        while used.contains(&dest) {
-            dest = guard.path().join(n.to_string()).join(&rel);
-            n += 1;
-        }
-        // Belt-and-suspenders: never write outside `root`.
-        if !dest.starts_with(guard.path()) {
-            continue;
-        }
-        if let Some(parent) = dest.parent() {
-            if fs::create_dir_all(parent).is_err() {
+        //
+        // `used` is a fast pre-check only, never the decision. It compares
+        // paths byte-for-byte, while the staging filesystem may fold case or
+        // Unicode normalization (APFS, HFS+, NTFS): there `IMG_1.JPG` and
+        // `img_1.jpg` are two entries in `used` but one entry on disk. So the
+        // filesystem decides — every candidate is created exclusively, and an
+        // `AlreadyExists` moves to the next candidate instead of writing
+        // through what is already there, which for a staged symlink means
+        // truncating another selection's original on the source media.
+        //
+        // The retry is bounded: a collision can only come from a destination an
+        // earlier entry staged. Failed attempts either remove their destination
+        // or abort staging, so no unknown bytes remain in this upload tree.
+        // The margin stops a filesystem that keeps calling a name taken without
+        // ever letting us create it.
+        let attempts = used.len() + 8;
+        let mut staged = None;
+        let mut failure: Option<String> = None;
+        for attempt in 0..attempts {
+            let dest = match attempt {
+                0 => guard.path().join(&rel),
+                n => guard.path().join(n.to_string()).join(&rel),
+            };
+            if used.contains(&dest) {
                 continue;
+            }
+            // Belt-and-suspenders: never write outside `root`.
+            if !dest.starts_with(guard.path()) {
+                failure =
+                    Some("The staging destination fell outside the staging folder".to_string());
+                break;
+            }
+            if let Some(parent) = dest.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    failure = Some(format!("Could not create the staging folder: {e}"));
+                    break;
+                }
+            }
+            match link_file(src, &dest, progress) {
+                Ok(()) => {
+                    staged = Some(dest);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    // The attempt may have created the destination before it
+                    // failed — the copy fallback opens `dest` with `create_new`
+                    // and can still die on the read or the write. Anything left
+                    // there is a partial file that immich-go would upload as a
+                    // complete asset, and that is absent from `links`, so it
+                    // could not even be mapped back to its original.
+                    match remove_staging_destination(&dest) {
+                        Ok(()) => {}
+                        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(cleanup) => {
+                            // Do not return a guard that points an uploader at a
+                            // tree containing bytes we could not prove safe.
+                            guard.cleanup();
+                            return Err(format!(
+                                "Could not stage the file: {e}; could not remove the partial staging output: {cleanup}"
+                            ));
+                        }
+                    }
+                    failure = Some(format!("Could not stage the file: {e}"));
+                    break;
+                }
             }
         }
         // A single unreadable/locked/failed file must not abort the whole batch;
-        // skip it and keep staging the rest. The `linked == 0` check below still
-        // fails the run when nothing could be staged at all.
-        if link_file(src, &dest, progress).is_err() {
+        // record why it was omitted and keep staging the rest. The `linked == 0`
+        // check below still fails the run when nothing could be staged at all.
+        let Some(dest) = staged else {
+            guard.failures.push(StagingFailure {
+                source: entry.clone(),
+                message: failure.unwrap_or_else(|| {
+                    format!("Staging failed after {attempts} attempts: every destination name was taken")
+                }),
+            });
             continue;
-        }
+        };
         guard.links.push(dest.clone(), PathBuf::from(entry));
         used.insert(dest);
         linked += 1;
@@ -253,31 +350,66 @@ pub(crate) fn acquire_dir_lock(dir: &Path) -> std::io::Result<fs::File> {
     }
 }
 
+fn remove_staging_destination(dest: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FORCE_STAGING_DESTINATION_REMOVAL_FAILURE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected staging destination removal failure",
+        ));
+    }
+    fs::remove_file(dest)
+}
+
 /// Link `src` into `dest`, falling back to a copy, and report bytes moved.
+///
+/// Every attempt is exclusive, and an `AlreadyExists` error is returned as it
+/// is instead of being read as a missing capability: a taken `dest` is a
+/// collision only the caller can resolve, by picking another name. Falling
+/// through to the copy would open whatever already sits there, and when that is
+/// the symlink staging created for an earlier selection, opening it truncates
+/// that user's original file.
 ///
 /// The copy is chunked rather than `fs::copy` so a single large file still ticks
 /// `progress`. Callers use that tick to tell a source that is working from one
 /// that has stopped answering; a whole-file `fs::copy` looks identical to a dead
 /// mount for as long as it runs, which on Windows or across volumes — the only
 /// cases that reach the fallback — can be minutes per file.
-fn link_file(src: &Path, dest: &Path, progress: &AtomicU64) -> Result<(), String> {
+fn link_file(src: &Path, dest: &Path, progress: &AtomicU64) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FORCE_NEXT_LINK_FAILURE_AFTER_DESTINATION.with(|failure| failure.replace(false)) {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dest)?;
+        FORCED_PARTIAL_DESTINATION.with(|path| {
+            path.replace(Some(dest.to_path_buf()));
+        });
+        return Err(std::io::Error::other("injected failed staging link"));
+    }
+
     #[cfg(unix)]
     {
-        if std::os::unix::fs::symlink(src, dest).is_ok() {
-            return Ok(());
+        match std::os::unix::fs::symlink(src, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
+            Err(_) => {}
         }
     }
     #[cfg(windows)]
     {
-        if std::os::windows::fs::symlink_file(src, dest).is_ok() {
-            return Ok(());
+        match std::os::windows::fs::symlink_file(src, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
+            Err(_) => {}
         }
     }
-    if fs::hard_link(src, dest).is_ok() {
-        return Ok(());
+    match fs::hard_link(src, dest) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
+        Err(_) => {}
     }
     copy_reporting_progress(src, dest, progress)
-        .map_err(|e| format!("Could not stage {}: {e}", src.display()))
 }
 
 /// Chunk size for the copy fallback. Large enough that the read/write syscalls
@@ -286,7 +418,36 @@ const COPY_CHUNK: usize = 1024 * 1024;
 
 fn copy_reporting_progress(src: &Path, dest: &Path, progress: &AtomicU64) -> std::io::Result<()> {
     let mut reader = fs::File::open(src)?;
-    let mut writer = fs::File::create(dest)?;
+    // `create_new`, never `File::create`: create truncates an existing
+    // destination and follows a symlink at that path, so staging would write
+    // through the link made for an earlier selection and destroy that file's
+    // original on the source media before anything was uploaded.
+    let mut writer = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    // `create_new` proved nothing else owned `dest`, so the file is ours from
+    // here and we must not leave it behind half-written. A read error on the
+    // source or a write error on a dying mount stops the copy mid-file, and
+    // immich-go uploads whatever it finds in the staging tree: a truncated
+    // photo would reach the server as a complete asset, and because the caller
+    // never records a failed destination in its link map, it could not be
+    // mapped back to its original either.
+    let copied = copy_chunks(&mut reader, &mut writer, progress);
+    if copied.is_err() {
+        // Close the handle first so the removal cannot race our own writer.
+        // `create_staging_dir` retries this removal and aborts when it fails.
+        drop(writer);
+        let _ = remove_staging_destination(dest);
+    }
+    copied
+}
+
+fn copy_chunks(
+    reader: &mut fs::File,
+    writer: &mut fs::File,
+    progress: &AtomicU64,
+) -> std::io::Result<()> {
     let mut buf = vec![0u8; COPY_CHUNK];
     loop {
         let read = reader.read(&mut buf)?;
@@ -348,6 +509,33 @@ fn safe_relative(rel: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StagingLinkFailure;
+
+    impl StagingLinkFailure {
+        fn enable(cleanup_fails: bool) -> Self {
+            FORCE_NEXT_LINK_FAILURE_AFTER_DESTINATION.with(|failure| failure.set(true));
+            FORCE_STAGING_DESTINATION_REMOVAL_FAILURE.with(|failure| failure.set(cleanup_fails));
+            FORCED_PARTIAL_DESTINATION.with(|path| {
+                path.replace(None);
+            });
+            Self
+        }
+
+        fn partial_destination(&self) -> Option<PathBuf> {
+            FORCED_PARTIAL_DESTINATION.with(|path| path.borrow().clone())
+        }
+    }
+
+    impl Drop for StagingLinkFailure {
+        fn drop(&mut self) {
+            FORCE_NEXT_LINK_FAILURE_AFTER_DESTINATION.with(|failure| failure.set(false));
+            FORCE_STAGING_DESTINATION_REMOVAL_FAILURE.with(|failure| failure.set(false));
+            FORCED_PARTIAL_DESTINATION.with(|path| {
+                path.replace(None);
+            });
+        }
+    }
 
     #[test]
     fn stages_selected_files_preserving_names() {
@@ -532,6 +720,109 @@ mod tests {
         fs::remove_dir_all(&tmp).unwrap();
     }
 
+    /// Staging must never write through what already sits at a destination. The
+    /// entry there is a symlink to a user's original, so an opening truncate
+    /// destroys the very file the run exists to upload — before one byte is
+    /// sent. Both the copy fallback and `link_file` must refuse instead.
+    #[test]
+    fn an_existing_destination_is_refused_and_the_source_survives() {
+        let tmp = std::env::temp_dir().join(format!("stage-clobber-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let original = tmp.join("original.jpg");
+        fs::write(&original, b"original bytes").unwrap();
+        let other = tmp.join("other.jpg");
+        fs::write(&other, b"other bytes").unwrap();
+        // The destination an earlier selection would have staged: a symlink
+        // pointing straight at a source file.
+        let dest = tmp.join("staged.jpg");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&original, &dest).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&original, &dest).unwrap();
+
+        let error = copy_reporting_progress(&other, &dest, &AtomicU64::new(0))
+            .expect_err("the copy fallback must refuse an existing destination");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&original).unwrap(), b"original bytes");
+
+        // A taken destination is a collision, not a missing link capability, so
+        // `link_file` reports it rather than falling back to the copy.
+        let error = link_file(&other, &dest, &AtomicU64::new(0))
+            .expect_err("a taken destination must not reach the copy fallback");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&original).unwrap(), b"original bytes");
+        assert_eq!(fs::read(&other).unwrap(), b"other bytes");
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Two selections whose staged relative names differ only by ASCII case
+    /// alias to ONE destination on a case-insensitive volume (default APFS,
+    /// NTFS), which the byte-for-byte `used` set cannot see. Each selection
+    /// still needs its own staged entry, and no source may be written through.
+    #[test]
+    fn case_variant_names_stage_to_distinct_destinations() {
+        let tmp = std::env::temp_dir().join(format!("stage-case-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let lower = tmp.join("photo.jpg");
+        let upper = tmp.join("PHOTO.JPG");
+        fs::write(&lower, b"lower bytes").unwrap();
+        fs::write(&upper, b"upper bytes").unwrap();
+        // One write clobbering the other is how the test learns the volume
+        // folds case: there the two selections are one file under two names.
+        let folds_case = fs::read(&lower).unwrap() == b"upper bytes";
+
+        let staged = create_staging_dir(
+            &[
+                lower.to_string_lossy().to_string(),
+                upper.to_string_lossy().to_string(),
+            ],
+            None,
+            None,
+            &AtomicU64::new(0),
+        )
+        .unwrap();
+
+        let destinations: Vec<PathBuf> = staged
+            .links()
+            .entries()
+            .iter()
+            .map(|(destination, _)| destination.clone())
+            .collect();
+        assert_eq!(destinations.len(), 2, "both selections must be staged");
+        assert_ne!(
+            destinations[0], destinations[1],
+            "case variants must not share one staged destination"
+        );
+        assert_eq!(
+            walkdir_files(staged.path()).len(),
+            2,
+            "each selection needs its own entry on the staging filesystem"
+        );
+        if folds_case {
+            // The filesystem, not `used`, caught the alias, so the second entry
+            // took the next disambiguated candidate.
+            assert!(destinations[1].starts_with(staged.path().join("1")));
+        }
+        for destination in &destinations {
+            assert!(
+                !fs::read(destination).unwrap().is_empty(),
+                "a staged entry must resolve to its source's bytes"
+            );
+        }
+
+        // The sources are exactly as the setup left them: nothing was truncated.
+        let expected_lower: &[u8] = if folds_case {
+            b"upper bytes"
+        } else {
+            b"lower bytes"
+        };
+        assert_eq!(fs::read(&lower).unwrap(), expected_lower);
+        assert_eq!(fs::read(&upper).unwrap(), b"upper bytes");
+
+        cleanup_staging_dir(staged);
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
     #[test]
     fn safe_relative_strips_traversal() {
         assert_eq!(
@@ -670,6 +961,31 @@ mod tests {
             .iter()
             .all(|(_, original)| original != &missing && original != &directory));
 
+        // Accepting 2 of 4 is only correct if the caller can see the other 2.
+        // Finalization builds its errors from the immich-go run log, which can
+        // never mention a file that was never offered to it.
+        assert_eq!(staged.requested, 4);
+        let omitted: Vec<String> = staged
+            .failures
+            .iter()
+            .map(|failure| failure.source.clone())
+            .collect();
+        assert_eq!(
+            omitted,
+            vec![
+                missing.to_string_lossy().to_string(),
+                directory.to_string_lossy().to_string(),
+            ]
+        );
+        assert!(
+            staged
+                .failures
+                .iter()
+                .all(|failure| failure.message.contains("Not a file")),
+            "each omission must name its reason: {:?}",
+            staged.failures
+        );
+
         cleanup_staging_dir(staged);
         fs::remove_dir_all(&tmp).unwrap();
     }
@@ -697,6 +1013,234 @@ mod tests {
             error.contains("None of the selected files could be staged"),
             "unexpected staging error: {error}"
         );
+    }
+
+    /// The copy fallback opens `dest` with `create_new` and only then starts
+    /// reading, so a source that dies mid-copy leaves a TRUNCATED file in the
+    /// staging tree. immich-go uploads whatever it finds there, and the failed
+    /// destination is absent from the link map, so that partial photo would
+    /// reach the server as a complete asset and escape the completed-path
+    /// bookkeeping delete-after-import relies on. Nothing may survive a failed
+    /// copy.
+    ///
+    /// Unix only: the failure is provoked deterministically by copying from a
+    /// directory, where `open` succeeds and the first `read` returns `EISDIR`,
+    /// which is exactly a source that stops answering after the destination
+    /// exists. Windows refuses the `open`, so the destination is never created
+    /// there and the test would prove nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_copy_leaves_no_partial_file_at_the_destination() {
+        let tmp = std::env::temp_dir().join(format!("stage-partial-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        // Opens like a file, fails on the first read.
+        let unreadable_source = tmp.join("source");
+        fs::create_dir(&unreadable_source).unwrap();
+        let dest = tmp.join("staged.jpg");
+
+        let error = copy_reporting_progress(&unreadable_source, &dest, &AtomicU64::new(0))
+            .expect_err("a source that cannot be read must fail the copy");
+
+        assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "the destination must have been created before the read failed"
+        );
+        assert!(
+            !dest.exists(),
+            "a failed copy must not leave a partial file at {}",
+            dest.display()
+        );
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// A failed attempt can leave a destination behind after creating it. If
+    /// removing that artifact also fails, returning a partial `StagingDir`
+    /// would let immich-go scan and upload the unknown file.
+    #[test]
+    fn cleanup_failure_aborts_staging_and_removes_the_upload_tree() {
+        let tmp = std::env::temp_dir().join(format!("stage-cleanup-failure-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("source.jpg");
+        fs::write(&source, b"original bytes").unwrap();
+
+        let fault = StagingLinkFailure::enable(true);
+        let error = match create_staging_dir(
+            &[source.to_string_lossy().to_string()],
+            None,
+            None,
+            &AtomicU64::new(0),
+        ) {
+            Err(error) => error,
+            Ok(staged) => {
+                cleanup_staging_dir(staged);
+                panic!("a cleanup failure must not return an upload tree");
+            }
+        };
+        let partial_destination = fault
+            .partial_destination()
+            .expect("the injected failed attempt must create a destination");
+        drop(fault);
+
+        assert!(
+            error.contains("could not remove the partial staging output"),
+            "the cleanup error must reject staging: {error}"
+        );
+        assert!(
+            !partial_destination.parent().unwrap().exists(),
+            "an error must leave no staging tree for an uploader to scan"
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"original bytes");
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn a_failed_attempt_with_successful_cleanup_allows_later_staging() {
+        let tmp = std::env::temp_dir().join(format!("stage-cleanup-success-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let failed = tmp.join("failed.jpg");
+        let valid = tmp.join("valid.jpg");
+        fs::write(&failed, b"first original").unwrap();
+        fs::write(&valid, b"second original").unwrap();
+
+        let fault = StagingLinkFailure::enable(false);
+        let staged = create_staging_dir(
+            &[
+                failed.to_string_lossy().to_string(),
+                valid.to_string_lossy().to_string(),
+            ],
+            None,
+            None,
+            &AtomicU64::new(0),
+        )
+        .expect("a cleaned failed attempt must not abort later staging");
+        let partial_destination = fault
+            .partial_destination()
+            .expect("the injected failed attempt must create a destination");
+        drop(fault);
+
+        assert!(!partial_destination.exists());
+        assert_eq!(staged.links().entries().len(), 1);
+        assert_eq!(staged.failures.len(), 1);
+        assert_eq!(
+            staged
+                .links()
+                .original_for(&staged.path().join("valid.jpg")),
+            Some(valid.as_path())
+        );
+        assert_eq!(fs::read(&failed).unwrap(), b"first original");
+        assert_eq!(fs::read(&valid).unwrap(), b"second original");
+
+        cleanup_staging_dir(staged);
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Omitted selections must not consume the destination names later
+    /// selections need. A run of same-name failures used to be able to occupy
+    /// candidate after candidate, and the bound counted only successes, so a
+    /// perfectly readable file that resolved to that name found no free
+    /// candidate and was dropped from the import without a word.
+    #[test]
+    fn a_run_of_same_name_failures_still_lets_a_later_valid_file_stage() {
+        let tmp = std::env::temp_dir().join(format!("stage-starve-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        // A relative entry leaves the selection with no common ancestor, so
+        // every entry stages under its bare file name — the "same file name
+        // from two drives" shape, which is the only way distinct selections
+        // compete for one relative name. The name is one no working directory
+        // holds, so this entry is itself an omitted selection.
+        let mut selected = vec![format!("no-such-relative-{}.jpg", Uuid::new_v4())];
+        for index in 0..8 {
+            let folder = tmp.join(format!("d{index}"));
+            fs::create_dir_all(&folder).unwrap();
+            // Named exactly like the valid file below, and unstageable.
+            let decoy = folder.join("photo.jpg");
+            fs::create_dir(&decoy).unwrap();
+            selected.push(decoy.to_string_lossy().to_string());
+        }
+        let valid_folder = tmp.join("real");
+        fs::create_dir_all(&valid_folder).unwrap();
+        let valid = valid_folder.join("photo.jpg");
+        fs::write(&valid, b"valid bytes").unwrap();
+        selected.push(valid.to_string_lossy().to_string());
+
+        let staged = create_staging_dir(&selected, None, None, &AtomicU64::new(0))
+            .expect("a valid file after a run of failures must still stage");
+
+        assert_eq!(staged.links().entries().len(), 1);
+        let first_candidate = staged.path().join("photo.jpg");
+        assert_eq!(
+            staged.links().original_for(&first_candidate),
+            Some(valid.as_path()),
+            "the failures freed nothing, so the valid file took the first candidate"
+        );
+        assert_eq!(fs::read(&first_candidate).unwrap(), b"valid bytes");
+        assert_eq!(staged.requested, 10);
+        assert_eq!(
+            staged.failures.len(),
+            9,
+            "every omitted selection is reported: {:?}",
+            staged.failures
+        );
+
+        cleanup_staging_dir(staged);
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// `requested` and `failures` are the caller's only evidence that a run
+    /// staged fewer files than the user picked, so they must be exact: one
+    /// entry per omitted selection, in selection order, and duplicates of a
+    /// valid file counted once each rather than folded together.
+    #[test]
+    fn requested_and_failures_are_exact_for_a_mixed_selection() {
+        let tmp = std::env::temp_dir().join(format!("stage-count-{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let valid = tmp.join("kept.jpg");
+        fs::write(&valid, b"kept").unwrap();
+        let folder = tmp.join("album");
+        fs::create_dir_all(&folder).unwrap();
+        let missing = tmp.join("gone.jpg");
+        let also_missing = tmp.join("gone-too.jpg");
+
+        let selected = vec![
+            missing.to_string_lossy().to_string(),
+            valid.to_string_lossy().to_string(),
+            folder.to_string_lossy().to_string(),
+            valid.to_string_lossy().to_string(),
+            also_missing.to_string_lossy().to_string(),
+        ];
+        let staged = create_staging_dir(&selected, None, None, &AtomicU64::new(0)).unwrap();
+
+        assert_eq!(staged.requested, 5);
+        assert_eq!(staged.links().entries().len(), 2);
+        let omitted: Vec<String> = staged
+            .failures
+            .iter()
+            .map(|failure| failure.source.clone())
+            .collect();
+        assert_eq!(
+            omitted,
+            vec![
+                missing.to_string_lossy().to_string(),
+                folder.to_string_lossy().to_string(),
+                also_missing.to_string_lossy().to_string(),
+            ]
+        );
+        // Staged plus omitted accounts for every selection, which is what lets
+        // finalization refuse to call a partial run a clean success.
+        assert_eq!(
+            staged.links().entries().len() + staged.failures.len(),
+            staged.requested
+        );
+        for failure in &staged.failures {
+            assert!(
+                !failure.message.is_empty(),
+                "every omission needs a user-facing reason"
+            );
+        }
+
+        cleanup_staging_dir(staged);
+        fs::remove_dir_all(&tmp).unwrap();
     }
 
     fn walkdir_files(root: &Path) -> Vec<PathBuf> {

@@ -42,11 +42,12 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import * as api from "$lib/api";
-import type { Album, ImportInput, ImportRecord } from "$lib/types";
+import type { Album, ImportInput, ImportRecord, ScanSummary } from "$lib/types";
 import { profilesState, activeProfile } from "./profiles";
 import { albumsState } from "./albums";
 import { sourceState } from "./source";
 import { errorsState } from "./errors";
+import { importOptionsState } from "./import-options";
 import { historyState, replayImport } from "./history";
 
 function importRequest(overrides: Partial<ImportInput> = {}): ImportInput {
@@ -293,5 +294,170 @@ describe("replayImport", () => {
 
     const errors = get(errorsState);
     expect(errors.some((e) => /profile changed/i.test(e.message))).toBe(true);
+  });
+
+  it("abandons the staged source if the active profile changes while it is scanning", async () => {
+    await saveProfile("p1", "https://one.example.com");
+    await saveProfile("p2", "https://two.example.com");
+
+    // Block the source scan so the profile can be switched while it is in
+    // flight -- the scan is the last await of the replay and ProfileSelector
+    // stays interactive for all of it.
+    const gate = Promise.withResolvers<ScanSummary>();
+    let scanStarted = false;
+    vi.mocked(api.scanSourcesStream).mockImplementationOnce(() => {
+      scanStarted = true;
+      return gate.promise;
+    });
+
+    const record = importRecord("r1", { profile_id: "p1", source_paths: ["/old-card"] });
+    const errorCountBefore = get(errorsState).length;
+
+    const replay = replayImport(record);
+    await vi.waitFor(() => expect(scanStarted).toBe(true));
+
+    profilesState.setActiveProfile("p2");
+    gate.resolve({
+      status: "complete",
+      photo_count: 1,
+      video_count: 0,
+      total_size_bytes: 10,
+      skipped_unreadable: 0,
+    });
+
+    expect(await replay).toBe("staged");
+    expect(get(activeProfile)?.id).toBe("p2");
+    // The record's source must not stay committed under the new profile: the
+    // album subscription clears album state on a switch but never the source,
+    // so a surviving commit would offer the old run's source and options as
+    // though they had been reviewed for p2.
+    expect(get(sourceState).selectedPaths).toEqual([]);
+    expect(get(sourceState).scanResult).toBeNull();
+    expect(
+      get(errorsState)
+        .slice(errorCountBefore)
+        .some((e) => /profile changed/i.test(e.message)),
+    ).toBe(true);
+  });
+
+  it("leaves a source the user established after the switch alone when it abandons", async () => {
+    await saveProfile("p1", "https://one.example.com");
+    await saveProfile("p2", "https://two.example.com");
+
+    const gate = Promise.withResolvers<ScanSummary>();
+    let scanStarted = false;
+    vi.mocked(api.scanSourcesStream).mockImplementationOnce(() => {
+      scanStarted = true;
+      return gate.promise;
+    });
+
+    const record = importRecord("r1", { profile_id: "p1", source_paths: ["/old-card"] });
+    const errorCountBefore = get(errorsState).length;
+
+    const replay = replayImport(record);
+    await vi.waitFor(() => expect(scanStarted).toBe(true));
+
+    // The user switches profiles and then picks a fresh card for it. That
+    // selection supersedes the replay's scan and owns the source from here on.
+    profilesState.setActiveProfile("p2");
+    sourceState.clearSource();
+    await sourceState.selectSources(["/new-card"]);
+
+    gate.resolve({
+      status: "complete",
+      photo_count: 1,
+      video_count: 0,
+      total_size_bytes: 10,
+      skipped_unreadable: 0,
+    });
+
+    expect(await replay).toBe("staged");
+    expect(
+      get(errorsState)
+        .slice(errorCountBefore)
+        .some((e) => /profile changed/i.test(e.message)),
+    ).toBe(true);
+    // The abandonment cleanup is scoped to the replay's own source commit, so
+    // it must not wipe the newer one the user made while the scan was pending.
+    expect(get(sourceState).selectedPaths).toEqual(["/new-card"]);
+    expect(get(sourceState).scanResult).not.toBeNull();
+  });
+
+  it("disarms the options it hydrated when a replay is abandoned", async () => {
+    await saveProfile("p1", "https://one.example.com");
+    await saveProfile("p2", "https://two.example.com");
+
+    // What the user has set up for themselves before pressing "Import again".
+    importOptionsState.setKeepFiles(true);
+    importOptionsState.setTags(["mine"]);
+    const optionsBefore = get(importOptionsState);
+
+    const gate = Promise.withResolvers<Album[]>();
+    vi.mocked(api.albumsList).mockReturnValueOnce(gate.promise);
+
+    // The record ran with delete-after-import armed.
+    const record = importRecord("r1", {
+      profile_id: "p1",
+      source_paths: ["/old-card"],
+      keep_files: false,
+      tags: ["from-the-record"],
+    });
+
+    const replay = replayImport(record);
+    // hydrateFromRequest runs synchronously before the first await, so the
+    // record's options are already in force here -- this is the state the
+    // abandonment has to undo.
+    expect(get(importOptionsState).keepFiles).toBe(false);
+
+    profilesState.setActiveProfile("p2");
+    gate.resolve([]);
+    expect(await replay).toBe("staged");
+
+    // keepFiles: false is delete-after-import. Left armed under p2, the next
+    // Start Import the user reviews for p2 would wipe their card.
+    expect(get(importOptionsState).keepFiles).toBe(true);
+    expect(get(importOptionsState).tags).toEqual(["mine"]);
+    expect(get(importOptionsState)).toEqual(optionsBefore);
+  });
+
+  it("leaves options the user changed after the switch alone when it abandons", async () => {
+    await saveProfile("p1", "https://one.example.com");
+    await saveProfile("p2", "https://two.example.com");
+
+    importOptionsState.setKeepFiles(true);
+    importOptionsState.setOverwrite(false);
+
+    const gate = Promise.withResolvers<ScanSummary>();
+    let scanStarted = false;
+    vi.mocked(api.scanSourcesStream).mockImplementationOnce(() => {
+      scanStarted = true;
+      return gate.promise;
+    });
+
+    const record = importRecord("r1", {
+      profile_id: "p1",
+      source_paths: ["/old-card"],
+      keep_files: false,
+    });
+
+    const replay = replayImport(record);
+    await vi.waitFor(() => expect(scanStarted).toBe(true));
+
+    // The user switches profiles and then edits the options themselves. From
+    // here the options are theirs, so the replay's cleanup owns nothing --
+    // exactly the discipline clearSourceIfUnchanged applies to the source.
+    profilesState.setActiveProfile("p2");
+    importOptionsState.setOverwrite(true);
+
+    gate.resolve({
+      status: "complete",
+      photo_count: 1,
+      video_count: 0,
+      total_size_bytes: 10,
+      skipped_unreadable: 0,
+    });
+    expect(await replay).toBe("staged");
+
+    expect(get(importOptionsState).overwrite).toBe(true);
   });
 });

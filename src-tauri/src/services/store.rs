@@ -45,8 +45,16 @@ fn store_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 fn load(app: &tauri::AppHandle) -> Result<StoreData, String> {
-    let path = store_path(app)?;
-    match fs::read_to_string(&path) {
+    read_store_at(&store_path(app)?)
+}
+
+/// Read the store, distinguishing "never written" from "cannot be read".
+///
+/// Split out from `load` so the distinction can be tested without an
+/// `AppHandle`: every caller that treats `Ok(StoreData::default())` as a first
+/// run depends on a read failure NOT arriving as an empty store.
+fn read_store_at(path: &Path) -> Result<StoreData, String> {
+    match fs::read_to_string(path) {
         Ok(raw) => serde_json::from_str::<StoreData>(&raw)
             .map_err(|e| format!("Could not parse store at {}: {e}", path.display())),
         // A missing file is the first-run case, not a failure.
@@ -121,14 +129,36 @@ fn clear_store_data(data: &mut StoreData) {
     data.sources.clear();
 }
 
-pub fn last_import_for(app: &AppHandle, profile_id: &str, source_paths: &[String]) -> Option<i64> {
+/// The incremental date floor for one (profile, source set), or `None` when this
+/// pair has never earned a checkpoint.
+///
+/// A store that cannot be read or parsed returns `Err`, never `Ok(None)`: the
+/// renderer turns `None` into "no floor, import everything", so collapsing a
+/// read failure into the first-run answer would silently widen a requested
+/// "only new since last import" run into a full re-upload of the whole card.
+/// A genuinely MISSING store is still `Ok(None)` — that is a real first run, and
+/// `load` already distinguishes the two.
+pub fn last_import_for(
+    app: &AppHandle,
+    profile_id: &str,
+    source_paths: &[String],
+) -> Result<Option<i64>, String> {
     let _guard = lock_store();
 
-    load(app)
-        .ok()?
+    last_import_at(&store_path(app)?, profile_id, source_paths)
+}
+
+/// The `AppHandle`-free core of `last_import_for`, so the missing-versus-
+/// unreadable distinction is directly testable against a real store file.
+fn last_import_at(
+    path: &Path,
+    profile_id: &str,
+    source_paths: &[String],
+) -> Result<Option<i64>, String> {
+    Ok(read_store_at(path)?
         .sources
         .get(&checkpoint_key(profile_id, source_paths))
-        .map(|source| source.last_imported_at)
+        .map(|source| source.last_imported_at))
 }
 
 // Checkpoints are per (profile, source set): the same card imported under a
@@ -212,11 +242,41 @@ fn normalize_source_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::{
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    use uuid::Uuid;
 
     use super::{
-        checkpoint_key, clear_store_data, normalize_source_path, source_key, SourceMeta, StoreData,
+        checkpoint_key, clear_store_data, last_import_at, normalize_source_path, source_key,
+        SourceMeta, StoreData,
     };
+
+    fn scratch_dir(stem: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("immich-shuttle-store-{stem}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Written through `serde_json` rather than a JSON literal: `checkpoint_key`
+    /// embeds a U+001F separator, which is not legal raw inside a JSON string.
+    fn store_with_checkpoint(path: &Path, profile_id: &str, source: &str, at: i64) {
+        let data = StoreData {
+            history: Vec::new(),
+            sources: HashMap::from([(
+                checkpoint_key(profile_id, &[source.to_string()]),
+                SourceMeta {
+                    last_imported_at: at,
+                    last_total: 3,
+                },
+            )]),
+        };
+        fs::write(path, serde_json::to_string(&data).unwrap()).unwrap();
+    }
 
     #[test]
     fn clear_history_resets_source_metadata() {
@@ -235,6 +295,67 @@ mod tests {
 
         assert!(data.history.is_empty());
         assert!(data.sources.is_empty());
+    }
+
+    #[test]
+    fn a_stored_checkpoint_is_returned_for_its_own_key_only() {
+        let dir = scratch_dir("checkpoint-hit");
+        let path = dir.join("store.json");
+        store_with_checkpoint(&path, "p1", "/Volumes/SD/DCIM", 1_700_000_000);
+
+        let source = ["/Volumes/SD/DCIM".to_string()];
+        assert_eq!(
+            last_import_at(&path, "p1", &source),
+            Ok(Some(1_700_000_000))
+        );
+        // A different profile must not inherit this card's date floor.
+        assert_eq!(last_import_at(&path, "p2", &source), Ok(None));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_store_is_a_first_run_not_a_failure() {
+        let dir = scratch_dir("checkpoint-missing");
+        let path = dir.join("store.json");
+
+        // Never written: there genuinely is no date floor, so "only new since
+        // last import" correctly falls back to importing everything.
+        assert_eq!(
+            last_import_at(&path, "p1", &["/Volumes/SD/DCIM".to_string()]),
+            Ok(None)
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_malformed_store_fails_instead_of_reporting_a_first_run() {
+        let dir = scratch_dir("checkpoint-malformed");
+        let path = dir.join("store.json");
+        fs::write(&path, b"{ not json").unwrap();
+
+        // `Ok(None)` here would be indistinguishable from a first run, and the
+        // renderer would drop the requested only-new floor and re-upload the
+        // entire card. The failure has to reach the caller.
+        let error = last_import_at(&path, "p1", &["/Volumes/SD/DCIM".to_string()]).unwrap_err();
+        assert!(error.contains("Could not parse store"), "got: {error}");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_store_fails_instead_of_reporting_a_first_run() {
+        let dir = scratch_dir("checkpoint-unreadable");
+        // A directory where the store file belongs: the entry exists, so this is
+        // an I/O failure rather than the NotFound first-run case.
+        let path = dir.join("store.json");
+        fs::create_dir(&path).unwrap();
+
+        let error = last_import_at(&path, "p1", &["/Volumes/SD/DCIM".to_string()]).unwrap_err();
+        assert!(error.contains("Could not read store"), "got: {error}");
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

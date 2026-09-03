@@ -1,4 +1,4 @@
-use std::{sync::LazyLock, time::Duration};
+use std::{collections::HashSet, ops::Range, sync::LazyLock, time::Duration};
 
 use reqwest::{Client, Method, Response, Url};
 use serde::{Deserialize, Serialize};
@@ -112,10 +112,20 @@ async fn response_text_limited(response: Response) -> Result<String, String> {
 /// Immich server bases identify an origin (optionally behind a path-prefix), not
 /// a resource. Discard a query and fragment so they cannot be inherited by API
 /// requests or public share links.
+///
+/// Userinfo is discarded for the same reason and one more: `Url`'s `Display`
+/// prints `user:pass@host`, and every API error string interpolates the URL
+/// before it reaches app.log and the job card. Stripping the credentials here
+/// means no downstream formatter can leak them. This client authenticates with
+/// the `x-api-key` header, so URL credentials were never a supported mechanism.
+/// `set_username`/`set_password` only fail for a cannot-be-a-base URL, which by
+/// construction has no authority to carry userinfo, so the error is moot.
 fn server_base_url(value: &str) -> Option<Url> {
     let mut url = Url::parse(value.trim()).ok()?;
     url.set_query(None);
     url.set_fragment(None);
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
 
     let path = url.path().trim_end_matches('/').to_string();
     let root = path.strip_suffix("/api").unwrap_or(&path);
@@ -577,7 +587,8 @@ impl ImmichClient {
     }
 
     /// Checks which of `checksums` the server already holds, returning the
-    /// POSITIONS within the slice that it reports as duplicates.
+    /// POSITIONS within the slice it reports as duplicates, split by whether the
+    /// server also proved its copy is live (see `BulkUploadCheck`).
     ///
     /// The wire `id` is only a correlation handle — the server echoes it back so
     /// each result can be paired with the row that produced it, and nothing else
@@ -587,39 +598,72 @@ impl ImmichClient {
     /// failover target), which is strictly more than uploading the photo itself
     /// discloses: immich-go identifies an asset as `<filename>-<size>` and sends
     /// no directory structure at all.
-    pub async fn bulk_upload_check(
-        &self,
-        checksums: &[String],
-    ) -> Result<std::collections::HashSet<usize>, String> {
-        let mut present: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    pub async fn bulk_upload_check(&self, checksums: &[String]) -> Result<BulkUploadCheck, String> {
+        let mut check = BulkUploadCheck::default();
         for (chunk_index, chunk) in checksums.chunks(BULK_UPLOAD_CHECK_CHUNK).enumerate() {
-            let offset = chunk_index * BULK_UPLOAD_CHECK_CHUNK;
+            // `chunks` yields full-size batches until the last one, so this
+            // batch starts at exactly `chunk_index * CHUNK` and covers
+            // `chunk.len()` consecutive request-wide indexes from there. That
+            // half-open range is the complete set of ids this request issued,
+            // and therefore the only ids its response may echo back.
+            let start = chunk_index * BULK_UPLOAD_CHECK_CHUNK;
+            let requested = start..start + chunk.len();
             let value = self
                 .request_json(
                     Method::POST,
                     &["assets", "bulk-upload-check"],
-                    Some(bulk_upload_check_payload(offset, chunk)),
+                    Some(bulk_upload_check_payload(start, chunk)),
                 )
                 .await?;
             let results = value
                 .get("results")
                 .and_then(|r| r.as_array())
                 .ok_or_else(|| "bulk-upload-check returned no results".to_string())?;
-            // An id we cannot parse is one we never issued, so ignore it. Failing
-            // to recognise a duplicate only means a file is treated as NOT on the
-            // server, which keeps the original — the safe direction.
-            present.extend(
-                duplicates_from_results(results)
-                    .iter()
-                    .filter_map(|id| id.parse::<usize>().ok()),
-            );
+            for (id, copy) in duplicates_from_results(results) {
+                let index = checked_result_index(id, &requested)?;
+                check.duplicates.insert(index);
+                if copy == ServerCopy::Live {
+                    check.confirmed_live.insert(index);
+                }
+            }
         }
-        Ok(present)
+        Ok(check)
     }
 }
 
 /// Immich rejects very large batches, so checks are chunked.
 const BULK_UPLOAD_CHECK_CHUNK: usize = 500;
+
+/// Longest server-echoed id repeated back in a protocol-violation message. The
+/// text is server-controlled and lands in app.log and the job card, so keep
+/// enough to diagnose the mispairing without letting a server flood the log.
+const MAX_ECHOED_ID_CHARS: usize = 32;
+
+/// Pair one bulk-upload-check result back to the row that produced it.
+///
+/// The echoed `id` is the ONLY link between a result and a local file, and a
+/// confirmed row is what authorizes deleting that file's original
+/// (wipe::verify_uploaded). So an id is accepted only when it is an index
+/// inside `requested`, the exact half-open range this one request carried. An
+/// index belonging to a different chunk would otherwise graft this response's
+/// answer onto an unrelated photo whose checksum the server never confirmed.
+///
+/// A violation fails the whole sweep rather than skipping the offending row: a
+/// server that mispairs one index has disproved its pairing of every other id
+/// in the same response, so the remaining answers are not evidence either.
+/// Both callers propagate the error, so a failed sweep deletes nothing.
+fn checked_result_index(id: &str, requested: &Range<usize>) -> Result<usize, String> {
+    match id.parse::<usize>() {
+        Ok(index) if requested.contains(&index) => Ok(index),
+        _ => {
+            let shown: String = id.chars().take(MAX_ECHOED_ID_CHARS).collect();
+            Err(format!(
+                "bulk-upload-check protocol violation: server echoed id {shown:?} for a request carrying indexes {}..{}",
+                requested.start, requested.end
+            ))
+        }
+    }
+}
 
 /// Builds one bulk-upload-check request body. Split out so the wire shape can be
 /// asserted without a live server — specifically that it carries nothing but an
@@ -633,32 +677,60 @@ fn bulk_upload_check_payload(offset: usize, chunk: &[String]) -> Value {
     json!({ "assets": assets })
 }
 
-/// Asset ids the server reports as already-present duplicates. An asset counts
-/// as confirmed-on-server ONLY when action=="reject" AND reason=="duplicate"
-/// AND it is not trashed; any other reject reason is treated as NOT present.
-/// This guards verify-before-wipe (wipe::verify_uploaded) so a local original is
-/// never deleted unless the server actually holds a live identical copy.
+/// One bulk-upload-check sweep, split into the two different questions its
+/// callers ask. "Does the server already hold this file?" and "may we delete
+/// the local original?" are not the same question, because the server can match
+/// a checksum without telling us whether its copy is live.
+#[derive(Debug, Default, Clone)]
+pub struct BulkUploadCheck {
+    /// Indices the server matched AND explicitly reported live. ONLY these may
+    /// authorize deleting a local original (wipe::verify_uploaded).
+    pub confirmed_live: HashSet<usize>,
+    /// Indices the server matched without reporting a trashed copy — live plus
+    /// unknown-status. Read-only forecasting uses this: it deletes nothing, so
+    /// counting an unprovable match as a duplicate costs only accuracy.
+    pub duplicates: HashSet<usize>,
+}
+
+/// What a duplicate match proves about the liveness of the server's copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerCopy {
+    /// The server stated `isTrashed: false`.
+    Live,
+    /// The server did not state the copy is live. Never wipe-confirmable.
+    Unknown,
+}
+
+/// Asset ids the server reports as already-present duplicates, each paired with
+/// what the response proves about that copy. An id is reported ONLY when
+/// action=="reject" AND reason=="duplicate"; any other reject reason is treated
+/// as NOT present. This guards verify-before-wipe (wipe::verify_uploaded) so a
+/// local original is never deleted unless the server actually holds a live
+/// identical copy.
 ///
-/// `isTrashed` (Immich >= 1.115) is critical: bulk-upload-check matches a
-/// checksum even when the server's only copy is soft-deleted, so treating a
-/// trashed match as "present" would let us wipe the last live original and lose
-/// it permanently once the server trash is emptied. Older servers omit the
-/// field; there it defaults to false (unchanged, no-less-safe behavior).
-fn duplicates_from_results(results: &[Value]) -> Vec<String> {
+/// `isTrashed` is critical: bulk-upload-check matches a checksum even when the
+/// server's only copy is soft-deleted, so treating a trashed match as "present"
+/// would let us wipe the last live original and lose it permanently once the
+/// server trash is emptied. The field is OPTIONAL in the Immich API
+/// (`AssetBulkUploadCheckResult` lists it outside `required`), so an absent,
+/// null, or non-boolean value means unknown — never live. Unknown is dropped
+/// here rather than defaulting to false, because a default of false would be a
+/// fabricated proof of liveness and this codebase's compatibility floor (1.106)
+/// predates the field entirely.
+fn duplicates_from_results(results: &[Value]) -> Vec<(&str, ServerCopy)> {
     results
         .iter()
         .filter_map(|result| {
             let id = result.get("id").and_then(Value::as_str)?;
             let action = result.get("action").and_then(Value::as_str)?;
             let reason = result.get("reason").and_then(Value::as_str);
-            let is_trashed = result
-                .get("isTrashed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if action == "reject" && reason == Some("duplicate") && !is_trashed {
-                Some(id.to_string())
-            } else {
-                None
+            if action != "reject" || reason != Some("duplicate") {
+                return None;
+            }
+            match result.get("isTrashed").and_then(Value::as_bool) {
+                Some(true) => None,
+                Some(false) => Some((id, ServerCopy::Live)),
+                None => Some((id, ServerCopy::Unknown)),
             }
         })
         .collect()
@@ -768,12 +840,28 @@ mod tests {
                 };
                 let mut request = Vec::new();
                 let mut chunk = [0_u8; 1024];
+                // Read the headers, then the body the request declares. A stub
+                // that answers and closes while a POST body is still unread can
+                // reach the client as a connection reset instead of a response,
+                // which would make the chunked bulk-upload-check sweep flaky.
+                let mut head_len = None;
                 while let Ok(read) = socket.read(&mut chunk).await {
                     if read == 0 {
                         break;
                     }
                     request.extend_from_slice(&chunk[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    if head_len.is_none() {
+                        head_len = request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .map(|offset| offset + 4);
+                    }
+                    let Some(head_len) = head_len else { continue };
+                    let head = String::from_utf8_lossy(&request[..head_len]).into_owned();
+                    let body_len = request_header(&head, "content-length")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= head_len + body_len {
                         break;
                     }
                 }
@@ -1000,7 +1088,7 @@ mod tests {
 
     #[test]
     fn only_duplicate_rejects_count_as_present() {
-        use super::duplicates_from_results;
+        use super::{duplicates_from_results, ServerCopy};
         use serde_json::json;
         let results = [
             json!({ "id": "a", "action": "reject", "reason": "duplicate" }),
@@ -1008,8 +1096,12 @@ mod tests {
             json!({ "id": "c", "action": "reject", "reason": "unsupported" }),
             json!({ "id": "d", "action": "reject" }),
         ];
-        // Only the duplicate-reason reject is treated as present on the server.
-        assert_eq!(duplicates_from_results(&results), vec!["a".to_string()]);
+        // Only the duplicate-reason reject is treated as present on the server;
+        // it states no trash status, so its liveness is unknown.
+        assert_eq!(
+            duplicates_from_results(&results),
+            vec![("a", ServerCopy::Unknown)]
+        );
     }
 
     /// The bulk-upload-check id is a correlation handle, not an identifier the
@@ -1054,9 +1146,156 @@ mod tests {
         assert_eq!(body["assets"][0]["id"], "500");
     }
 
+    /// The echoed id is the only link between a result and a local file, so the
+    /// range check must accept exactly the indexes the request issued — no more,
+    /// and no fewer. `600` and `499` bracket the second chunk's range, and a
+    /// non-numeric id is an id this client never sent at all.
+    #[test]
+    fn checked_result_index_accepts_only_the_requested_range() {
+        use super::checked_result_index;
+
+        assert_eq!(checked_result_index("500", &(500..600)), Ok(500));
+        assert_eq!(checked_result_index("599", &(500..600)), Ok(599));
+        for id in ["499", "600", "0", "-1", "1e3", "", "not-an-index"] {
+            let error = checked_result_index(id, &(500..600))
+                .expect_err("an id outside 500..600 was never issued by that request");
+            assert!(
+                error.contains("protocol violation") && error.contains("500..600"),
+                "unexpected error for id {id:?}: {error}"
+            );
+        }
+        // The id is server-controlled text on its way to app.log, so it is
+        // bounded before it is quoted back.
+        let error = checked_result_index(&"9".repeat(4096), &(0..1))
+            .expect_err("an over-long id is not an index");
+        assert!(error.len() < 200, "echoed id was not bounded: {error}");
+    }
+
+    fn chunked_check_checksums() -> Vec<String> {
+        // 600 rows split into chunks of 500, so the second request carries
+        // indexes 500..600 and the offset arithmetic is actually exercised.
+        (0..600).map(|row| format!("{row:040x}")).collect()
+    }
+
+    /// A result carrying an index from a DIFFERENT chunk is a mispairing, and
+    /// `confirmed_live` is what authorizes deleting a local original. The whole
+    /// sweep fails rather than skipping the row: a server that mispairs one
+    /// index has disproved its pairing of the rest of the response too.
+    #[tokio::test]
+    async fn bulk_upload_check_rejects_an_index_from_another_chunk() {
+        let stub = spawn_http_stub(|request| {
+            // Only the second chunk's body mentions index 500.
+            let echoed = if request.contains(r#""id":"500""#) {
+                "0"
+            } else {
+                "1"
+            };
+            http_response(
+                "200 OK",
+                &[],
+                &format!(
+                    r#"{{"results":[{{"id":"{echoed}","action":"reject","reason":"duplicate","isTrashed":false}}]}}"#
+                ),
+            )
+        })
+        .await;
+
+        let error = ImmichClient::new(&stub.url, "range-test-api-key")
+            .bulk_upload_check(&chunked_check_checksums())
+            .await
+            .expect_err("a cross-chunk index must fail the check");
+        assert!(
+            error.contains("protocol violation") && error.contains("500..600"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The mirror of the rejection: the second chunk's own indexes start at 500,
+    /// so a range anchored at zero (or one sized to the first chunk) would drop
+    /// every later confirmation and silently stop wiping uploaded originals.
+    #[tokio::test]
+    async fn bulk_upload_check_confirms_in_range_indexes_from_every_chunk() {
+        let stub = spawn_http_stub(|request| {
+            let echoed: &[&str] = if request.contains(r#""id":"500""#) {
+                &["500", "599"]
+            } else {
+                &["0", "499"]
+            };
+            let results = echoed
+                .iter()
+                .map(|id| {
+                    format!(
+                        r#"{{"id":"{id}","action":"reject","reason":"duplicate","isTrashed":false}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            http_response("200 OK", &[], &format!(r#"{{"results":[{results}]}}"#))
+        })
+        .await;
+
+        let check = ImmichClient::new(&stub.url, "range-test-api-key")
+            .bulk_upload_check(&chunked_check_checksums())
+            .await
+            .expect("every echoed index is inside the chunk that requested it");
+        let mut confirmed = check.confirmed_live.into_iter().collect::<Vec<_>>();
+        confirmed.sort_unstable();
+        assert_eq!(confirmed, [0, 499, 500, 599]);
+        let mut duplicates = check.duplicates.into_iter().collect::<Vec<_>>();
+        duplicates.sort_unstable();
+        assert_eq!(duplicates, [0, 499, 500, 599]);
+    }
+
+    /// A profile URL may carry `user:pass@`, and `Url`'s Display prints userinfo
+    /// verbatim. Normalization drops it so no downstream formatter can leak it.
+    #[test]
+    fn normalization_drops_url_credentials() {
+        for (input, expected) in [
+            (
+                "https://s3cr3tuser:s3cr3tpass@immich.example.com/api",
+                "https://immich.example.com",
+            ),
+            (
+                "https://s3cr3tuser@immich.example.com:2283/",
+                "https://immich.example.com:2283",
+            ),
+        ] {
+            assert_eq!(normalize_server_url(input), expected);
+        }
+    }
+
+    /// API error text reaches app.log and the job card, so a server URL that
+    /// carried credentials must not put them there.
+    #[tokio::test]
+    async fn api_error_text_carries_no_url_credentials() {
+        const USERNAME: &str = "s3cr3tuser";
+        const PASSWORD: &str = "s3cr3tpass";
+
+        let stub = spawn_http_stub(|_| {
+            http_response("500 Internal Server Error", &[], r#"{"error":"boom"}"#)
+        })
+        .await;
+        let with_credentials = stub
+            .url
+            .replace("http://", &format!("http://{USERNAME}:{PASSWORD}@"));
+
+        let error = ImmichClient::new(&with_credentials, "credential-test-api-key")
+            .ping()
+            .await
+            .expect_err("a 500 must surface as an API error");
+        assert!(error.contains("(500"), "unexpected error: {error}");
+        for secret in [USERNAME, PASSWORD] {
+            assert!(
+                !error.contains(secret),
+                "API error leaked URL credentials: {error}"
+            );
+        }
+        assert!(!error.contains('@'), "API error leaked userinfo: {error}");
+    }
+
     #[test]
     fn trashed_duplicate_is_not_treated_as_present() {
-        use super::duplicates_from_results;
+        use super::{duplicates_from_results, ServerCopy};
         use serde_json::json;
         // A duplicate whose only server copy is trashed must NOT count as
         // present, or verify-before-wipe would delete the last live original.
@@ -1064,7 +1303,33 @@ mod tests {
             json!({ "id": "live", "action": "reject", "reason": "duplicate", "isTrashed": false }),
             json!({ "id": "trashed", "action": "reject", "reason": "duplicate", "isTrashed": true }),
         ];
-        assert_eq!(duplicates_from_results(&results), vec!["live".to_string()]);
+        assert_eq!(
+            duplicates_from_results(&results),
+            vec![("live", ServerCopy::Live)]
+        );
+    }
+
+    /// `isTrashed` is optional in the Immich API, so a response that omits it —
+    /// or answers with the wrong type — proves nothing about the server's copy.
+    /// Defaulting such a match to "live" would authorize wiping the last live
+    /// local original on the word of a field the server never sent.
+    #[test]
+    fn unstated_trash_status_is_unknown_not_live() {
+        use super::{duplicates_from_results, ServerCopy};
+        use serde_json::json;
+        for result in [
+            json!({ "id": "x", "action": "reject", "reason": "duplicate" }),
+            json!({ "id": "x", "action": "reject", "reason": "duplicate", "isTrashed": null }),
+            json!({ "id": "x", "action": "reject", "reason": "duplicate", "isTrashed": "false" }),
+            json!({ "id": "x", "action": "reject", "reason": "duplicate", "isTrashed": 0 }),
+        ] {
+            let results = [result.clone()];
+            assert_eq!(
+                duplicates_from_results(&results),
+                vec![("x", ServerCopy::Unknown)],
+                "unstated trash status must not read as live: {result}"
+            );
+        }
     }
 
     #[test]

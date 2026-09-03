@@ -17,5 +17,5 @@ pub async fn history_source_last_import(
     profile_id: String,
     source_paths: Vec<String>,
 ) -> Result<Option<i64>, String> {
-    Ok(store::last_import_for(&app, &profile_id, &source_paths))
+    store::last_import_for(&app, &profile_id, &source_paths)
 }

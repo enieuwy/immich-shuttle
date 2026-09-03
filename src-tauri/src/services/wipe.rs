@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 use crate::services::immich_client::ImmichClient;
@@ -16,9 +16,15 @@ pub struct WipeResult {
     pub failed: usize,
     /// Files kept because the path no longer names an existing regular file.
     pub skipped: usize,
-    /// Files kept because they no longer matched the identity that was verified
-    /// against the server (see `FileIdentity`).
+    /// Files kept because the file at the path is demonstrably NOT the one that
+    /// was verified against the server (see `FileIdentity`).
     pub changed: usize,
+    /// Files kept because their identity could no longer be *proven*: the
+    /// volume was remounted, the re-stat failed, or the filesystem stopped
+    /// reporting a field the check needs. Nothing says these files changed —
+    /// only that the app can no longer show they did not, which is equally
+    /// disqualifying but a different thing to tell the user.
+    pub unprovable: usize,
     /// Paths whose verified files could not be moved to the Trash and may be retried.
     pub failed_paths: Vec<String>,
     pub errors: Vec<String>,
@@ -37,9 +43,92 @@ pub struct WipeResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileIdentity {
     pub len: u64,
-    /// `None` when the platform/filesystem does not report a modification time;
-    /// length alone then carries the check.
+    /// `None` when the platform/filesystem does not report a modification time.
+    /// Unknown is not identical, so an absent mtime on either side fails the
+    /// match: length alone cannot tell a same-size rewrite from the bytes the
+    /// server confirmed.
     pub modified: Option<SystemTime>,
+    /// `None` only on a platform that reports no stable file record. Same rule
+    /// as `modified` — an absent record refuses the delete instead of falling
+    /// back to the weaker fields.
+    pub record: Option<FileRecordId>,
+}
+
+/// Identity of the file record a path resolved to, so a *replacement* file that
+/// happens to share its predecessor's length and mtime is still caught.
+///
+/// How much this proves is platform-dependent, and the two branches are not
+/// equally strong — see `file_record` on each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileRecordId {
+    /// The filesystem that issued `record`, so a record number is only ever
+    /// compared against one from the same filesystem. Unix `st_dev`; on Windows
+    /// no volume identifier is reachable on stable, so it is a constant `0` and
+    /// carries no information (see `file_record`).
+    pub device: u64,
+    /// Unix `st_ino`: a file created at the same path gets a fresh inode, which
+    /// makes a replacement provable. Windows uses the creation time, which is
+    /// weaker — it corroborates, it does not prove (see `file_record`).
+    pub record: u64,
+}
+
+/// Unix reports the pair that genuinely identifies a file: the filesystem that
+/// issued the inode, and the inode itself. Note that `st_dev` is stable only
+/// while the volume stays mounted — an eject and reinsert, or an SMB
+/// reconnect, renumbers it for a file nobody touched, which is why the
+/// re-check reports a device change as unproven identity rather than as a
+/// changed file.
+#[cfg(unix)]
+fn file_record(metadata: &fs::Metadata) -> Option<FileRecordId> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileRecordId {
+        device: metadata.dev(),
+        record: metadata.ino(),
+    })
+}
+
+/// Windows has no stable accessor for the pair that would actually identify a
+/// file: `volume_serial_number()`/`file_index()` sit behind the unstable
+/// `windows_by_handle` feature, and reading them any other way means a
+/// `GetFileInformationByHandle` FFI call on the open handle, which this
+/// signature (a plain `&Metadata`) cannot reach. So the creation time stands in,
+/// and it is important to be exact about what it does and does not show:
+///
+/// - It DOES catch a path recreated at a different time, which is the common
+///   replacement (a camera writing a new file, a fresh copy).
+/// - It does NOT prove the file was not replaced. NTFS *tunneling* restores the
+///   original creation time when a file is deleted and recreated under the same
+///   name in the same directory within a short window — exactly the case this
+///   field is meant to catch. On Windows the load-bearing evidence is therefore
+///   the length + modification time pair, which a recreate cannot restore
+///   without being made to; the creation time only narrows the gap further.
+/// - A creation time of `0` means the volume does not record one, i.e. UNKNOWN.
+///   Returning it as a value would compare equal on both stats and silently
+///   authorize every delete, so it yields `None` and the wipe refuses instead.
+///
+/// Refusing outright on Windows (always `None`) was the alternative. It is
+/// rejected because it would turn the wipe into a permanent no-op there: the
+/// length + mtime pair already catches every rewrite the unix branch catches,
+/// and trading a working feature for the narrow tunneling window is a worse
+/// deal than documenting the window.
+#[cfg(windows)]
+fn file_record(metadata: &fs::Metadata) -> Option<FileRecordId> {
+    use std::os::windows::fs::MetadataExt;
+    let creation_time = metadata.creation_time();
+    if creation_time == 0 {
+        return None;
+    }
+    Some(FileRecordId {
+        device: 0,
+        record: creation_time,
+    })
+}
+
+/// A platform with neither accessor cannot identify the file record, and the
+/// wipe refuses rather than authorizing a delete on the remaining fields.
+#[cfg(not(any(unix, windows)))]
+fn file_record(_metadata: &fs::Metadata) -> Option<FileRecordId> {
+    None
 }
 
 impl FileIdentity {
@@ -47,27 +136,91 @@ impl FileIdentity {
         Self {
             len: metadata.len(),
             modified: metadata.modified().ok(),
+            record: file_record(metadata),
         }
     }
 
-    /// Whether `other` is the same file contents this identity was taken from.
+    /// Classify `other` against the file this identity was taken from.
     ///
-    /// mtime is compared with a one-second tolerance: some filesystems (FAT32 on
-    /// camera cards, SMB shares) store second- or two-second-granularity
-    /// timestamps, and a stat that rounds differently than the one taken at hash
-    /// time must not be read as a rewrite.
-    fn matches(&self, other: &Self) -> bool {
+    /// Only `Same` authorizes the delete: every field must be known on both
+    /// sides and equal exactly, and no subset is allowed to stand in for the
+    /// rest — this is the last authorization before the file leaves its path.
+    /// There is deliberately no mtime tolerance: however coarse a filesystem's
+    /// timestamp granularity is, repeated stats of an untouched file return the
+    /// same quantized value, so two DIFFERENT values always mean the file
+    /// changed.
+    ///
+    /// The order matters. Length and mtime are checked first because a
+    /// difference there is positive proof that the path no longer holds the
+    /// verified bytes, whatever volume it now lives on. Only once those agree
+    /// does a device mismatch mean "remounted" rather than "different file".
+    fn check(&self, other: &Self) -> IdentityCheck {
         if self.len != other.len {
-            return false;
+            return IdentityCheck::Changed;
         }
-        match (self.modified, other.modified) {
-            (Some(a), Some(b)) => a
-                .duration_since(b)
-                .or_else(|_| b.duration_since(a))
-                .is_ok_and(|drift| drift <= Duration::from_secs(1)),
-            // An unreadable mtime on either side leaves length as the only
-            // signal; do not treat that as a mismatch and keep everything.
-            _ => true,
+        let (Some(mine), Some(theirs)) = (self.modified, other.modified) else {
+            return IdentityCheck::Unprovable(Unprovable::Incomplete);
+        };
+        if mine != theirs {
+            return IdentityCheck::Changed;
+        }
+        let (Some(mine), Some(theirs)) = (self.record, other.record) else {
+            return IdentityCheck::Unprovable(Unprovable::Incomplete);
+        };
+        if mine.device != theirs.device {
+            // Record numbers from two different filesystems are not comparable,
+            // so the inode cannot rule a replacement in or out.
+            return IdentityCheck::Unprovable(Unprovable::Remounted);
+        }
+        if mine.record != theirs.record {
+            return IdentityCheck::Changed;
+        }
+        IdentityCheck::Same
+    }
+}
+
+/// What re-stating a verified file showed, split by what it actually proves.
+/// `Changed` and `Unprovable` both keep the file; they differ in what the user
+/// is told, because "your file changed" is a lie when the truth is "the card
+/// was reconnected and I can no longer prove anything about it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityCheck {
+    /// Same, untouched file: the delete is authorized.
+    Same,
+    /// The path demonstrably no longer holds the verified file.
+    Changed,
+    /// Nothing shows the file changed, and nothing shows it did not.
+    Unprovable(Unprovable),
+}
+
+/// Why identity could not be proven either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unprovable {
+    /// Length and mtime still agree, but the record came from a different
+    /// filesystem than the one verified: the volume was remounted or
+    /// reconnected. Extremely likely to be the same file; not provably so.
+    Remounted,
+    /// A field the check needs was never captured, on one side or the other.
+    Incomplete,
+}
+
+impl Unprovable {
+    /// The user-facing reason, phrased to say what happened and what to do
+    /// about it. "The file changed" would be a false statement here: the file
+    /// is kept because the app lost the ability to prove anything about it, not
+    /// because it observed a change.
+    fn explain(self) -> &'static str {
+        match self {
+            Self::Remounted => {
+                "its volume was remounted or reconnected since it was verified, so it can no \
+                 longer be proven to be the same file. Nothing was deleted — run the verify step \
+                 again now that the volume is back to re-check it."
+            }
+            Self::Incomplete => {
+                "the filesystem no longer reports the details (modification time, file record) \
+                 needed to prove it is the verified file. Nothing was deleted — run the verify \
+                 step again to re-check it."
+            }
         }
     }
 }
@@ -104,10 +257,15 @@ fn trash_context() -> trash::TrashContext {
 /// upstream. This prevents an allowlist from silently stranding media the
 /// server already holds and reporting the upload as skipped.
 ///
-/// Every file is re-stat'd immediately before deletion and kept if its identity
-/// no longer matches what was hashed for the server check — the stat and the
-/// delete are deliberately adjacent so the window a concurrent writer could slip
-/// into is as small as the loop body.
+/// Every file is re-stat'd immediately before deletion and kept unless its
+/// identity still provably matches what was hashed for the server check — the
+/// stat and the delete are deliberately adjacent so the window a concurrent
+/// writer could slip into is as small as the loop body. A file that is kept is
+/// reported as `changed` only when the re-stat PROVES it differs; when the
+/// identity merely became unprovable (a remount, an unreadable stat) it is
+/// reported as `unprovable`, because telling the user their files changed when
+/// they only reconnected the card sends them looking for a problem that is not
+/// there.
 pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
     let trash = trash_context();
     let mut result = WipeResult {
@@ -115,6 +273,7 @@ pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
         failed: 0,
         skipped: 0,
         changed: 0,
+        unprovable: 0,
         failed_paths: Vec::new(),
         errors: Vec::new(),
     };
@@ -127,11 +286,24 @@ pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
         }
 
         // Identity check last, so it is the most recent observation before the
-        // delete. An unreadable stat here means the file changed underneath us in
-        // a way we cannot reason about: keep it.
-        match fs::metadata(path) {
-            Ok(metadata) if file.identity.matches(&FileIdentity::of(&metadata)) => {}
-            Ok(_) => {
+        // delete.
+        let outcome = match fs::metadata(path) {
+            Ok(metadata) => file.identity.check(&FileIdentity::of(&metadata)),
+            // A stat that fails says nothing about the file's contents, so this
+            // is lost proof rather than an observed change. Same outcome: keep.
+            Err(err) => {
+                result.unprovable += 1;
+                result.errors.push(format!(
+                    "Kept {}: could not re-check the file before deleting it ({err}). Nothing was \
+                     deleted — run the verify step again to re-check it.",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        match outcome {
+            IdentityCheck::Same => {}
+            IdentityCheck::Changed => {
                 result.changed += 1;
                 result.errors.push(format!(
                     "Kept {}: the file changed after it was verified on the server.",
@@ -139,12 +311,11 @@ pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
                 ));
                 continue;
             }
-            Err(err) => {
-                result.changed += 1;
-                result.errors.push(format!(
-                    "Kept {}: could not re-check the file before deleting it ({err}).",
-                    path.display()
-                ));
+            IdentityCheck::Unprovable(reason) => {
+                result.unprovable += 1;
+                result
+                    .errors
+                    .push(format!("Kept {}: {}", path.display(), reason.explain()));
                 continue;
             }
         }
@@ -255,7 +426,9 @@ pub async fn verify_uploaded(
     // Only the checksums leave the machine; the paths stay here and are paired
     // back up by position.
     let checksums: Vec<String> = to_check.iter().map(|(_, sum)| sum.clone()).collect();
-    let present = client.bulk_upload_check(&checksums).await?;
+    // Only explicitly-live matches authorize a delete; an absent/unknown
+    // `isTrashed` is not a confirmation.
+    let present = client.bulk_upload_check(&checksums).await?.confirmed_live;
 
     let mut confirmed: Vec<VerifiedFile> = Vec::new();
     for (index, ((path, _), identity)) in to_check.into_iter().zip(identities).enumerate() {
@@ -324,7 +497,9 @@ pub async fn forecast_upload(
 
     let client = ImmichClient::new(server_url, api_key);
     let checksums: Vec<String> = to_check.iter().map(|(_, sum)| sum.clone()).collect();
-    let present = client.bulk_upload_check(&checksums).await?;
+    // The forecast only counts what an upload would skip, so a match the server
+    // did not explicitly mark trashed is enough here.
+    let present = client.bulk_upload_check(&checksums).await?.duplicates;
 
     let (new, already_present) = partition_present(to_check.len(), &present);
 
@@ -370,13 +545,14 @@ fn partition_present(total: usize, present: &std::collections::HashSet<usize>) -
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_file, hash_forecast_files, partition_present, wipe_files, FileIdentity, VerifiedFile,
+        file_record, hash_file, hash_forecast_files, partition_present, wipe_files, FileIdentity,
+        FileRecordId, IdentityCheck, Unprovable, VerifiedFile,
     };
     use std::{
         fs,
         path::{Path, PathBuf},
         sync::atomic::{AtomicBool, Ordering},
-        time::Duration,
+        time::{Duration, SystemTime},
     };
 
     fn temp_file(stem: &str, ext: &str) -> PathBuf {
@@ -406,8 +582,20 @@ mod tests {
             identity: FileIdentity {
                 len: 999_999,
                 modified: None,
+                record: None,
             },
         }
+    }
+
+    /// Pins a file's mtime so a test drifts it by an exact amount instead of
+    /// depending on what the clock did between two writes.
+    fn set_mtime(path: &Path, mtime: SystemTime) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open to set mtime")
+            .set_modified(mtime)
+            .expect("set mtime");
     }
 
     #[test]
@@ -480,36 +668,274 @@ mod tests {
         let _ = fs::remove_file(rewritten);
     }
 
-    /// Coarse-granularity filesystems (FAT32 cards, SMB) can report an mtime that
-    /// rounds differently between two stats of an untouched file; that must not be
-    /// read as a rewrite and block a legitimate wipe.
+    /// Two different mtimes always mean the file changed: repeated stats of an
+    /// untouched file return the same quantized value however coarse the
+    /// filesystem's granularity is, so there is no rounding to forgive. This
+    /// used to forgive up to a second of drift, which let a same-length rewrite
+    /// pass as identical.
+    ///
+    /// The classification is asserted, not just the boolean: only `Same`
+    /// authorizes a delete, and everything else has to land on the right side
+    /// of "proven different" vs. "no longer provable".
     #[test]
-    fn sub_second_mtime_drift_is_not_treated_as_a_change() {
+    fn sub_second_mtime_drift_is_treated_as_a_change() {
+        let record = Some(FileRecordId {
+            device: 1,
+            record: 2,
+        });
         let base = FileIdentity {
             len: 10,
-            modified: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(1_500)),
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_500)),
+            record,
         };
-        let rounded = FileIdentity {
-            len: 10,
-            modified: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+        let drifted = FileIdentity {
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            ..base.clone()
         };
-        assert!(base.matches(&rounded));
-        assert!(rounded.matches(&base));
-
-        let two_seconds_later = FileIdentity {
-            len: 10,
-            modified: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(4)),
-        };
-        assert!(!base.matches(&two_seconds_later));
+        assert_eq!(
+            base.check(&drifted),
+            IdentityCheck::Changed,
+            "half a second of drift is a rewrite"
+        );
+        assert_eq!(drifted.check(&base), IdentityCheck::Changed);
+        assert_eq!(
+            base.check(&base.clone()),
+            IdentityCheck::Same,
+            "an identical stat still authorizes the delete"
+        );
 
         let same_time_new_length = FileIdentity {
             len: 11,
-            modified: base.modified,
+            ..base.clone()
         };
-        assert!(
-            !base.matches(&same_time_new_length),
+        assert_eq!(
+            base.check(&same_time_new_length),
+            IdentityCheck::Changed,
             "a length change is a rewrite regardless of mtime"
         );
+
+        let unknown_mtime = FileIdentity {
+            modified: None,
+            ..base.clone()
+        };
+        assert_eq!(
+            base.check(&unknown_mtime),
+            IdentityCheck::Unprovable(Unprovable::Incomplete),
+            "an unknown mtime is not an identical one, and proves nothing either"
+        );
+        assert_eq!(
+            unknown_mtime.check(&base),
+            IdentityCheck::Unprovable(Unprovable::Incomplete)
+        );
+        assert_eq!(
+            unknown_mtime.check(&unknown_mtime.clone()),
+            IdentityCheck::Unprovable(Unprovable::Incomplete),
+            "two unknown mtimes leave length alone, which must never authorize a delete"
+        );
+
+        let unknown_record = FileIdentity {
+            record: None,
+            ..base.clone()
+        };
+        assert_eq!(
+            base.check(&unknown_record),
+            IdentityCheck::Unprovable(Unprovable::Incomplete),
+            "a file record that could not be captured must not weaken the check"
+        );
+        assert_eq!(
+            unknown_record.check(&base),
+            IdentityCheck::Unprovable(Unprovable::Incomplete)
+        );
+
+        let other_record = FileIdentity {
+            record: Some(FileRecordId {
+                device: 1,
+                record: 3,
+            }),
+            ..base.clone()
+        };
+        assert_eq!(
+            base.check(&other_record),
+            IdentityCheck::Changed,
+            "a new file record at the same path on the same filesystem is a replacement"
+        );
+
+        let other_device = FileIdentity {
+            record: Some(FileRecordId {
+                device: 2,
+                record: 2,
+            }),
+            ..base.clone()
+        };
+        assert_eq!(
+            base.check(&other_device),
+            IdentityCheck::Unprovable(Unprovable::Remounted),
+            "a record from a different filesystem is not comparable, so nothing is proven"
+        );
+    }
+
+    /// The rewrite the old one-second tolerance waved through: same length, a
+    /// different SHA-1, and an mtime only half a second later.
+    #[test]
+    fn keeps_a_same_length_rewrite_whose_mtime_moved_half_a_second() {
+        let path = temp_file("half-second-rewrite", "jpg");
+        fs::write(&path, b"original").expect("write original");
+        let file = verified(&path);
+        let hashed_at = file.identity.modified.expect("mtime captured at hash time");
+
+        // Identically sized, different bytes: only the mtime can reveal it.
+        fs::write(&path, b"replaced").expect("rewrite");
+        set_mtime(&path, hashed_at + Duration::from_millis(500));
+
+        let result = wipe_files(&[file]);
+
+        assert_eq!(result.changed, 1, "the rewrite must be reported as changed");
+        assert_eq!(result.deleted, 0);
+        assert!(
+            path.exists(),
+            "bytes the server never received must stay on disk"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A path that was unlinked and recreated names a different file, even when
+    /// the replacement matches the verified length and its mtime is restored.
+    #[test]
+    fn keeps_a_replacement_file_with_the_same_length_and_mtime() {
+        let path = temp_file("replaced-record", "jpg");
+        fs::write(&path, b"original").expect("write original");
+        let file = verified(&path);
+        let hashed_at = file.identity.modified.expect("mtime captured at hash time");
+
+        fs::remove_file(&path).expect("unlink the verified file");
+        fs::write(&path, b"replaced").expect("write the replacement");
+        set_mtime(&path, hashed_at);
+
+        let replacement = fs::metadata(&path).expect("stat the replacement");
+        assert_eq!(
+            file.identity.modified,
+            replacement.modified().ok(),
+            "test premise: length and mtime are indistinguishable"
+        );
+        assert_ne!(
+            file.identity.record,
+            file_record(&replacement),
+            "test premise: only the file record gives the replacement away"
+        );
+
+        let result = wipe_files(&[file]);
+
+        assert_eq!(result.changed, 1, "a replacement is not the verified file");
+        assert_eq!(result.deleted, 0);
+        assert!(path.exists(), "the replacement must stay on disk");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Length alone is not authorization: without a verified mtime the file is
+    /// kept even though it is otherwise untouched. It is kept as unprovable,
+    /// not as changed — a missing timestamp is missing evidence, not evidence.
+    #[test]
+    fn keeps_a_file_whose_verified_identity_has_no_mtime() {
+        let path = temp_file("unknown-mtime", "jpg");
+        fs::write(&path, b"bytes").expect("write file");
+        let mut file = verified(&path);
+        file.identity.modified = None;
+
+        let result = wipe_files(&[file]);
+
+        assert_eq!(result.unprovable, 1);
+        assert_eq!(result.changed, 0);
+        assert_eq!(result.deleted, 0);
+        assert!(
+            path.exists(),
+            "an unreadable mtime must not authorize a delete"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The Windows record is the file's creation time, and `0` there means the
+    /// volume does not record one — unknown, not a value. Encoding unknown as
+    /// `0` would compare equal on both stats and wave every delete through, so
+    /// `file_record` yields `None` and the delete is refused instead.
+    #[test]
+    fn refuses_to_delete_when_the_file_record_is_absent() {
+        let path = temp_file("absent-record", "jpg");
+        fs::write(&path, b"bytes").expect("write file");
+        let mut file = verified(&path);
+        // Exactly what a zero Windows creation time produces.
+        file.identity.record = None;
+
+        let on_disk = FileIdentity::of(&fs::metadata(&path).expect("stat the file"));
+        assert_eq!(
+            file.identity.check(&on_disk),
+            IdentityCheck::Unprovable(Unprovable::Incomplete),
+            "an absent record cannot prove this is the verified file"
+        );
+
+        let result = wipe_files(&[file]);
+
+        assert_eq!(result.unprovable, 1);
+        assert_eq!(
+            result.changed, 0,
+            "an unknown record is not evidence of a change"
+        );
+        assert_eq!(result.deleted, 0);
+        assert!(
+            path.exists(),
+            "an unknown file record must never authorize a delete"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A card ejected and reinserted, or an SMB share that reconnected, gives
+    /// an UNTOUCHED file a new device id. Refusing the delete is right, but
+    /// reporting it as a changed file sends the user hunting a problem that
+    /// does not exist: it is reported as unprovable, and the message names the
+    /// remount and the way out.
+    #[test]
+    fn reports_a_remount_as_unprovable_rather_than_as_a_changed_file() {
+        let path = temp_file("remounted-volume", "jpg");
+        fs::write(&path, b"bytes").expect("write file");
+        let mut file = verified(&path);
+        let verified_record = file
+            .identity
+            .record
+            .expect("this platform reports a file record");
+        // Same length, same mtime, same record number: only the volume moved.
+        file.identity.record = Some(FileRecordId {
+            device: verified_record.device.wrapping_add(1),
+            ..verified_record
+        });
+
+        let result = wipe_files(&[file]);
+
+        assert_eq!(
+            result.unprovable, 1,
+            "a remount leaves identity unproven, not disproven"
+        );
+        assert_eq!(
+            result.changed, 0,
+            "nothing observed says the file itself changed"
+        );
+        assert_eq!(result.deleted, 0);
+        assert!(
+            path.exists(),
+            "an unprovable identity must not authorize a delete"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("remounted") && e.contains("verify")),
+            "the message must name the remount and what to do next: {:?}",
+            result.errors
+        );
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

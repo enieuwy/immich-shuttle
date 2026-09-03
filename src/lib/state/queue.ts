@@ -159,7 +159,10 @@ export function selectNewlyTerminal(prev: ImportJob[], next: ImportJob[]): Impor
   });
 }
 
-async function handleTerminalTransitions(prev: ImportJob[], next: ImportJob[]) {
+// Exported so the best-effort-notification contract can be awaited directly: the
+// production call site is `void handleTerminalTransitions(...)`, which would let
+// a rejection escape the test as an unhandled rejection instead of failing it.
+export async function handleTerminalTransitions(prev: ImportJob[], next: ImportJob[]) {
   const newlyTerminal = selectNewlyTerminal(prev, next);
   if (newlyTerminal.length === 0) return;
   // The backend's stricter checkpoint eligibility inputs are not present on
@@ -172,12 +175,17 @@ async function handleTerminalTransitions(prev: ImportJob[], next: ImportJob[]) {
     if (!(await ensureNotifyPermission())) return;
     for (const job of newlyTerminal) {
       const notification = notificationForJob(job);
-      if (notification) sendNotification(notification);
+      // Awaited so an async rejection lands in the catch below. Un-awaited, the
+      // rejection escapes the surrounding try/catch entirely, and the call site
+      // discards the returned promise — the exact unhandled rejection the catch
+      // is here to prevent.
+      if (notification) await sendNotification(notification);
     }
   } catch {
     // Notifications are best-effort: a missing/denied permission backend or a
-    // throwing send must not surface as an unhandled rejection or disturb the
-    // already-refreshed queue state.
+    // failing send must not surface as an unhandled rejection or disturb the
+    // already-refreshed queue state. A failing send abandons the remaining
+    // notifications, matching how a synchronous throw has always behaved.
   }
 }
 
@@ -408,7 +416,22 @@ export const queueState = {
       if (!hasSelection) {
         dateRange = toImmichDateRange(options.dateFrom, options.dateTo);
         if (!dateRange && options.onlyNewSinceLastImport) {
-          const lastMs = await historySourceLastImport(profile.id, sourcePaths);
+          // A checkpoint the backend cannot read is NOT "no checkpoint". The
+          // store is now the only record of the date floor, so a read/parse
+          // failure that fell through to `null` would drop the requested
+          // only-new constraint and re-upload the whole card as a full import.
+          // Refuse the start instead: the user asked for an incremental window,
+          // and silently widening it is the one outcome they did not ask for.
+          let lastMs: number | null;
+          try {
+            lastMs = await historySourceLastImport(profile.id, sourcePaths);
+          } catch (error) {
+            throw new Error(
+              `Could not read the last-import checkpoint for this source, so "only new since last import" cannot be applied. Turn it off to import everything, or retry. (${
+                error instanceof Error ? error.message : String(error)
+              })`,
+            );
+          }
           if (lastMs != null) {
             // Format in the local calendar zone: immich-go parses --date-range in
             // local time, so a UTC date could land a day off and skip newer files.

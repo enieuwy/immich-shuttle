@@ -154,6 +154,18 @@
                 >
                   {record.errors} err
                 </span>
+                {#if record.incomplete}
+                  <!-- A record may stay `completed` under the existing status
+                       policy even when the backend could not prove every part
+                       of the run. Keep that terminal evidence visible instead
+                       of letting the green status icon imply full success. -->
+                  <span
+                    class="rounded-md bg-destructive/10 px-1.5 py-0.5 text-xs font-medium text-destructive"
+                    title="This import finished with incomplete or unproven results."
+                  >
+                    Incomplete
+                  </span>
+                {/if}
                 {#if record.request}
                   <Button
                     variant="ghost"

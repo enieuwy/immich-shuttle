@@ -113,6 +113,12 @@ export interface RemovableDevice {
   total_space: number;
   available_space: number;
   has_dcim: boolean;
+  /**
+   * Stable per-volume identity from the OS, or null/absent when the platform cannot prove
+   * it. Label and mount path both repeat across physical cards, so this is the only field
+   * that may key a saved destination or a delete-after-verify policy.
+   */
+  volume_id?: string | null;
 }
 
 export interface MediaFile {
@@ -182,6 +188,9 @@ export interface ImportRecord {
   uploaded: number;
   duplicates: number;
   errors: number;
+  /** True when the run ended without a complete, proven result. Older history
+   *  records omit it and remain readable as false. */
+  incomplete?: boolean;
   /** Full request that produced this run, for "Import again". Null on older
    *  records saved before request persistence. */
   request?: ImportInput | null;

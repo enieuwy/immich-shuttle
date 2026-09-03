@@ -2,7 +2,7 @@
   import { ServerCog } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import ActiveFilters from "./ActiveFilters.svelte";
-  import { importForecast, type ImportForecast } from "$lib/api";
+  import { forecastCancel, importForecast, type ImportForecast } from "$lib/api";
   import { activeProfile } from "$lib/state/profiles";
   import { sourceState } from "$lib/state/source";
   import { selectionState } from "$lib/state/selection";
@@ -14,6 +14,14 @@
   let forecasting = $state(false);
   let forecastError = $state("");
   let forecastToken = 0;
+  // Every backend forecast receives a strictly increasing generation. Cleanup
+  // sends this exact value back, so a delayed F1 cancel is a no-op after F2 has
+  // replaced it in the backend.
+  let forecastGeneration = 0;
+  // Generation of the call that still owns active backend work. This must not
+  // be a boolean: an old call can settle after F2 begins, and only its own
+  // `finally` may release this ownership.
+  let forecastInFlightGeneration: number | null = null;
 
   const canForecast = $derived(
     !!$activeProfile && $sourceState.selectedPaths.length > 0 && !forecasting,
@@ -45,6 +53,18 @@
     forecastError = "";
     // A superseded request must release the button because its own finally no longer matches the token.
     forecasting = false;
+    // Runs before the next pass and on unmount, i.e. exactly when the inputs
+    // this forecast was computed for stop being the current ones. Cancels the
+    // forecast alone; scan_cancel would kill the unrelated preview grid scan.
+    return () => {
+      const generation = forecastInFlightGeneration;
+      if (generation === null) return;
+      forecastInFlightGeneration = null;
+      void forecastCancel(generation).catch(() => {
+        // Best-effort: the request is already abandoned either way, and its own
+        // token check keeps the late result out of the UI.
+      });
+    };
   });
 
   async function checkServer() {
@@ -56,6 +76,8 @@
     const selection = [...$selectionState.selected];
     const options = $importOptionsState;
     const token = ++forecastToken;
+    const generation = ++forecastGeneration;
+    forecastInFlightGeneration = generation;
     forecasting = true;
     forecastError = "";
     forecast = null;
@@ -76,12 +98,16 @@
               includeExtensions: options.includeExtensions,
               excludeExtensions: options.excludeExtensions,
             },
+        generation,
       );
       if (token === forecastToken) forecast = result;
     } catch (error) {
       if (token === forecastToken)
         forecastError = error instanceof Error ? error.message : String(error);
     } finally {
+      // An old call can settle after F2 begins. It cannot release F2's backend
+      // ownership, or a later cleanup would leave F2 running.
+      if (forecastInFlightGeneration === generation) forecastInFlightGeneration = null;
       if (token === forecastToken) forecasting = false;
     }
   }

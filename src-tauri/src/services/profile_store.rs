@@ -118,28 +118,34 @@ pub fn delete_profile_locked(profile_id: &str) -> Result<(), String> {
     save_config(&cfg)
 }
 
+/// Redirects [`config_path`] at a private temp directory for tests.
+///
+/// `IMMICH_SHUTTLE_CONFIG_DIR` is process-wide, so every test module that
+/// isolates the config file has to serialize through this one lock: with a
+/// lock per module two modules point the same process at two directories and
+/// each reads the other's config.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_config {
     use std::fs;
-    use std::sync::{LazyLock, Mutex};
+    use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
 
-    use crate::models::profile::Profile;
+    static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-    use super::{
-        delete_profile, get_profile, load_config, lock_config, save_config, upsert_profile,
-        upsert_profile_locked, AppConfig,
-    };
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
-    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    fn use_temp_config_home(suffix: &str) -> std::path::PathBuf {
+    /// Points the process at a fresh empty config home and returns it. Callers
+    /// must hold [`lock`] for as long as they use the directory.
+    pub(crate) fn use_temp_config_home(suffix: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         dir.push(format!(
-            "immich-shuttle-profile-store-test-{}-{}-{}",
+            "immich-shuttle-config-test-{}-{}-{}",
             suffix,
             std::process::id(),
             nonce
@@ -149,10 +155,23 @@ mod tests {
         std::env::set_var("IMMICH_SHUTTLE_CONFIG_DIR", &dir);
         dir
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use crate::models::profile::Profile;
+
+    use super::test_config::{lock as lock_test_config, use_temp_config_home};
+    use super::{
+        delete_profile, get_profile, load_config, lock_config, save_config, upsert_profile,
+        upsert_profile_locked, AppConfig,
+    };
 
     #[test]
     fn loading_missing_config_returns_default_without_creating_file() {
-        let _guard = TEST_LOCK.lock().expect("lock test mutex");
+        let _guard = lock_test_config();
         let dir = use_temp_config_home("default");
         let cfg = load_config().expect("load default config");
         assert!(cfg.profiles.is_empty());
@@ -163,7 +182,7 @@ mod tests {
 
     #[test]
     fn upsert_and_get_profile_roundtrip() {
-        let _guard = TEST_LOCK.lock().expect("lock test mutex");
+        let _guard = lock_test_config();
         let dir = use_temp_config_home("crud");
         let profile = Profile {
             id: "p1".to_string(),
@@ -182,7 +201,7 @@ mod tests {
 
     #[test]
     fn locked_upsert_mutates_config_under_held_guard() {
-        let _test_guard = TEST_LOCK.lock().expect("lock test mutex");
+        let _test_guard = lock_test_config();
         let dir = use_temp_config_home("locked-upsert");
         let profile = Profile {
             id: "p1".to_string(),
@@ -205,7 +224,7 @@ mod tests {
 
     #[test]
     fn delete_profile_removes_profile() {
-        let _guard = TEST_LOCK.lock().expect("lock test mutex");
+        let _guard = lock_test_config();
         let dir = use_temp_config_home("delete");
         let profile = Profile {
             id: "p1".to_string(),
@@ -222,7 +241,7 @@ mod tests {
 
     #[test]
     fn failed_config_rename_removes_temp_file() {
-        let _guard = TEST_LOCK.lock().expect("lock test mutex");
+        let _guard = lock_test_config();
         let dir = use_temp_config_home("rename-cleanup");
         fs::create_dir_all(dir.join("immich-shuttle/config.json"))
             .expect("create directory at config path");

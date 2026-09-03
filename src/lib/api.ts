@@ -207,8 +207,9 @@ export interface ForecastFilters {
 export function importForecast(
   profileId: string,
   sourcePaths: string[],
-  selectFiles?: string[] | null,
-  filters?: ForecastFilters,
+  selectFiles: string[] | null | undefined,
+  filters: ForecastFilters | undefined,
+  generation: number,
 ): Promise<ImportForecast> {
   return invokeCommand<ImportForecast>("import_forecast", {
     profileId,
@@ -217,5 +218,11 @@ export function importForecast(
     includeType: filters?.includeType ?? null,
     includeExtensions: filters?.includeExtensions ?? [],
     excludeExtensions: filters?.excludeExtensions ?? [],
+    generation,
   });
+}
+
+/** Cancels only the active forecast that owns `generation`. */
+export function forecastCancel(generation: number): Promise<void> {
+  return invokeCommand<void>("forecast_cancel", { generation });
 }

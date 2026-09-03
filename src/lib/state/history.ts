@@ -4,7 +4,7 @@ import { historyClear, historyList } from "$lib/api";
 import { albumsState } from "$lib/state/albums";
 import { errorsState } from "$lib/state/errors";
 import { createGeneration } from "$lib/state/generation";
-import { importOptionsState } from "$lib/state/import-options";
+import { importOptionsState, type ImportOptionsSnapshot } from "$lib/state/import-options";
 import { profilesState } from "$lib/state/profiles";
 import { selectionState } from "$lib/state/selection";
 import { sourceState } from "$lib/state/source";
@@ -99,6 +99,25 @@ export const historyState = {
 export type ReplayOutcome = "staged" | "no-request" | "profile-missing" | "busy";
 
 /**
+ * Value equality over an options snapshot. The store holds only primitives and
+ * flat string arrays, so element-wise array comparison is exact; a plain `===`
+ * would report every snapshot as different because hydrateFromRequest builds
+ * fresh arrays. Used to tell "the replay's own write is still standing" from
+ * "the user has since changed something", which decides whether reverting is
+ * ours to do.
+ */
+function sameOptions(a: ImportOptionsSnapshot, b: ImportOptionsSnapshot): boolean {
+  return (Object.keys(a) as (keyof ImportOptionsSnapshot)[]).every((key) => {
+    const left = a[key];
+    const right = b[key];
+    if (Array.isArray(left) && Array.isArray(right)) {
+      return left.length === right.length && left.every((item, i) => item === right[i]);
+    }
+    return left === right;
+  });
+}
+
+/**
  * Stage a past import for review ("Import again"): restore the profile, album,
  * options, and source from the record's persisted request, then let the user
  * confirm and start. Does NOT auto-start — deletion/wipe safety requires a fresh
@@ -138,6 +157,20 @@ export async function replayImport(record: ImportRecord): Promise<ReplayOutcome>
 
   state.update((s) => ({ ...s, replaying: true, replayingRecordId: record.id }));
 
+  // The options in force before this replay touched them. hydrateFromRequest
+  // does a whole-store `set` from the record, so without this the abandonment
+  // path below has no way to put back what the user had -- and the record's
+  // `keepFiles: false` would stay armed, offering delete-after-import under a
+  // profile nobody reviewed it for.
+  const optionsBeforeReplay = get(importOptionsState);
+  // Exactly what hydrateFromRequest wrote, filled in once it has run. Compared
+  // against the live store on abandonment so the revert applies only when the
+  // replay's own write is still the one standing: the options panel stays
+  // interactive for the whole replay, and options the user set for the profile
+  // they switched TO are theirs, not ours to roll back. Same ownership rule as
+  // sourceState.clearSourceIfUnchanged.
+  let hydratedOptions: ImportOptionsSnapshot | null = null;
+
   // loadAlbums below can take several seconds (up to 6 retries against an
   // unreachable server), and ProfileSelector stays interactive the whole
   // time. If the user switches profiles mid-replay, activeProfile.subscribe
@@ -152,6 +185,9 @@ export async function replayImport(record: ImportRecord): Promise<ReplayOutcome>
   // through. Checked after every await below, not just once.
   const abandonIfProfileChanged = () => {
     if (get(profilesState).activeProfileId === request.profile_id) return false;
+    if (hydratedOptions && sameOptions(get(importOptionsState), hydratedOptions)) {
+      importOptionsState.restore(optionsBeforeReplay);
+    }
     errorsState.addError(
       "Import again was abandoned: the active profile changed before it finished loading.",
     );
@@ -161,6 +197,7 @@ export async function replayImport(record: ImportRecord): Promise<ReplayOutcome>
   try {
     profilesState.setActiveProfile(request.profile_id);
     importOptionsState.hydrateFromRequest(request);
+    hydratedOptions = get(importOptionsState);
     // Whole source is staged for review; any prior preview selection is dropped.
     selectionState.clear();
     sourceState.clearSource();
@@ -216,9 +253,26 @@ export async function replayImport(record: ImportRecord): Promise<ReplayOutcome>
     }
 
     if (abandonIfProfileChanged()) return "staged";
-    // selectSources reports its own failures via errorsState (source.ts) and
-    // never rejects, so nothing further to check here.
-    await sourceState.selectSources(request.source_paths);
+    // selectSources reports its own scan failures via errorsState (source.ts)
+    // and never rejects, so there is nothing to check about its outcome -- but
+    // the scan is itself a multi-second await with ProfileSelector live, so the
+    // profile has to be re-checked after it like after every other await.
+    const sourceToken = await sourceState.selectSources(request.source_paths);
+    if (abandonIfProfileChanged()) {
+      // The staged source belongs to the record's profile, not to the one the
+      // user just switched to. activeProfile.subscribe (albums.ts) clears album
+      // state on a switch but nothing clears the source, so leaving this commit
+      // in place offers the old run's source under the newly active profile as
+      // though it had been reviewed for it. (The options hydrated for the
+      // record are dropped by abandonIfProfileChanged itself, which has just
+      // run.) Clear only the commit THIS replay produced: if the user
+      // established a newer source while the scan was in flight, that source is
+      // theirs and the token check makes this cleanup a no-op against it.
+      if (sourceToken !== null) {
+        sourceState.clearSourceIfUnchanged(sourceToken);
+      }
+      return "staged";
+    }
     return "staged";
   } catch (error) {
     // Defensive backstop: nothing above currently throws (loadAlbums and

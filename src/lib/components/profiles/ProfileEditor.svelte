@@ -27,6 +27,12 @@
   let errorMessage = $state("");
   let validatedUserName = $state("");
   let validating = $derived(validation === "Validating...");
+  // A blank key means "keep the stored one" — but a new profile has no stored
+  // key to keep, and the backend rejects it. Editing keeps blank-means-keep:
+  // the field is never repopulated with the saved secret.
+  let canSave = $derived(
+    serverUrl.trim().length > 0 && (Boolean(profile) || apiKey.trim().length > 0),
+  );
   // Flag clear-text http:// URLs (the API key header and all photo bytes would
   // travel unencrypted). Loopback is exempt — it never leaves the machine.
   let insecure = $derived(
@@ -39,17 +45,30 @@
       ),
   );
 
+  function stripUrlUserinfo(value: string): string {
+    const trimmed = value.trim();
+    try {
+      const url = new URL(trimmed);
+      url.username = "";
+      url.password = "";
+      return url.toString();
+    } catch {
+      // Do not render or resend credentials from a malformed restored URL.
+      return trimmed.replace(/^([a-z][a-z\d+.-]*:\/\/)[^/?#@]*@/i, "$1");
+    }
+  }
+
   $effect(() => {
-    serverUrl = profile?.server_url ?? "";
-    lanServerUrl = profile?.lan_server_url ?? "";
-    wanServerUrl = profile?.wan_server_url ?? "";
+    serverUrl = stripUrlUserinfo(profile?.server_url ?? "");
+    lanServerUrl = stripUrlUserinfo(profile?.lan_server_url ?? "");
+    wanServerUrl = stripUrlUserinfo(profile?.wan_server_url ?? "");
   });
 
   async function testConnection() {
     errorMessage = "";
     validation = "Validating...";
     try {
-      const result = await profilesState.validateProfile(serverUrl, apiKey);
+      const result = await profilesState.validateProfile(stripUrlUserinfo(serverUrl), apiKey);
       validatedUserName = result.user_name;
       validation = `Connected as ${result.user_name} (server ${result.server_version})`;
     } catch (error) {
@@ -66,9 +85,9 @@
       await profilesState.saveProfile({
         id: profile?.id ?? null,
         display_name: validatedUserName || profile?.display_name || null,
-        server_url: serverUrl,
-        lan_server_url: lanServerUrl || null,
-        wan_server_url: wanServerUrl || null,
+        server_url: stripUrlUserinfo(serverUrl),
+        lan_server_url: stripUrlUserinfo(lanServerUrl) || null,
+        wan_server_url: stripUrlUserinfo(wanServerUrl) || null,
         api_key: apiKey || null,
       });
       onSaved();
@@ -196,7 +215,7 @@
         Test connection
       {/if}
     </Button>
-    <Button onclick={saveProfile} disabled={saving || !serverUrl.trim()}>
+    <Button onclick={saveProfile} disabled={saving || !canSave}>
       {saving ? "Saving…" : "Save"}
     </Button>
   </div>

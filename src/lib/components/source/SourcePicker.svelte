@@ -5,7 +5,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open } from "@tauri-apps/plugin-dialog";
-  import { FolderOpen, FileImage, HardDrive, History, LayoutGrid, Loader2, X, Zap } from "@lucide/svelte";
+  import { AlertTriangle, FolderOpen, FileImage, HardDrive, History, LayoutGrid, Loader2, RotateCcw, X, Zap } from "@lucide/svelte";
 
   import { sourceState } from "$lib/state/source";
   import { autoImportState } from "$lib/state/auto-import";
@@ -57,11 +57,17 @@
     }
     lastImportedAt = null;
     let cancelled = false;
-    void historySourceLastImport(profile.id, paths).then((ms) => {
-      if (!cancelled && lastImportVersion === $historyState.lastImportVersion) {
-        lastImportedAt = ms;
-      }
-    });
+    void historySourceLastImport(profile.id, paths)
+      .then((ms) => {
+        if (!cancelled && lastImportVersion === $historyState.lastImportVersion) {
+          lastImportedAt = ms;
+        }
+      })
+      // This label is display-only, so an unreadable checkpoint store degrades to
+      // "no known last import" instead of an unhandled rejection. The import path
+      // must NOT degrade the same way: queueState.startImport refuses the run,
+      // because there "no floor" silently means "re-upload the whole card".
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -265,6 +271,34 @@
                 {$sourceState.scanResult.skipped_unreadable} unreadable skipped
               </p>
             {/if}
+          {:else if $sourceState.scanOutcome === "timed_out" || $sourceState.scanOutcome === "cancelled"}
+            <!-- An abandoned scan saw only part of the source, so the store
+                 refuses to commit its file list. Say so where the counts would
+                 have been: without this the card falls silent and an empty
+                 preview grid looks like an empty card. A timeout is a failure;
+                 a cancel is the user's own choice, so it is stated plainly and
+                 never styled as an error. -->
+            <div class="flex flex-wrap items-center gap-2">
+              {#if $sourceState.scanOutcome === "timed_out"}
+                <p class="flex items-center gap-1.5 text-xs text-destructive">
+                  <AlertTriangle class="h-3.5 w-3.5 shrink-0" />
+                  Scanning stopped before it finished — this source was not fully read
+                </p>
+              {:else}
+                <p class="text-xs text-muted-foreground">
+                  Scan cancelled — this source was not fully read
+                </p>
+              {/if}
+              <Button
+                variant="outline"
+                size="sm"
+                class="h-6 px-2 text-xs"
+                onclick={() => void sourceState.rescan()}
+              >
+                <RotateCcw class="h-3.5 w-3.5" />
+                Retry scan
+              </Button>
+            </div>
           {/if}
             {#if lastImportedAt !== null}
               <p

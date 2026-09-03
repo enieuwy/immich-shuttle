@@ -36,24 +36,16 @@ pub struct RunProgress {
     pub unresolved_file_events: u32,
 }
 
-/// Extract the value of a space-delimited `key=` attribute from a console-slog
-/// line. immich-go's console handler writes attribute values UNQUOTED (spaces
-/// and all), so a value runs from after `key=` until the next known attribute
-/// key or end of line.
+/// Truncate an unquoted attribute value at the RIGHTMOST occurrence of each
+/// `next_keys` marker.
 ///
-/// Both the `key` marker itself and every `next_keys` marker are located by
-/// their RIGHTMOST occurrence on the line (`rfind`), not the first. immich-go
-/// appends attributes strictly after the value they follow, so the genuine
-/// marker for any key is always the LAST occurrence of ` <key>=` on the line —
-/// an earlier occurrence can only be a key-like substring embedded inside a
-/// preceding value (e.g. a filename legitimately containing ` error=` or
-/// ` reason=` on APFS/HFS+/ext4). Cutting at the first occurrence truncates
-/// such a value mid-path; cutting at the last keeps it whole and still strips
-/// only the real trailing attribute.
-fn attr_value(line: &str, key: &str, next_keys: &[&str]) -> Option<String> {
-    let needle = format!(" {key}=");
-    let pos = line.rfind(&needle)?;
-    let rest = &line[pos + needle.len()..];
+/// This is sound ONLY for a value whose event shape guarantees that one of
+/// `next_keys` really follows it: the genuine marker is then the last one on
+/// the line, and an earlier copy can only be a key-like substring embedded in
+/// the value itself (a filename legitimately containing ` error=` is legal on
+/// APFS/HFS+/ext4). A value with no guaranteed successor attribute must never
+/// be truncated at all — see `terminal_file_value`.
+fn truncate_at_next_attr<'a>(rest: &'a str, next_keys: &[&str]) -> &'a str {
     let mut end = rest.len();
     for next in next_keys {
         let marker = format!(" {next}=");
@@ -63,19 +55,78 @@ fn attr_value(line: &str, key: &str, next_keys: &[&str]) -> Option<String> {
             }
         }
     }
-    Some(rest[..end].trim().to_string())
+    &rest[..end]
 }
 
-/// The event message of a console-slog line (between the `ERR ` level token and
-/// the first attribute), e.g. "server error".
-fn error_message(line: &str) -> Option<String> {
-    let start = line.find(" ERR ")? + " ERR ".len();
-    let rest = &line[start..];
-    let end = rest
+/// Extract the value of a space-delimited `key=` attribute from a console-slog
+/// record body. immich-go's console handler writes attribute values UNQUOTED
+/// (spaces and all), so a value runs from after `key=` until the next known
+/// attribute key or end of body.
+///
+/// Both `key` and every `next_keys` marker are located by their RIGHTMOST
+/// occurrence, so this is restricted to attributes the event shape guarantees
+/// to be trailing — the `error=` / `reason=` of an ERR record. A PATH is never
+/// such an attribute: extract `file=` with `terminal_file_value` or
+/// `err_file_value`, which anchor on the FIRST, structural marker.
+fn attr_value(body: &str, key: &str, next_keys: &[&str]) -> Option<String> {
+    let needle = format!(" {key}=");
+    let pos = body.rfind(&needle)?;
+    let rest = &body[pos + needle.len()..];
+    Some(truncate_at_next_attr(rest, next_keys).trim().to_string())
+}
+
+/// The remainder of a console-slog record body after its FIRST ` file=` marker.
+///
+/// The marker MUST be found from the left. `body` begins after the level token,
+/// so everything ahead of the real marker is immich-go's own fixed message text
+/// ("uploaded successfully", "server error", ...), which carries no attribute
+/// marker of its own; every LATER ` file=` can only belong to the unquoted
+/// filename. Searching from the right instead starts the value INSIDE such a
+/// filename, which silently drops the event.
+fn file_attr_tail(body: &str) -> Option<&str> {
+    const MARKER: &str = " file=";
+    let pos = body.find(MARKER)?;
+    Some(&body[pos + MARKER.len()..])
+}
+
+/// The `file=` value of an INF `uploaded successfully` / `server has duplicate`
+/// record, where `file` is the LAST attribute immich-go writes.
+///
+/// Nothing may terminate this value. With no attribute after the filename there
+/// is no marker that can tell an embedded ` error=` / ` reason=` /
+/// ` discovered_at=` / ` file=` apart from a structural one, and truncating
+/// would tally — and offer for deletion — a DIFFERENT, possibly existing
+/// sibling path instead of the file that was really uploaded.
+fn terminal_file_value(body: &str) -> Option<String> {
+    Some(file_attr_tail(body)?.trim().to_string())
+}
+
+/// The `file=` value of an ERR record, whose shape writes the failure reason
+/// after the path: `ERR <msg> file=<path> error=<reason> [discovered_at=<ts>]`.
+///
+/// Terminating on `error=` / `reason=` is unavoidable here, because that is the
+/// attribute the shape guarantees follows the path, and the rightmost such
+/// marker is the structural one since the reason is written last.
+/// `discovered_at=` is deliberately NOT a terminator: the shape only ever emits
+/// it after the reason, so it can precede the end of the path only by being
+/// part of the filename.
+fn err_file_value(body: &str) -> Option<String> {
+    let tail = file_attr_tail(body)?;
+    Some(
+        truncate_at_next_attr(tail, &["error", "reason"])
+            .trim()
+            .to_string(),
+    )
+}
+
+/// The event message of a console-slog ERR body (before the first attribute),
+/// e.g. "server error".
+fn error_message(body: &str) -> Option<String> {
+    let end = body
         .find(" file=")
-        .or_else(|| rest.find(" error="))
-        .unwrap_or(rest.len());
-    let msg = rest[..end].trim();
+        .or_else(|| body.find(" error="))
+        .unwrap_or(body.len());
+    let msg = body[..end].trim();
     if msg.is_empty() {
         None
     } else {
@@ -169,31 +220,36 @@ fn fs_path_from_file_attr(file: &str, source_paths: &[String]) -> Option<String>
     Some(join_root(root, name))
 }
 
-/// The message of a console-slog INFO line (`YYYY-MM-DD HH:MM:SS INF <msg...>`),
-/// or `None` if the line is not an INFO event. The timestamp is fixed-width, so
-/// the level token sits at column 19. Indented summary-report lines (which begin
-/// with extra spaces after `INF `) are intentionally returned with their leading
-/// whitespace so callers' `starts_with` checks skip them.
-fn info_line_message(line: &str) -> Option<&str> {
-    const MARKER: &str = " INF ";
-    let marker_end = 19 + MARKER.len();
+/// The body of a console-slog record (`YYYY-MM-DD HH:MM:SS <LVL> <body...>`)
+/// once its level token has been matched, or `None` if the line is not that
+/// level. The timestamp is fixed-width, so the level token sits at column 19.
+///
+/// Every attribute parser anchors on this body rather than on the raw line, so
+/// a marker search can never start in the timestamp and always starts after the
+/// event's own message text.
+fn level_body<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    let marker_end = 19 + marker.len();
     if line.len() < marker_end || !line.is_char_boundary(19) || !line.is_char_boundary(marker_end) {
         return None;
     }
-    if &line[19..marker_end] != MARKER {
+    if &line[19..marker_end] != marker {
         return None;
     }
     Some(&line[marker_end..])
 }
 
-/// console-slog (NoColor) error line prefix: `YYYY-MM-DD HH:MM:SS ERR `.
-fn is_error_line(line: &str) -> bool {
-    const MARKER: &str = " ERR ";
-    let marker_end = 19 + MARKER.len();
-    line.len() >= marker_end
-        && line.is_char_boundary(19)
-        && line.is_char_boundary(marker_end)
-        && &line[19..marker_end] == MARKER
+/// The message of a console-slog INFO line, or `None` if the line is not an
+/// INFO event. Indented summary-report lines (which begin with extra spaces
+/// after `INF `) are intentionally returned with their leading whitespace so
+/// callers' `starts_with` checks skip them.
+fn info_line_message(line: &str) -> Option<&str> {
+    level_body(line, " INF ")
+}
+
+/// The body of a console-slog (NoColor) error line, i.e. everything after the
+/// `YYYY-MM-DD HH:MM:SS ERR ` prefix.
+fn error_line_body(line: &str) -> Option<&str> {
+    level_body(line, " ERR ")
 }
 
 /// Incremental accumulator for run-log progress.
@@ -285,10 +341,8 @@ impl ProgressAccumulator {
     }
 
     fn apply_line(&mut self, line: &str) {
-        if is_error_line(line) {
-            match attr_value(line, "file", &["error", "reason", "discovered_at"])
-                .filter(|f| !f.is_empty())
-            {
+        if let Some(body) = error_line_body(line) {
+            match err_file_value(body).filter(|f| !f.is_empty()) {
                 Some(file) => {
                     if self.failed_paths.len() < MAX_TRACKED_ERROR_PATHS
                         && self.failed_paths.insert(file)
@@ -311,9 +365,11 @@ impl ProgressAccumulator {
             return;
         };
         if message.starts_with("uploaded successfully") {
-            if let Some(file) = attr_value(line, "file", &["error", "reason", "discovered_at"])
-                .filter(|f| !f.is_empty())
-            {
+            // `file` is the terminal attribute of this event shape, so the
+            // whole remainder of the line is the filename. Cutting it at a
+            // key-like substring would tally (and offer for deletion) a
+            // different sibling path than the one that was uploaded.
+            if let Some(file) = terminal_file_value(message).filter(|f| !f.is_empty()) {
                 // Tallying and dedup both require resolution now: an
                 // unresolvable `file=` did not come from the scan (it may be a
                 // forged record — a filename containing a newline can inject an
@@ -335,9 +391,8 @@ impl ProgressAccumulator {
                 }
             }
         } else if message.starts_with("server has duplicate") {
-            if let Some(file) = attr_value(line, "file", &["error", "reason", "discovered_at"])
-                .filter(|f| !f.is_empty())
-            {
+            // Same terminal shape as `uploaded successfully` above.
+            if let Some(file) = terminal_file_value(message).filter(|f| !f.is_empty()) {
                 match fs_path_from_file_attr(&file, &self.source_paths) {
                     Some(path) => {
                         if self.seen_paths.insert(path.clone()) {
@@ -381,10 +436,10 @@ pub fn parse_error_log(contents: &str, source_paths: &[String]) -> Vec<FileError
     let mut seen: HashSet<String> = HashSet::new();
 
     for line in contents.lines() {
-        if !is_error_line(line) {
+        let Some(body) = error_line_body(line) else {
             continue;
-        }
-        let file = match attr_value(line, "file", &["error", "reason", "discovered_at"]) {
+        };
+        let file = match err_file_value(body) {
             // Display only — nothing is deleted from this list, so an unresolvable
             // value still tells the user which file the server rejected.
             Some(f) if !f.is_empty() => {
@@ -395,10 +450,13 @@ pub fn parse_error_log(contents: &str, source_paths: &[String]) -> Vec<FileError
         if !seen.insert(file.clone()) {
             continue;
         }
-        let reason = attr_value(line, "error", &["discovered_at"])
+        // The reason IS the trailing attribute of the ERR shape (only
+        // `discovered_at=` may follow it), so `attr_value`'s rightmost-marker
+        // rule is the structural one for it.
+        let reason = attr_value(body, "error", &["discovered_at"])
             .filter(|r| !r.is_empty())
-            .or_else(|| attr_value(line, "reason", &["discovered_at"]).filter(|r| !r.is_empty()))
-            .or_else(|| error_message(line))
+            .or_else(|| attr_value(body, "reason", &["discovered_at"]).filter(|r| !r.is_empty()))
+            .or_else(|| error_message(body))
             .unwrap_or_else(|| "Upload failed".to_string());
         out.push(FileError { file, reason });
         if out.len() >= MAX_FILE_ERRORS {
@@ -412,7 +470,8 @@ pub fn parse_error_log(contents: &str, source_paths: &[String]) -> Vec<FileError
 #[cfg(test)]
 mod tests {
     use super::{
-        info_line_message, is_error_line, parse_error_log, parse_run_progress, ProgressAccumulator,
+        error_line_body, info_line_message, parse_error_log, parse_run_progress,
+        ProgressAccumulator,
     };
 
     // A realistic console-slog run-log slice captured from immich-go v0.32.0
@@ -720,7 +779,7 @@ mod tests {
         // The byte offset after a console-slog level token lands inside `é`.
         // Parsing this must reject the line rather than slicing at a non-boundary.
         let line = "1234567890123456789abcdé ERR file=Card:IMG_0001.JPG";
-        assert!(!is_error_line(line));
+        assert!(error_line_body(line).is_none());
         assert_eq!(info_line_message(line), None);
         assert_eq!(parse_run_progress(line, &[]).progress.errors, 0);
     }
@@ -774,19 +833,107 @@ mod tests {
         assert_eq!(run.progress.uploaded, 0);
     }
 
-    // ---- INF `file=` terminator list (was previously unterminated) ----
+    // ---- terminal `file=` shapes (INF uploaded / duplicate) ----
 
-    /// Before the fix, the INF branches passed an empty terminator list to
-    /// `attr_value`, so a `file=` value ran to end of line and swallowed any
-    /// trailing attribute verbatim into the resolved path. Passing the same
-    /// terminator list the ERR branch already used cuts the value at the
-    /// real trailing attribute instead.
+    /// `uploaded successfully` ends AT its `file=` value: immich-go writes no
+    /// attribute after it, so every ` file=` / ` error=` / ` reason=` /
+    /// ` discovered_at=` past the structural marker is part of the (unquoted,
+    /// legal-on-APFS) filename. Terminating the value on those markers picked a
+    /// different sibling path than the file that was uploaded — or, for
+    /// ` file=`, started the value inside the filename and dropped the event.
     #[test]
-    fn uploaded_line_file_value_terminates_before_trailing_attr() {
-        let log = "2026-06-24 16:10:21 INF uploaded successfully file=/Volumes/CARD:DCIM/IMG_0001.JPG error=unexpected";
+    fn uploaded_terminal_file_value_keeps_embedded_markers() {
+        let log = "2026-06-24 16:10:21 INF uploaded successfully file=/Volumes/CARD:DCIM/photo file=copy.jpg\n\
+2026-06-24 16:10:22 INF uploaded successfully file=/Volumes/CARD:DCIM/photo error=inside.jpg\n\
+2026-06-24 16:10:23 INF uploaded successfully file=/Volumes/CARD:DCIM/photo reason=inside.jpg\n\
+2026-06-24 16:10:24 INF uploaded successfully file=/Volumes/CARD:DCIM/photo discovered_at=inside.jpg";
         let run = parse_run_progress(log, &["/Volumes/CARD".to_string()]);
-        assert_eq!(run.progress.uploaded, 1);
-        assert_eq!(run.completed_paths, vec!["/Volumes/CARD/DCIM/IMG_0001.JPG"]);
+        assert_eq!(
+            run.completed_paths,
+            vec![
+                "/Volumes/CARD/DCIM/photo file=copy.jpg",
+                "/Volumes/CARD/DCIM/photo error=inside.jpg",
+                "/Volumes/CARD/DCIM/photo reason=inside.jpg",
+                "/Volumes/CARD/DCIM/photo discovered_at=inside.jpg",
+            ]
+        );
+        assert_eq!(run.progress.uploaded, 4);
+        assert_eq!(run.unresolved_file_events, 0);
+    }
+
+    /// `server has duplicate` has the same terminal shape, and its files are
+    /// wipe candidates too, so it must keep the whole filename as well.
+    #[test]
+    fn duplicate_terminal_file_value_keeps_embedded_markers() {
+        let log = "2026-06-24 16:10:31 INF server has duplicate file=/Volumes/CARD:DCIM/clip file=copy.mp4\n\
+2026-06-24 16:10:32 INF server has duplicate file=/Volumes/CARD:DCIM/clip error=inside.mp4\n\
+2026-06-24 16:10:33 INF server has duplicate file=/Volumes/CARD:DCIM/clip reason=inside.mp4\n\
+2026-06-24 16:10:34 INF server has duplicate file=/Volumes/CARD:DCIM/clip discovered_at=inside.mp4";
+        let run = parse_run_progress(log, &["/Volumes/CARD".to_string()]);
+        assert_eq!(
+            run.completed_paths,
+            vec![
+                "/Volumes/CARD/DCIM/clip file=copy.mp4",
+                "/Volumes/CARD/DCIM/clip error=inside.mp4",
+                "/Volumes/CARD/DCIM/clip reason=inside.mp4",
+                "/Volumes/CARD/DCIM/clip discovered_at=inside.mp4",
+            ]
+        );
+        assert_eq!(run.progress.duplicates, 4);
+        assert_eq!(run.unresolved_file_events, 0);
+    }
+
+    /// `DCIM/photo` and `DCIM/photo error=inside.jpg` can both exist in the
+    /// same directory. A truncated value resolves under the real root, so the
+    /// resolver cannot catch it: the truncated sibling would be tallied and
+    /// handed to the wipe stage as a delete candidate for a file that was
+    /// never uploaded.
+    #[test]
+    fn truncated_sibling_path_is_never_a_wipe_candidate() {
+        let log = "2026-06-24 16:10:21 INF uploaded successfully file=/Volumes/CARD:DCIM/photo error=inside.jpg\n\
+2026-06-24 16:10:22 INF server has duplicate file=/Volumes/CARD:DCIM/clip discovered_at=inside.mp4";
+        let run = parse_run_progress(log, &["/Volumes/CARD".to_string()]);
+        for truncated in ["/Volumes/CARD/DCIM/photo", "/Volumes/CARD/DCIM/clip"] {
+            assert!(
+                !run.completed_paths.iter().any(|p| p == truncated),
+                "truncated sibling {truncated} must never become a wipe candidate"
+            );
+        }
+        assert_eq!(
+            run.completed_paths,
+            vec![
+                "/Volumes/CARD/DCIM/photo error=inside.jpg",
+                "/Volumes/CARD/DCIM/clip discovered_at=inside.mp4",
+            ]
+        );
+    }
+
+    /// ERR records DO carry attributes after the path, but only the reason
+    /// (`error=` / `reason=`) is guaranteed to sit there; `discovered_at=`
+    /// follows the reason, so reaching the path means it came from the
+    /// filename. It must not terminate the path.
+    #[test]
+    fn err_file_value_is_not_terminated_by_embedded_discovered_at() {
+        let log = "2026-06-22 14:30:05 ERR incomplete processing file=/Volumes/CARD:DCIM/photo discovered_at=inside.jpg error=asset never reached final state";
+        let errors = parse_error_log(log, &["/Volumes/CARD".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].file,
+            "/Volumes/CARD/DCIM/photo discovered_at=inside.jpg"
+        );
+        assert_eq!(errors[0].reason, "asset never reached final state");
+    }
+
+    /// The structural ` file=` marker is the FIRST one after the event message;
+    /// a later copy belongs to the filename. Anchoring on the last one started
+    /// the value inside the filename and reported the wrong file entirely.
+    #[test]
+    fn err_file_value_anchors_on_first_file_marker() {
+        let log = "2026-06-22 14:30:01 ERR server error file=/Volumes/CARD:DCIM/photo file=copy.jpg error=Internal Server Error (500)";
+        let errors = parse_error_log(log, &["/Volumes/CARD".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].file, "/Volumes/CARD/DCIM/photo file=copy.jpg");
+        assert_eq!(errors[0].reason, "Internal Server Error (500)");
     }
 
     // ---- unresolved_file_events ----

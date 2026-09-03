@@ -10,6 +10,7 @@
  * | -------------------- | ------------------------------------------------ |
  * | `TERMINAL_CANCEL`    | `commands::import::TERMINAL_CANCEL_ERROR`        |
  * | `JOB_NOT_FOUND`      | `commands::import::JOB_NOT_FOUND_ERROR`          |
+ * | `IMPORT_NOT_RUNNING` | `commands::import::IMPORT_NOT_RUNNING_ERROR`     |
  * | `MISSING_API_KEY`    | `services::keychain::MISSING_API_KEY_ERROR`      |
  * | `UNREACHABLE_SERVER` | `services::immich_client::UNREACHABLE_ERROR`     |
  *
@@ -20,6 +21,7 @@
 const BACKEND_ERROR = {
   TERMINAL_CANCEL: "Cannot cancel a terminal import",
   JOB_NOT_FOUND: "Job not found:",
+  IMPORT_NOT_RUNNING: "Import is no longer running:",
   MISSING_API_KEY: "No API key found for profile",
   UNREACHABLE_SERVER: "Could not reach the server",
 } as const;

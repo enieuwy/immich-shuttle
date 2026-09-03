@@ -111,6 +111,7 @@ export const devices: RemovableDevice[] = [
   {
     name: "CANON_EOS",
     mount_path: "/Volumes/CANON_EOS",
+    volume_id: "fixture-canon-eos",
     total_space: 64 * 1024 * 1024 * 1024,
     available_space: 12 * 1024 * 1024 * 1024,
     has_dcim: true,
@@ -118,6 +119,7 @@ export const devices: RemovableDevice[] = [
   {
     name: "Untitled",
     mount_path: "/Volumes/Untitled",
+    volume_id: "fixture-untitled",
     total_space: 256 * 1024 * 1024 * 1024,
     available_space: 240 * 1024 * 1024 * 1024,
     has_dcim: false,
