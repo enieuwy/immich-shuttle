@@ -13,17 +13,15 @@ let counter = 0;
 
 export const errorsState = {
   subscribe: state.subscribe,
+  /** Add an error. When a dedupe key is supplied, suppress it while any active
+   *  error carries that key. The key names a recurring failure class whose owner
+   *  clears it on recovery, so different wording for one outage cannot stack
+   *  another toast. */
   addError(message: string, level: UiError["level"] = "error", dedupeKey?: string) {
     const id = `${Date.now()}-${counter++}`;
     let added = false;
     state.update((items) => {
-      if (
-        dedupeKey &&
-        items.some(
-          (item) =>
-            item.dedupeKey === dedupeKey && item.level === level && item.message === message,
-        )
-      ) {
+      if (dedupeKey && items.some((item) => item.dedupeKey === dedupeKey)) {
         return items;
       }
       added = true;

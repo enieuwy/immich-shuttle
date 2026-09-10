@@ -26,6 +26,7 @@ import { albumsState } from "$lib/state/albums";
 import { createGeneration } from "$lib/state/generation";
 import { activeProfile, profilesState } from "$lib/state/profiles";
 import { sourceState } from "$lib/state/source";
+import { isAlreadyTerminal } from "$lib/state/shutdown";
 
 type QueueState = {
   jobs: ImportJob[];
@@ -389,14 +390,21 @@ export const queueState = {
       const albumsUsable = albums.loadedProfileId === profile.id;
       // immich-go assigns albums by name (--into-album), single album per run. A
       // device rule can supply the name directly; otherwise resolve it from the
-      // first selected album id.
+      // durable selection first because a search can remove the chosen album
+      // from the visible results.
       const albumIds = overrides?.albumIds ?? (albumsUsable ? albums.selectedAlbumIds : []);
       const intoAlbum =
         overrides?.intoAlbum !== undefined
           ? overrides.intoAlbum
           : albumIds.length > 0
-            ? (albums.availableAlbums.find((a) => a.id === albumIds[0])?.album_name ?? null)
+            ? (albums.selectedAlbums.find((a) => a.id === albumIds[0]) ??
+                albums.availableAlbums.find((a) => a.id === albumIds[0]))?.album_name ?? null
             : null;
+      if (albumIds.length > 0 && !intoAlbum) {
+        throw new Error(
+          "Could not resolve the selected album. Reload the album list and try again.",
+        );
+      }
 
       // An explicit preview selection IS the import: the user hand-picked exact
       // files, so no coarse filter may silently drop one. Type, date, include-
@@ -496,7 +504,11 @@ export const queueState = {
     try {
       await importCancel(jobId);
       await refreshJobs();
-    } catch {
+    } catch (error) {
+      if (isAlreadyTerminal(error)) {
+        await refreshJobs();
+        return;
+      }
       errorsState.addError("Could not cancel import.");
     }
   },

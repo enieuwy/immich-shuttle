@@ -12,6 +12,8 @@ import { activeProfile } from "$lib/state/profiles";
 type AlbumsState = {
   availableAlbums: Album[];
   selectedAlbumIds: string[];
+  /** Selected album objects survive search-filtered list reloads. */
+  selectedAlbums: Album[];
   availableUsers: AlbumUser[];
   loading: boolean;
   error: string | null;
@@ -51,6 +53,7 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 const state = writable<AlbumsState>({
   availableAlbums: [],
   selectedAlbumIds: [],
+  selectedAlbums: [],
   availableUsers: [],
   loading: false,
   error: null,
@@ -82,6 +85,7 @@ activeProfile.subscribe((profile) => {
   state.update((s) => ({
     ...s,
     selectedAlbumIds: [],
+    selectedAlbums: [],
     availableAlbums: [],
     availableUsers: [],
     loadedProfileId: null,
@@ -195,17 +199,29 @@ export const albumsState = {
     }
   },
   selectAlbum(albumId: string) {
-    // Single-select: immich-go imports into one album (--into-album).
-    state.update((s) => ({ ...s, selectedAlbumIds: [albumId] }));
+    // Single-select: immich-go imports into one album (--into-album). Keep the
+    // object separately because a later search can remove it from the visible
+    // results while it remains the import destination.
+    state.update((s) => {
+      const selectedAlbum =
+        s.availableAlbums.find((album) => album.id === albumId) ??
+        s.selectedAlbums.find((album) => album.id === albumId);
+      return {
+        ...s,
+        selectedAlbumIds: [albumId],
+        selectedAlbums: selectedAlbum ? [selectedAlbum] : [],
+      };
+    });
   },
   deselectAlbum(albumId: string) {
     state.update((s) => ({
       ...s,
       selectedAlbumIds: s.selectedAlbumIds.filter((id) => id !== albumId),
+      selectedAlbums: s.selectedAlbums.filter((album) => album.id !== albumId),
     }));
   },
   clearSelection() {
-    state.update((s) => ({ ...s, selectedAlbumIds: [] }));
+    state.update((s) => ({ ...s, selectedAlbumIds: [], selectedAlbums: [] }));
   },
   async createAlbum(
     name: string,
@@ -264,6 +280,7 @@ export const albumsState = {
         availableAlbums: [created, ...s.availableAlbums],
         // Single-select: importing into the just-created album (--into-album).
         selectedAlbumIds: [created.id],
+        selectedAlbums: [created],
         shareLinkUrl,
       }));
       if (warnings.length > 0) {

@@ -1973,6 +1973,11 @@ fn plan_import_start(input: &ImportInput) -> Result<StartPlan, String> {
     // Both the in-flight id and the resolution at finalization read this, so
     // they cannot disagree about whether a link is warranted.
     let album_link_name = album_link_target(input.organization, input.into_album.as_deref());
+    // A selected album without a resolved name silently uploads to the wrong
+    // place, which is worse than refusing to start the import.
+    if !input.album_ids.is_empty() && album_link_name.is_none() {
+        return Err("An album was selected but its name could not be resolved.".to_string());
+    }
     let provisional_album_id = if album_link_name.is_some() {
         input.album_ids.first().cloned()
     } else {
@@ -3482,13 +3487,27 @@ pub async fn import_cancel(job_id: String) -> Result<(), String> {
     let job = get_job(&job_id)?;
     match &job.status {
         JobStatus::Running => {
-            let running = RUNNING_IMPORTS
-                .lock()
-                .map_err(|_| "Could not lock running imports state".to_string())?;
-            let flag = running
-                .get(&job_id)
-                .ok_or_else(|| format!("{IMPORT_NOT_RUNNING_ERROR} {job_id}"))?;
-            flag.store(true, Ordering::Relaxed);
+            let signalled = {
+                let running = RUNNING_IMPORTS
+                    .lock()
+                    .map_err(|_| "Could not lock running imports state".to_string())?;
+                if let Some(flag) = running.get(&job_id) {
+                    flag.store(true, Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !signalled {
+                // The finalization window has no sidecar flag left to signal,
+                // but the stored running status must still accept cancellation.
+                let finalizing = FINALIZING_IMPORTS
+                    .lock()
+                    .map_err(|_| "Could not lock finalizing imports state".to_string())?;
+                if !finalizing.contains(&job_id) {
+                    return Err(format!("{IMPORT_NOT_RUNNING_ERROR} {job_id}"));
+                }
+            }
         }
         JobStatus::Pending => {}
         JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => {
@@ -4317,6 +4336,49 @@ mod tests {
         lock_jobs().retain(|j| j.id != job_id);
     }
 
+    /// A worker has no sidecar flag after it enters finalization, but a cancel
+    /// during that window must still become the outcome shown to the user.
+    #[test]
+    fn cancel_succeeds_while_a_running_job_is_only_finalizing() {
+        let job_id = format!("cancel-finalizing-{}", Uuid::new_v4());
+        let mut job = terminal_job(&job_id, false);
+        job.status = JobStatus::Running;
+        lock_jobs().push(job);
+        lock_finalizing().insert(job_id.clone());
+        assert!(!lock_running().contains_key(&job_id));
+
+        tauri::async_runtime::block_on(import_cancel(job_id.clone()))
+            .expect("a finalizing import still accepts cancellation");
+
+        let stored = get_job(&job_id).expect("the cancelled job remains stored");
+        assert!(matches!(stored.status, JobStatus::Cancelled));
+
+        lock_finalizing().remove(&job_id);
+        lock_jobs().retain(|job| job.id != job_id);
+    }
+
+    #[test]
+    fn cancel_refuses_a_running_job_with_no_live_worker() {
+        let job_id = format!("cancel-not-running-{}", Uuid::new_v4());
+        let mut job = terminal_job(&job_id, false);
+        job.status = JobStatus::Running;
+        lock_jobs().push(job);
+        assert!(!lock_running().contains_key(&job_id));
+        assert!(!lock_finalizing().contains(&job_id));
+
+        let err = tauri::async_runtime::block_on(import_cancel(job_id.clone()))
+            .expect_err("a running status without a live worker must be refused");
+
+        assert_eq!(err, format!("{IMPORT_NOT_RUNNING_ERROR} {job_id}"));
+        assert!(matches!(
+            get_job(&job_id)
+                .expect("the refused job remains stored")
+                .status,
+            JobStatus::Running
+        ));
+        lock_jobs().retain(|job| job.id != job_id);
+    }
+
     /// Eviction must preserve a terminal job that still owns a wipe prompt:
     /// dropping it also drops the payload needed to confirm deletion.
     #[test]
@@ -4887,6 +4949,27 @@ mod tests {
             album_link_target(Organization::SingleAlbum, Some("  ")),
             None
         );
+    }
+
+    /// Losing a selected album's name must stop before the plan silently turns
+    /// the request into a root-timeline upload.
+    #[test]
+    fn a_selected_album_requires_a_resolved_name() {
+        let mut input = replayable_input("p1");
+        input.album_ids = vec!["a".to_string()];
+
+        let err = plan_import_start(&input)
+            .err()
+            .expect("a selected album without a name must be refused");
+        assert_eq!(
+            err,
+            "An album was selected but its name could not be resolved."
+        );
+
+        input.into_album = Some("Holiday".to_string());
+        let plan = plan_import_start(&input).expect("the same selected album is valid once named");
+        assert_eq!(plan.provisional_album_id.as_deref(), Some("a"));
+        assert_eq!(plan.album_link_name.as_deref(), Some("Holiday"));
     }
 
     /// PARTIAL-RUN-LOOKS-CLEAN: one photo uploads, immich-go then reports an

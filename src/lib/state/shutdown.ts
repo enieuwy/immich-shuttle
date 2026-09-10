@@ -101,7 +101,7 @@ export type ShutdownDeps = {
  * case shutdown already reads as terminal. Refusing here would report an
  * incomplete shutdown for work that no longer exists.
  */
-function isAlreadyTerminal(reason: unknown): boolean {
+export function isAlreadyTerminal(reason: unknown): boolean {
   return (
     isBackendError(reason, "TERMINAL_CANCEL") ||
     isBackendError(reason, "IMPORT_NOT_RUNNING") ||

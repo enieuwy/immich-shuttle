@@ -33,18 +33,27 @@ describe("errorsState", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("deduplicates active errors with the same key and allows them after dismissal", () => {
+  it("deduplicates an active key across messages and levels until recovery clears it", () => {
     errorsState.addError("Queue refresh failed.", "error", "queue-refresh");
-    errorsState.addError("Queue refresh failed.", "error", "queue-refresh");
-    errorsState.addError("A different error.", "error", "queue-refresh");
+    errorsState.addError("The queue is unavailable.", "warning", "queue-refresh");
 
-    expect(get(errorsState)).toHaveLength(2);
+    expect(get(errorsState)).toEqual([
+      expect.objectContaining({
+        dedupeKey: "queue-refresh",
+        level: "error",
+        message: "Queue refresh failed.",
+      }),
+    ]);
 
-    for (const error of get(errorsState).filter((item) => item.dedupeKey === "queue-refresh")) {
-      errorsState.dismissError(error.id);
-    }
-    errorsState.addError("Queue refresh failed.", "error", "queue-refresh");
+    errorsState.clearKeyed("queue-refresh");
+    errorsState.addError("The queue is still unavailable.", "warning", "queue-refresh");
 
-    expect(get(errorsState).filter((error) => error.dedupeKey === "queue-refresh")).toHaveLength(1);
+    expect(get(errorsState)).toEqual([
+      expect.objectContaining({
+        dedupeKey: "queue-refresh",
+        level: "warning",
+        message: "The queue is still unavailable.",
+      }),
+    ]);
   });
 });

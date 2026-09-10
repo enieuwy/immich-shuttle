@@ -259,6 +259,32 @@ describe("queueState", () => {
     expect(vi.mocked(api.importConfirmWipe)).toHaveBeenCalledWith("job-1", true);
   });
 
+  it("refreshes silently when cancel loses a race to terminal completion", async () => {
+    const existingErrorIds = new Set(get(errorsState).map((error) => error.id));
+    const refreshCallsBefore = vi.mocked(api.importListJobs).mock.calls.length;
+    vi.mocked(api.importCancel).mockRejectedValueOnce(
+      new BackendError("import_cancel", "Cannot cancel a terminal import: job-1"),
+    );
+
+    await queueState.cancelImport("job-1");
+
+    expect(vi.mocked(api.importListJobs).mock.calls.length).toBe(refreshCallsBefore + 1);
+    expect(get(errorsState).filter((error) => !existingErrorIds.has(error.id))).toEqual([]);
+  });
+
+  it("reports an unrelated cancel failure", async () => {
+    const existingErrorIds = new Set(get(errorsState).map((error) => error.id));
+    vi.mocked(api.importCancel).mockRejectedValueOnce(new Error("transport failed"));
+
+    await queueState.cancelImport("job-1");
+
+    const shown = get(errorsState).find(
+      (error) => !existingErrorIds.has(error.id) && error.message === "Could not cancel import.",
+    );
+    expect(shown).toBeDefined();
+    errorsState.dismissError(shown!.id);
+  });
+
   it("shows the backend's own reason when a retry is refused", async () => {
     // Admission refuses for the moment a cancelled run finishes writing history,
     // and that sentence tells the user to try again; a generic message would not.
@@ -326,6 +352,39 @@ describe("queueState", () => {
     const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
     expect(payload?.album_ids).toEqual(["a1"]);
     expect(payload?.into_album).toBe("Trip");
+  });
+
+  it("keeps the selected album name when search results exclude it", async () => {
+    await activateProfileWithSource();
+    await albumsState.loadAlbums();
+    albumsState.selectAlbum("a1");
+    vi.mocked(api.albumsList).mockResolvedValueOnce([
+      { id: "a2", album_name: "Work", shared_with: [] },
+    ]);
+    await albumsState.loadAlbums("work");
+    expect(get(albumsState).availableAlbums.map((album) => album.id)).toEqual(["a2"]);
+
+    await queueState.startImport();
+
+    const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
+    expect(payload?.album_ids).toEqual(["a1"]);
+    expect(payload?.into_album).toBe("Trip");
+    albumsState.clearSelection();
+  });
+
+  it("rejects an album id whose name cannot be resolved", async () => {
+    await activateProfileWithSource();
+    albumsState.clearSelection();
+    vi.mocked(api.albumsList).mockResolvedValueOnce([]);
+    await albumsState.loadAlbums("missing");
+    albumsState.selectAlbum("missing");
+    const startsBefore = vi.mocked(api.importStart).mock.calls.length;
+
+    await expect(queueState.startImport()).rejects.toThrow(
+      "Could not resolve the selected album. Reload the album list and try again.",
+    );
+    expect(vi.mocked(api.importStart).mock.calls.length).toBe(startsBefore);
+    albumsState.clearSelection();
   });
 
   it("defaults organization to single_album", async () => {
