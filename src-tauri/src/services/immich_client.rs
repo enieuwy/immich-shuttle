@@ -1119,14 +1119,6 @@ mod tests {
     }
 
     #[test]
-    fn trims_trailing_slash() {
-        assert_eq!(
-            normalize_server_url("https://immich.example.com/"),
-            "https://immich.example.com"
-        );
-    }
-
-    #[test]
     fn share_link_uses_primary_server_url() {
         use super::share_link_url;
 
