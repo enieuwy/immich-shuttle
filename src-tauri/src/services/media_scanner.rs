@@ -90,10 +90,18 @@ pub(crate) fn acquire_scan_roots(
     purpose: ScanPurpose,
     roots: &[String],
 ) -> Result<InFlightScanRoots, String> {
+    acquire_scan_roots_with_grace(purpose, roots, CLAIM_GRACE)
+}
+
+pub(crate) fn acquire_scan_roots_with_grace(
+    purpose: ScanPurpose,
+    roots: &[String],
+    grace: Duration,
+) -> Result<InFlightScanRoots, String> {
     let keys = claim_keys(purpose, roots);
     let (lock, released) = &*IN_FLIGHT_SCAN_ROOTS;
     let mut in_flight = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let deadline = Instant::now() + CLAIM_GRACE;
+    let deadline = Instant::now() + grace;
     while let Some(taken) = keys.iter().position(|key| in_flight.contains(key)) {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -508,21 +516,24 @@ mod tests {
         use std::{sync::mpsc, thread};
 
         let root = format!("/unresponsive-source-{}", Uuid::new_v4());
+        let grace = Duration::from_millis(20);
         let (release_sender, release_receiver) = mpsc::sync_channel(0);
-        let guard = acquire_scan_roots(ScanPurpose::Scan, std::slice::from_ref(&root))
-            .expect("first walk claims root");
+        let guard =
+            acquire_scan_roots_with_grace(ScanPurpose::Scan, std::slice::from_ref(&root), grace)
+                .expect("first walk claims root");
         let worker = thread::spawn(move || {
             let _guard = guard;
             release_receiver.recv().expect("test releases blocked walk");
         });
 
         let started = Instant::now();
-        let second = acquire_scan_roots(ScanPurpose::Scan, std::slice::from_ref(&root))
-            .expect_err("a walk that never returns must fail the next claim");
+        let second =
+            acquire_scan_roots_with_grace(ScanPurpose::Scan, std::slice::from_ref(&root), grace)
+                .expect_err("a walk that never returns must fail the next claim");
         assert!(second.contains(&root));
         // The claim waited rather than failing on contact, so a walk that is
         // merely finishing is not reported as unresponsive.
-        assert!(started.elapsed() >= CLAIM_GRACE);
+        assert!(started.elapsed() >= grace);
 
         release_sender.send(()).expect("blocked walk is released");
         worker.join().expect("walking task exits");

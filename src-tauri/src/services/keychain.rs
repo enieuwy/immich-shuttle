@@ -330,6 +330,53 @@ mod tests {
         assert!(message.contains("Original backend error: backend failure"));
     }
 
+    #[test]
+    fn require_api_key_returns_the_stored_secret() {
+        let _guard = test_store::exclusive();
+        test_store::reset();
+        let profile = format!("__unit_keychain_{}", uuid::Uuid::new_v4());
+        test_store::seed(&profile, "stored-key");
+
+        assert_eq!(require_api_key(&profile).unwrap(), "stored-key");
+    }
+
+    /// The frontend recognizes this marker and offers to connect the server.
+    /// Changing it would turn an actionable state into a generic failure.
+    #[test]
+    fn require_api_key_identifies_the_missing_profile() {
+        let _guard = test_store::exclusive();
+        test_store::reset();
+        let profile = format!("__unit_keychain_{}", uuid::Uuid::new_v4());
+
+        let error = require_api_key(&profile).expect_err("an absent key must fail");
+
+        assert_eq!(error, format!("{MISSING_API_KEY_ERROR}: {profile}"));
+    }
+
+    /// Deletion is observable only when the deleted key can no longer
+    /// authenticate the profile and reports the frontend's missing-key marker.
+    #[test]
+    fn delete_api_key_makes_the_profile_missing() {
+        let _guard = test_store::exclusive();
+        test_store::reset();
+        let profile = format!("__unit_keychain_{}", uuid::Uuid::new_v4());
+        test_store::seed(&profile, "stored-key");
+
+        delete_api_key(&profile).unwrap();
+        let error = require_api_key(&profile).expect_err("the deleted key must stay absent");
+
+        assert_eq!(error, format!("{MISSING_API_KEY_ERROR}: {profile}"));
+    }
+
+    #[test]
+    fn delete_api_key_accepts_an_absent_profile() {
+        let _guard = test_store::exclusive();
+        test_store::reset();
+        let profile = format!("__unit_keychain_{}", uuid::Uuid::new_v4());
+
+        delete_api_key(&profile).expect("deleting an absent key must be idempotent");
+    }
+
     /// A failed verification must not leave the new secret in place: the caller
     /// is told the save failed, so the previous key has to stay the live one.
     #[test]

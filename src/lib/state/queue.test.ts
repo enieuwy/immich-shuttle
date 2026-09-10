@@ -254,9 +254,55 @@ describe("queueState", () => {
     importOptionsState.clearDateRange();
   });
 
-  it("confirmWipe forwards args to importConfirmWipe", async () => {
-    await queueState.confirmWipe("job-1", true);
+  it("tracks an unsettled wipe until confirmation and refresh finish", async () => {
+    await activateProfileWithSource();
+    const wipe = Promise.withResolvers<ImportJob>();
+    vi.mocked(api.importConfirmWipe).mockReturnValueOnce(wipe.promise);
+
+    const operation = queueState.confirmWipe("job-1", true);
+
+    // Shutdown reads this set synchronously. Registration after the first await
+    // would leave a quit window while the backend consumes the delete payload.
+    expect(queueState.pendingWipes()).toHaveLength(1);
     expect(vi.mocked(api.importConfirmWipe)).toHaveBeenCalledWith("job-1", true);
+
+    wipe.resolve({
+      id: "job-1",
+      status: "completed",
+      progress: { total: 1, uploaded: 1, duplicates: 0, errors: 0 },
+      awaiting_wipe_confirmation: false,
+      pending_wipe_count: 0,
+      file_errors: [],
+      profile_id: "p1",
+    });
+    await operation;
+
+    expect(queueState.pendingWipes()).toEqual([]);
+  });
+
+  it("removes a rejected wipe from shutdown tracking and reports the failure", async () => {
+    await activateProfileWithSource();
+    const existingErrorIds = new Set(get(errorsState).map((error) => error.id));
+    const wipe = Promise.withResolvers<ImportJob>();
+    vi.mocked(api.importConfirmWipe).mockReturnValueOnce(wipe.promise);
+
+    const operation = queueState.confirmWipe("job-1", true);
+
+    expect(queueState.pendingWipes()).toHaveLength(1);
+    wipe.reject(new Error("wipe failed"));
+    await operation;
+
+    // Failed IPC still settles the tracked work, while the established queue
+    // and toast surfaces preserve the reason and the actionable user message.
+    expect(queueState.pendingWipes()).toEqual([]);
+    expect(get(queueState).error).toBe("wipe failed");
+    const shown = get(errorsState).find(
+      (error) =>
+        !existingErrorIds.has(error.id) &&
+        error.message === "Could not complete wipe confirmation.",
+    );
+    expect(shown).toBeDefined();
+    errorsState.dismissError(shown!.id);
   });
 
   it("refreshes silently when cancel loses a race to terminal completion", async () => {

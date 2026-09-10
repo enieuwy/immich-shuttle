@@ -215,6 +215,62 @@ describe("autoImportState", () => {
     );
   });
 
+  it("does not restore a failed candidate after auto-import is disabled", async () => {
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+
+    let rejectStart!: (reason?: unknown) => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    vi.spyOn(queueState, "startImport").mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectStart = reject;
+          markStarted();
+        }),
+    );
+
+    const accepting = autoImportState.accept();
+    await started;
+    // The toggle invalidates the prompt while its import start is still unsettled.
+    autoImportState.setEnabled(false);
+    rejectStart(new Error("start failed"));
+    await accepting;
+
+    expect(get(autoImportState).candidate).toBeNull();
+  });
+
+  it("does not restore a failed candidate after its card is ejected", async () => {
+    autoImportState.setEnabled(true);
+    autoImportState.observe([]);
+    autoImportState.observe([card]);
+
+    let rejectStart!: (reason?: unknown) => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    vi.spyOn(queueState, "startImport").mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectStart = reject;
+          markStarted();
+        }),
+    );
+
+    const accepting = autoImportState.accept();
+    await started;
+    // Ejection removes this card's lifecycle entry without changing the suspended revision.
+    autoImportState.observe([]);
+    rejectStart(new Error("start failed"));
+    await accepting;
+
+    expect(get(autoImportState).candidate).toBeNull();
+  });
+
   it("dismiss suppresses re-prompt until the card is re-inserted", () => {
     autoImportState.setEnabled(true);
     autoImportState.observe([]);

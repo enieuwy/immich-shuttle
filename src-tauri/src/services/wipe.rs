@@ -589,8 +589,8 @@ fn partition_present(total: usize, present: &std::collections::HashSet<usize>) -
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_file, hash_forecast_files, partition_present, wipe_files, FileIdentity, FileRecordId,
-        IdentityCheck, Unprovable, VerifiedFile,
+        hash_file, hash_forecast_files, partition_present, verify_uploaded, wipe_files,
+        FileIdentity, FileRecordId, IdentityCheck, Unprovable, VerifiedFile,
     };
     use std::{
         fs,
@@ -598,6 +598,9 @@ mod tests {
         sync::atomic::{AtomicBool, Ordering},
         time::{Duration, SystemTime},
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
 
     fn temp_file(stem: &str, ext: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -607,6 +610,83 @@ mod tests {
             ext
         ));
         path
+    }
+
+    /// The same local HTTP seam as the Immich client tests. It records every
+    /// request so the empty-input barrier can prove that it stops before I/O.
+    struct HttpStub {
+        url: String,
+        requests: mpsc::UnboundedReceiver<String>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for HttpStub {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn spawn_http_stub(responder: impl Fn(&str) -> String + Send + 'static) -> HttpStub {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let addr = listener.local_addr().expect("stub address");
+        let (requests_tx, requests) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    continue;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                // Read the whole declared body before answering. Closing while
+                // reqwest still writes can surface as a reset instead.
+                let mut head_len = None;
+                while let Ok(read) = socket.read(&mut chunk).await {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if head_len.is_none() {
+                        head_len = request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .map(|offset| offset + 4);
+                    }
+                    let Some(head_len) = head_len else { continue };
+                    let head = String::from_utf8_lossy(&request[..head_len]).into_owned();
+                    let body_len = head
+                        .lines()
+                        .skip(1)
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= head_len + body_len {
+                        break;
+                    }
+                }
+
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let response = responder(&request);
+                let _ = requests_tx.send(request);
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        HttpStub {
+            url: format!("http://127.0.0.1:{}", addr.port()),
+            requests,
+            handle,
+        }
+    }
+
+    fn http_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
     }
 
     /// A file as the wipe worker would receive it: verified against the server
@@ -646,6 +726,114 @@ mod tests {
             .expect("open to set mtime")
             .set_modified(mtime)
             .expect("set mtime");
+    }
+
+    #[tokio::test]
+    async fn verify_uploaded_returns_empty_without_asking_the_server() {
+        let mut stub = spawn_http_stub(|_| http_response(r#"{"results":[]}"#)).await;
+
+        let result = verify_uploaded(&stub.url, "test-api-key", &[])
+            .await
+            .expect("empty verification succeeds");
+
+        assert!(result.confirmed.is_empty());
+        assert!(result.unverified.is_empty());
+        assert!(
+            stub.requests.try_recv().is_err(),
+            "an empty candidate set must stop before server I/O"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_uploaded_keeps_a_candidate_that_cannot_be_hashed() {
+        let missing = temp_file("verify-missing", "jpg");
+        let _ = fs::remove_file(&missing);
+        let missing = missing.to_string_lossy().into_owned();
+        let mut stub = spawn_http_stub(|_| http_response(r#"{"results":[]}"#)).await;
+
+        let result = verify_uploaded(&stub.url, "test-api-key", std::slice::from_ref(&missing))
+            .await
+            .expect("an unreadable candidate is kept");
+
+        assert!(
+            result.confirmed.is_empty(),
+            "a file that was not hashed must never be authorized"
+        );
+        assert_eq!(result.unverified, [missing]);
+        assert!(
+            stub.requests.try_recv().is_err(),
+            "no checksum exists for the server to check"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_uploaded_keeps_omitted_and_not_live_candidates() {
+        let omitted = temp_file("verify-omitted", "jpg");
+        let trashed = temp_file("verify-trashed", "jpg");
+        fs::write(&omitted, b"omitted checksum").expect("write omitted candidate");
+        fs::write(&trashed, b"trashed checksum").expect("write trashed candidate");
+        let paths = vec![
+            omitted.to_string_lossy().into_owned(),
+            trashed.to_string_lossy().into_owned(),
+        ];
+        // Index 0 is absent. Index 1 matches only a trashed server copy.
+        let stub = spawn_http_stub(|_| {
+            http_response(
+                r#"{"results":[{"id":"1","action":"reject","reason":"duplicate","isTrashed":true}]}"#,
+            )
+        })
+        .await;
+
+        let result = verify_uploaded(&stub.url, "test-api-key", &paths)
+            .await
+            .expect("unconfirmed candidates are kept");
+
+        assert!(result.confirmed.is_empty());
+        assert_eq!(
+            result.unverified, paths,
+            "neither an omitted answer nor a trashed copy authorizes deletion"
+        );
+
+        let _ = fs::remove_file(omitted);
+        let _ = fs::remove_file(trashed);
+    }
+
+    /// The server confirms index 1, not index 0. This catches an off-by-one
+    /// partition and proves the hash-time identity stays paired with its path.
+    #[tokio::test]
+    async fn verify_uploaded_partitions_a_mixed_batch_without_swapping_identities() {
+        let kept = temp_file("verify-index-zero", "jpg");
+        let confirmed = temp_file("verify-index-one", "jpg");
+        fs::write(&kept, b"keep index zero").expect("write unverified candidate");
+        fs::write(&confirmed, b"confirm index one").expect("write confirmed candidate");
+        let kept_path = kept.to_string_lossy().into_owned();
+        let confirmed_path = confirmed.to_string_lossy().into_owned();
+        let paths = vec![kept_path.clone(), confirmed_path.clone()];
+        let (expected_checksum, expected_identity) =
+            hash_file(&confirmed_path).expect("hash expected confirmed file");
+        let stub = spawn_http_stub(|_| {
+            http_response(
+                r#"{"results":[{"id":"1","action":"reject","reason":"duplicate","isTrashed":false}]}"#,
+            )
+        })
+        .await;
+
+        let result = verify_uploaded(&stub.url, "test-api-key", &paths)
+            .await
+            .expect("mixed verification succeeds");
+
+        assert_eq!(result.unverified, [kept_path]);
+        assert_eq!(result.confirmed.len(), 1);
+        let verified = &result.confirmed[0];
+        assert_eq!(verified.path, confirmed_path);
+        assert_eq!(verified.checksum, expected_checksum);
+        assert_eq!(
+            verified.identity, expected_identity,
+            "the confirmed checksum must carry the identity hashed for index 1"
+        );
+
+        let _ = fs::remove_file(kept);
+        let _ = fs::remove_file(confirmed);
     }
 
     #[test]

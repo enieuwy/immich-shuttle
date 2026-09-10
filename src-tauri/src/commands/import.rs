@@ -4578,14 +4578,28 @@ mod tests {
     fn a_second_staging_walk_of_a_held_root_is_refused_by_name() {
         let root = format!("/Volumes/CARD-{}", Uuid::new_v4());
         let roots = vec![root.clone()];
-        let held = media_scanner::acquire_scan_roots(media_scanner::ScanPurpose::Stage, &roots)
-            .expect("the first staging walk claims the root");
+        let grace = Duration::from_millis(20);
+        let held = media_scanner::acquire_scan_roots_with_grace(
+            media_scanner::ScanPurpose::Stage,
+            &roots,
+            grace,
+        )
+        .expect("the first staging walk claims the root");
 
-        let refused = media_scanner::acquire_scan_roots(media_scanner::ScanPurpose::Stage, &roots)
-            .expect_err("a held staging root must refuse the next walk");
+        let started = Instant::now();
+        let refused = media_scanner::acquire_scan_roots_with_grace(
+            media_scanner::ScanPurpose::Stage,
+            &roots,
+            grace,
+        )
+        .expect_err("a held staging root must refuse the next walk");
         assert!(
             refused.contains(&root),
             "the refusal names the source: {refused}"
+        );
+        assert!(
+            started.elapsed() >= grace,
+            "the refusal must wait for the grace period"
         );
 
         // A scan of the same root claims a different namespace and is unaffected.
@@ -5625,6 +5639,94 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(job_id);
+    }
+
+    /// A decline consumes the delete offer without touching any external proof
+    /// source. Otherwise saying "keep my files" could still prompt for a key,
+    /// probe a changed card, contact Immich, or leave the delete re-triggerable.
+    #[test]
+    fn declining_a_wipe_keeps_every_file_and_consumes_the_offer() {
+        let _script = volume_script_guard();
+        let _keychain = keychain::test_store::exclusive();
+        keychain::test_store::reset();
+        let source = std::env::temp_dir().join(format!("wipe-decline-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&source).unwrap();
+        let photo = source.join("photo.jpg");
+        let video = source.join("video.mov");
+        std::fs::write(&photo, b"photo").unwrap();
+        std::fs::write(&video, b"video").unwrap();
+        let paths = vec![
+            photo.to_string_lossy().into_owned(),
+            video.to_string_lossy().into_owned(),
+        ];
+        let stub = ServerStub::start(DUPLICATE_LIVE_BODY);
+        let job_id = format!("wipe-decline-{}", Uuid::new_v4());
+        let profile_id = format!("profile-{job_id}");
+        let volume_ids = HashMap::from([
+            (paths[0].clone(), "disk-a".to_string()),
+            (paths[1].clone(), "disk-a".to_string()),
+        ]);
+        script_volume_identities(vec![volume_ids.clone()]);
+        let mut offered = terminal_job(&job_id, true);
+        offered.profile_id = profile_id.clone();
+        offered.pending_wipe_count = paths.len() as u32;
+        lock_jobs().push(offered);
+        PENDING_WIPE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                job_id.clone(),
+                PendingWipe {
+                    paths,
+                    server_url: stub.url.clone(),
+                    volume_ids,
+                    sequence: PENDING_WIPE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                },
+            );
+
+        let declined = tauri::async_runtime::block_on(import_confirm_wipe(job_id.clone(), false))
+            .expect("declining succeeds without a stored API key");
+
+        assert!(
+            keychain::test_store::peek(&profile_id).is_none(),
+            "the empty fake keychain proves the decline required no credential"
+        );
+        assert_eq!(
+            VOLUME_IDENTITY_SCRIPT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "declining must not consume a scripted volume probe"
+        );
+        assert_eq!(stub.hits(), 0, "declining must not contact the server");
+        assert!(photo.exists(), "the declined photo must remain on disk");
+        assert!(video.exists(), "the declined video must remain on disk");
+        assert!(
+            !PENDING_WIPE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&job_id),
+            "the consumed offer must not remain re-triggerable"
+        );
+        assert!(!declined.awaiting_wipe_confirmation);
+        assert_eq!(declined.pending_wipe_count, 0);
+        assert_eq!(
+            declined.summary.as_deref(),
+            Some("Wipe skipped by user. 2 files kept.")
+        );
+        let stored = get_job(&job_id).expect("the declined state is published");
+        assert!(!stored.awaiting_wipe_confirmation);
+        assert_eq!(stored.pending_wipe_count, 0);
+        assert_eq!(
+            stored.summary.as_deref(),
+            Some("Wipe skipped by user. 2 files kept.")
+        );
+
+        clear_volume_identity_script();
+        forget_wipe(&job_id);
+        keychain::test_store::reset();
+        std::fs::remove_dir_all(&source).unwrap();
     }
 
     /// A candidate with no recorded identity is refused as hard as a changed
