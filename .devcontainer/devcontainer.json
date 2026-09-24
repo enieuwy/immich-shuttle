@@ -1,0 +1,59 @@
+// Dev Container for immich-shuttle (https://containers.dev).
+//
+// Mirrors the Linux CI in .github/workflows/build.yml: Node 22, Rust stable
+// with rustfmt + clippy, the Tauri/WebKitGTK system libraries, and Playwright
+// Chromium. A fresh container can run `npm run verify`.
+//
+// Runs as root on purpose: under rootless Docker, container root maps to the
+// host user that owns the checkout, so files written into the bind-mounted
+// repo keep that owner. Build outputs and dependency trees live in per-repo
+// named volumes; download caches live in shared `devcache-*` volumes.
+{
+  "name": "immich-shuttle",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
+  },
+  "remoteUser": "root",
+  "containerUser": "root",
+  "updateRemoteUserUID": false,
+  // Root normally bypasses file permission bits, so a test that chmods a
+  // directory to 000 to make it unreadable (media_scanner's unreadable-entry
+  // count) would pass on CI's non-root runner and fail here. Dropping these two
+  // capabilities makes root obey the mode bits like any owner; it still owns
+  // the workspace (rootless Docker maps it to the host user) and the volumes.
+  // The Dockerfile points apt's download sandbox at root to match.
+  "runArgs": ["--cap-drop=DAC_OVERRIDE", "--cap-drop=DAC_READ_SEARCH"],
+  "mounts": [
+    {
+      "type": "volume",
+      "source": "immich-shuttle-node_modules",
+      "target": "${containerWorkspaceFolder}/node_modules"
+    },
+    {
+      "type": "volume",
+      "source": "immich-shuttle-target",
+      "target": "${containerWorkspaceFolder}/src-tauri/target"
+    },
+    {
+      "type": "volume",
+      "source": "devcache-cargo-registry",
+      "target": "/usr/local/cargo/registry"
+    },
+    {
+      "type": "volume",
+      "source": "devcache-npm",
+      "target": "/root/.npm"
+    },
+    {
+      "type": "volume",
+      "source": "devcache-ms-playwright",
+      "target": "/root/.cache/ms-playwright"
+    }
+  ],
+  "postCreateCommand": "npm ci && ./scripts/download-sidecar.sh --target x86_64-unknown-linux-gnu && npx playwright install --with-deps chromium"
+}
