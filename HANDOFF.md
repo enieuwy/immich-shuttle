@@ -73,7 +73,9 @@ The coordinator removed the throwaway Rust source, executable, and smoke screens
 - `immich-shuttle-iy3` — Windows signing cost and credential decision remains with the operator.
 - `immich-shuttle-a107d6406c7cf671` — date/concurrency tests are complete; raw/burst mapping-only tests remain intentionally absent under the brief's test rule.
 
-No release, deployment, push, secret rotation, live-data edit, or OMP configuration change occurred. The URL fix does not prove that any previously exposed credential was rotated.
+No release, deployment, push, secret rotation, or OMP configuration change occurred. The URL fix does not prove that any previously exposed credential was rotated.
+
+Landing evidence correction: the existing Rust thumbnail tests use the application thumbnail cache under `~/Library/Application Support/immich-shuttle/thumbnails`. The captured Rust output shows those paths. Tests create UUID-named temporary image fixtures and attempt to remove their matching cache files. They ignore cleanup errors, so removal is not guaranteed. This run therefore cannot claim that every test write stayed outside application data directories. No additional cache cleanup occurs during landing.
 
 ## Per-ID dispositions
 
