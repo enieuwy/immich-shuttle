@@ -392,9 +392,14 @@ export const queueState = {
       // device rule can supply the name directly; otherwise resolve it from the
       // durable selection first because a search can remove the chosen album
       // from the visible results.
-      const albumIds = overrides?.albumIds ?? (albumsUsable ? albums.selectedAlbumIds : []);
-      const intoAlbum =
-        overrides?.intoAlbum !== undefined
+      const organization = overrides?.organization ?? options.organization;
+      const singleAlbum = organization === "single_album";
+      const albumIds = singleAlbum
+        ? overrides?.albumIds ?? (albumsUsable ? albums.selectedAlbumIds : [])
+        : [];
+      const intoAlbum = !singleAlbum
+        ? null
+        : overrides?.intoAlbum !== undefined
           ? overrides.intoAlbum
           : albumIds.length > 0
             ? (albums.selectedAlbums.find((a) => a.id === albumIds[0]) ??
@@ -463,7 +468,7 @@ export const queueState = {
         concurrent_tasks: options.concurrentTasks,
         select_files: selectFiles,
         into_album: intoAlbum,
-        organization: overrides?.organization ?? options.organization,
+        organization,
         on_errors: options.keepGoingOnErrors ? "continue" : null,
         overwrite: options.overwrite,
         tags: options.tags,

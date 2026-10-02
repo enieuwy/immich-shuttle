@@ -30,8 +30,34 @@ fn tail_lines(content: &str, max_lines: usize) -> String {
     lines[start..].join("\n")
 }
 
+fn log_path(file_name: &str) -> Result<PathBuf, String> {
+    if file_name != "app.log" && !is_run_log_name(file_name) {
+        return Err("Invalid log file name".to_string());
+    }
+    let dir = logs_dir()?
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve log directory: {e}"))?;
+    let path = dir.join(file_name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err("Log files must not be symbolic links".to_string())
+        }
+        Ok(_) => {
+            let resolved = path
+                .canonicalize()
+                .map_err(|e| format!("Could not resolve log file: {e}"))?;
+            if resolved.parent() != Some(dir.as_path()) {
+                return Err("Log file is outside the log directory".to_string());
+            }
+            Ok(path)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Err(error) => Err(format!("Could not inspect log file: {error}")),
+    }
+}
+
 pub fn read_recent(file_name: &str, max_lines: usize) -> Result<String, String> {
-    let path = logs_dir()?.join(file_name);
+    let path = log_path(file_name)?;
     if !path.exists() {
         return Ok(String::new());
     }
@@ -45,7 +71,7 @@ pub fn append_log(file_name: &str, line: &str) -> Result<(), String> {
     let _guard = LOG_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let path = logs_dir()?.join(file_name);
+    let path = log_path(file_name)?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -154,6 +180,23 @@ mod tests {
         time::{Duration, SystemTime},
     };
     use uuid::Uuid;
+
+    #[test]
+    fn invalid_log_names_are_rejected_before_access() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../app.log",
+            "/tmp/app.log",
+            "other.log",
+            "run-invalid.log",
+            r"..\app.log",
+        ] {
+            assert!(super::read_recent(name, 10).is_err());
+            assert!(super::append_log(name, "ignored").is_err());
+        }
+    }
 
     /// Pins a fixture's modification time. Rotation orders by `modified()`, so
     /// the age order a test asserts on must be stated outright: writing the

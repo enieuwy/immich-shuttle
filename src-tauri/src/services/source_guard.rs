@@ -1,14 +1,12 @@
-//! Authorization scope for path-scoped IPC commands.
+//! Consistency scope for path-scoped IPC commands.
 //!
-//! The preview commands (`preview_thumbnails`, `preview_dates`) take raw file
-//! paths from the renderer and read those files off disk. Without a guard a
-//! compromised or buggy renderer could use them to read arbitrary local files
-//! and exfiltrate the bytes/timestamps back through the IPC boundary.
+//! The scan commands record source roots supplied by the renderer. Preview and
+//! forecast commands use this scope to reject paths outside the current source
+//! selection, including sibling paths with a matching text prefix.
 //!
-//! We authorize by the folders the user actually selected: the scan commands
-//! (the point at which the user grants access to a source) record their roots
-//! here, and preview requests are rejected unless they canonicalize to a path
-//! nested under a recorded root.
+//! This is not an authorization boundary against a compromised renderer: the
+//! renderer supplies both the scan roots and the later read paths. The guard
+//! prevents path confusion, but does not independently prove user consent.
 
 use std::{
     path::PathBuf,
@@ -17,7 +15,7 @@ use std::{
 
 static APPROVED_ROOTS: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// Replace user-selected source roots as authorized for later path-scoped reads.
+/// Replace the recorded source roots for later path-scoped consistency checks.
 ///
 /// The approved scope is always exactly the current selection: callers pass the
 /// complete current selection, so `roots` holds nothing else by the time this
@@ -26,17 +24,20 @@ static APPROVED_ROOTS: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::n
 /// call. Canonicalization runs before the lock so a slow filesystem cannot stall
 /// concurrent `is_within_approved` checks. The prepared list replaces the prior
 /// list under one lock hold. This swap is atomic because a path-scoped IPC read
-/// that lands mid-update must never be denied for a source the user did in fact
-/// select. Clearing the scope uses `replace_roots(&[])`. A panic elsewhere must
+/// that lands mid-update must never be denied for a source still in the current
+/// selection. Clearing the scope uses `replace_roots(&[])`. A panic elsewhere must
 /// not wedge the guard: the root list is a plain `Vec<PathBuf>` with no
 /// invariant a panic could break mid-update, so a poisoned lock is recovered
 /// rather than treated as permanent denial (which would blank previews for the
 /// session).
 pub fn replace_roots(paths: &[String]) {
-    let batch: Vec<PathBuf> = paths
-        .iter()
-        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p)))
-        .collect();
+    replace_roots_with(paths, |path| {
+        std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+    });
+}
+
+fn replace_roots_with(paths: &[String], mut prepare_root: impl FnMut(&str) -> PathBuf) {
+    let batch: Vec<PathBuf> = paths.iter().map(|path| prepare_root(path)).collect();
     let mut roots = APPROVED_ROOTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -44,7 +45,7 @@ pub fn replace_roots(paths: &[String]) {
 }
 
 /// Whether `path` canonicalizes to a location nested under a recorded source
-/// root. Paths the user never selected as a source are rejected.
+/// root. This checks scan consistency, not independent filesystem authorization.
 pub fn is_within_approved(path: &str) -> bool {
     let Ok(canon) = std::fs::canonicalize(path) else {
         return false;
@@ -118,9 +119,9 @@ mod tests {
         std::fs::remove_dir_all(&sibling).unwrap();
     }
 
-    /// The old reset-and-record pair left `APPROVED_ROOTS` empty in between,
-    /// so a concurrent preview or forecast could be rejected for a source the
-    /// user had selected.
+    /// A replacement keeps the old scope visible while it prepares the new one.
+    /// Block preparation explicitly so the concurrent observation cannot miss
+    /// a clear-before-refill regression.
     #[test]
     fn replace_roots_swaps_the_scope_without_an_empty_window() {
         let _test_lock = TEST_LOCK
@@ -138,13 +139,32 @@ mod tests {
         std::fs::write(&file_b, b"b").unwrap();
 
         replace_roots(&[root_a.to_string_lossy().to_string()]);
-        assert!(is_within_approved(&file_a.to_string_lossy()));
-
-        replace_roots(&[root_b.to_string_lossy().to_string()]);
-        assert!(
-            is_within_approved(&file_b.to_string_lossy())
-                && !is_within_approved(&file_a.to_string_lossy())
-        );
+        let paths = [root_b.to_string_lossy().to_string()];
+        let (preparing_tx, preparing_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let updater = scope.spawn(move || {
+                replace_roots_with(&paths, |path| {
+                    preparing_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    std::fs::canonicalize(path).unwrap()
+                });
+            });
+            preparing_rx.recv().unwrap();
+            let observer = scope.spawn(|| {
+                observed_tx
+                    .send(is_within_approved(&file_a.to_string_lossy()))
+                    .unwrap();
+            });
+            let observed = observed_rx.recv_timeout(std::time::Duration::from_secs(5));
+            release_tx.send(()).unwrap();
+            updater.join().unwrap();
+            observer.join().unwrap();
+            assert!(observed.unwrap());
+        });
+        assert!(is_within_approved(&file_b.to_string_lossy()));
+        assert!(!is_within_approved(&file_a.to_string_lossy()));
 
         replace_roots(&[]);
         std::fs::remove_dir_all(&root_a).unwrap();

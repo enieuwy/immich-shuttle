@@ -279,6 +279,13 @@ fn trash_context() -> trash::TrashContext {
 /// because telling the user their files changed when they only reconnected the
 /// card sends them looking for a problem that is not there.
 pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
+    wipe_files_with_reader(files, hash_file)
+}
+
+fn wipe_files_with_reader(
+    files: &[VerifiedFile],
+    read: impl Fn(&str) -> Result<(String, FileIdentity), String>,
+) -> WipeResult {
     let trash = trash_context();
     let mut result = WipeResult {
         deleted: 0,
@@ -332,12 +339,10 @@ pub fn wipe_files(files: &[VerifiedFile]) -> WipeResult {
             }
         }
 
-        // The authorization. `hash_file` reads and stats through ONE handle, so
-        // a replacement swapped in between this read and the stat cannot look
-        // like the verified file. A checksum that still matches makes the
-        // delete safe whatever the metadata says: the server holds these exact
-        // bytes.
-        match hash_file(&file.path) {
+        // Re-read the bytes before moving the file. This rejects observed
+        // changes, but the path-based Trash API can still resolve a replacement
+        // after this handle closes. These checks do not close that final race.
+        match read(&file.path) {
             Ok((checksum, _)) if checksum == file.checksum => {}
             Ok(_) => {
                 result.changed += 1;
@@ -1105,6 +1110,20 @@ mod tests {
         assert!(path.exists());
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn keeps_verified_files_when_the_final_read_fails() {
+        let path = temp_file("unreadable-at-wipe", "jpg");
+        fs::write(&path, b"bytes").expect("write file");
+        let file = verified(&path);
+        let result = super::wipe_files_with_reader(&[file], |_| Err("read denied".to_string()));
+        assert_eq!(result.unprovable, 1);
+        assert_eq!(result.changed, 0);
+        assert_eq!(result.deleted, 0);
+        assert!(result.errors[0].contains("could not re-read"));
+        assert_eq!(fs::read(&path).unwrap(), b"bytes");
+        fs::remove_file(path).unwrap();
     }
 
     /// Length alone is not authorization: without a verified mtime the file is

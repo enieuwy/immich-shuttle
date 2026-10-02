@@ -243,7 +243,9 @@ pub async fn profile_validate(url: String, api_key: String) -> Result<ServerInfo
 
 #[cfg(test)]
 mod tests {
-    use super::{profile_from_input, profile_upsert, profile_validate, profiles_list};
+    use super::{
+        profile_delete, profile_from_input, profile_upsert, profile_validate, profiles_list,
+    };
     use crate::models::profile::{Profile, ProfileInput};
     use crate::services::{keychain, profile_store, url_resolver};
 
@@ -272,6 +274,13 @@ mod tests {
             wan_server_url: None,
             api_key: api_key.map(str::to_string),
         }
+    }
+
+    fn invalidate_config(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("immich-shuttle/config.json");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create config directory");
+        std::fs::write(&path, b"not valid JSON").expect("make the profile store fail");
+        path
     }
 
     #[test]
@@ -520,6 +529,169 @@ mod tests {
         assert_eq!(
             keychain::test_store::peek(&created.id).as_deref(),
             Some("original-key")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn failed_profile_upsert_restores_the_existing_api_key() {
+        let (_config, _credentials, dir) = isolate("upsert-restore-key");
+        let saved = profile_upsert(input(None, "https://immich.example.com", Some("old-key")))
+            .await
+            .expect("create profile");
+        let before = keychain::test_store::snapshot();
+        let config_path = invalidate_config(&dir);
+
+        let error = profile_upsert(input(
+            Some(&saved.id),
+            "https://changed.example.com",
+            Some("new-key"),
+        ))
+        .await
+        .expect_err("the profile store fails after the credential changes");
+
+        assert!(error.contains("Could not parse config"));
+        assert_eq!(keychain::test_store::snapshot(), before);
+        assert_eq!(std::fs::read(config_path).unwrap(), b"not valid JSON");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn failed_new_profile_upsert_removes_only_the_new_api_key() {
+        let (_config, _credentials, dir) = isolate("upsert-remove-new-key");
+        keychain::test_store::seed("unrelated-profile", "unrelated-key");
+        let before = keychain::test_store::snapshot();
+        let config_path = invalidate_config(&dir);
+
+        let error = profile_upsert(input(None, "https://immich.example.com", Some("new-key")))
+            .await
+            .expect_err("the profile store fails after the new credential is stored");
+
+        assert!(error.contains("Could not parse config"));
+        assert_eq!(keychain::test_store::snapshot(), before);
+        assert_eq!(std::fs::read(config_path).unwrap(), b"not valid JSON");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn failed_profile_upsert_reports_a_failed_credential_rollback() {
+        let (_config, _credentials, dir) = isolate("upsert-rollback-error");
+        invalidate_config(&dir);
+        for previous in [None, Some("old-key")] {
+            keychain::test_store::reset();
+            if let Some(api_key) = previous {
+                keychain::test_store::seed("profile", api_key);
+                keychain::test_store::fail_set_after(1, "restore rejected");
+            } else {
+                keychain::test_store::fail_next_delete("delete rejected");
+            }
+
+            let error = profile_upsert(input(
+                Some("profile"),
+                "https://immich.example.com",
+                Some("new-key"),
+            ))
+            .await
+            .expect_err("the profile store and the rollback both fail");
+
+            assert!(error.contains("Could not parse config"));
+            assert!(error.contains("additionally failed to roll back the API key change"));
+            assert!(error.contains(if previous.is_some() {
+                "restore rejected"
+            } else {
+                "delete rejected"
+            }));
+            assert_eq!(
+                keychain::test_store::peek("profile").as_deref(),
+                Some("new-key")
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn profile_delete_removes_the_profile_and_its_api_key() {
+        let (_config, _credentials, dir) = isolate("delete-profile");
+        let saved = profile_upsert(input(None, "https://immich.example.com", Some("old-key")))
+            .await
+            .expect("create profile");
+
+        profile_delete(saved.id.clone())
+            .await
+            .expect("delete profile");
+
+        assert!(profile_store::list_profiles()
+            .expect("load the saved config")
+            .iter()
+            .all(|profile| profile.id != saved.id));
+        assert_eq!(keychain::test_store::peek(&saved.id), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn failed_profile_delete_restores_the_previous_api_key() {
+        let (_config, _credentials, dir) = isolate("delete-restore-key");
+        let saved = profile_upsert(input(None, "https://immich.example.com", Some("old-key")))
+            .await
+            .expect("create profile");
+        let before = keychain::test_store::snapshot();
+        let config_path = invalidate_config(&dir);
+
+        let error = profile_delete(saved.id)
+            .await
+            .expect_err("the profile store fails after the key is deleted");
+
+        assert!(error.contains("Could not parse config"));
+        assert_eq!(keychain::test_store::snapshot(), before);
+        assert_eq!(std::fs::read(config_path).unwrap(), b"not valid JSON");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn failed_profile_delete_reports_a_failed_credential_restore() {
+        let (_config, _credentials, dir) = isolate("delete-restore-error");
+        let saved = profile_upsert(input(None, "https://immich.example.com", Some("old-key")))
+            .await
+            .expect("create profile");
+        invalidate_config(&dir);
+        keychain::test_store::fail_set_after(0, "restore rejected");
+
+        let error = profile_delete(saved.id.clone())
+            .await
+            .expect_err("the profile store and the credential restore both fail");
+
+        assert!(error.contains("Could not parse config"));
+        assert!(error.contains("additionally failed to restore the API key"));
+        assert!(error.contains("restore rejected"));
+        assert_eq!(keychain::test_store::peek(&saved.id), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn a_keychain_delete_failure_keeps_the_profile_and_its_api_key() {
+        let (_config, _credentials, dir) = isolate("delete-keychain-error");
+        let saved = profile_upsert(input(None, "https://immich.example.com", Some("old-key")))
+            .await
+            .expect("create profile");
+        let before = keychain::test_store::snapshot();
+        keychain::test_store::fail_next_delete("delete rejected");
+
+        let error = profile_delete(saved.id.clone())
+            .await
+            .expect_err("the keychain refuses deletion");
+
+        assert!(error.contains("delete rejected"));
+        assert_eq!(keychain::test_store::snapshot(), before);
+        assert_eq!(
+            profile_store::get_profile(&saved.id).unwrap().server_url,
+            saved.server_url
         );
         let _ = std::fs::remove_dir_all(dir);
     }

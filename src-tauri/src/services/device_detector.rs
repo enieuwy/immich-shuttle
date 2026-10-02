@@ -381,7 +381,7 @@ pub fn mount_root_for_path(path: &Path) -> Option<PathBuf> {
 #[cfg(target_os = "windows")]
 pub fn mount_root_for_path(path: &Path) -> Option<PathBuf> {
     mount_root_for_path_with(path, |candidate| {
-        probe_volume_id(&candidate.to_string_lossy()).is_some()
+        volume_identity_for_path(candidate).is_some()
     })
 }
 
@@ -747,7 +747,7 @@ mod tests {
     /// accepts a mount point, so the identity was always unknown and the wipe prompt could
     /// never confirm a volume on any platform. An asset path has to be resolved through the
     /// mount root that contains it.
-    #[cfg(any(unix, target_os = "windows"))]
+    #[cfg(unix)]
     #[test]
     fn file_identity_is_resolved_through_the_files_mount_root() {
         let dir = std::env::temp_dir().join(format!("device-mount-root-{}", Uuid::new_v4()));
@@ -769,15 +769,14 @@ mod tests {
         );
         assert_ne!(root, file);
 
-        // Still true of the mount-point-only probe, on every platform: no OS identifies a
-        // volume from a file path. This is exactly what the import path used to ask for.
-        assert_eq!(volume_identity_for_path(&file), None);
-        // Going through the mount root gives the file the identity of the volume it lives on,
-        // which is whatever the platform proves for that mount point.
-        assert_eq!(
-            file_volume_identity_resolver()(&file),
-            volume_identity_for_path(&root)
-        );
+        // Exercise the real mount-root walk without spawning a platform identity probe.
+        let expected_root = root.clone();
+        let mut resolve =
+            file_volume_identity_resolver_with(mount_root_for_path, move |candidate| {
+                assert_eq!(candidate, expected_root.as_path());
+                Some("test-volume-id".to_string())
+            });
+        assert_eq!(resolve(&file).as_deref(), Some("test-volume-id"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

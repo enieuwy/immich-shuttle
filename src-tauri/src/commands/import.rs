@@ -147,6 +147,7 @@ async fn join_bounded<T>(
     cancel_grace: Duration,
     progress: Option<&AtomicU64>,
 ) -> Result<BoundedJoin<T>, String> {
+    use tokio::time::Instant;
     let mut bound_deadline = Instant::now() + bound;
     let mut seen_progress = progress.map(|counter| counter.load(Ordering::Relaxed));
     let mut abandon_after: Option<Instant> = None;
@@ -669,7 +670,7 @@ fn admission_block_reason(
     safety_lease_live: bool,
 ) -> Option<&'static str> {
     if safety_lease_live {
-        Some("A previous import did not prove its sidecar stopped; restart the app before importing this source again.")
+        Some("All imports are paused because a previous import did not prove its sidecar stopped; restart the app before importing again.")
     } else if run_live {
         Some(IMPORT_RUNNING_ERROR)
     } else if finalizing_live {
@@ -2721,6 +2722,9 @@ pub async fn import_forecast(
     exclude_extensions: Vec<String>,
     generation: u64,
 ) -> Result<wipe::ForecastResult, String> {
+    if source_paths.is_empty() {
+        return Err("At least one source path is required".to_string());
+    }
     let cancellation = Arc::new(AtomicBool::new(false));
     let previous = {
         let mut active = ACTIVE_FORECAST
@@ -3553,6 +3557,7 @@ pub async fn import_cancel(job_id: String) -> Result<(), String> {
 /// are only observable through their respective maps.
 #[tauri::command]
 pub async fn import_await_terminal(job_id: String, timeout_ms: u64) -> Result<ImportJob, String> {
+    use tokio::time::Instant;
     // `timeout_ms` arrives over IPC and must not be trusted to be in range:
     // `Instant`'s `Add` panics on overflow, and this runs before `get_job`, so
     // an untrusted huge value would panic the command task for any job id
@@ -4235,40 +4240,21 @@ mod tests {
         std::fs::remove_dir_all(&unapproved).unwrap();
     }
 
-    /// Isolates the `select_files` branch of the approved-scope guard, which
-    /// `import_forecast_refuses_sources_outside_the_approved_scope` above does
-    /// not exercise (it passes `select_files: None`). Passing zero
-    /// `source_paths` skips the `source_paths` loop entirely — that loop
-    /// checks the process-global `APPROVED_ROOTS`, which is also mutated by
-    /// `source_guard`'s own tests, so asserting it would pass is
-    /// order-dependent. `validate_selected_under_sources` instead checks
-    /// `select_files` against the `source_paths` parameter directly, so this
-    /// negative case needs none of that global state.
     #[test]
-    fn import_forecast_refuses_selected_files_outside_the_approved_scope() {
-        let unapproved =
-            std::env::temp_dir().join(format!("immich-shuttle-select-outside-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&unapproved).unwrap();
-        let outside_file = unapproved.join("photo.jpg");
-        std::fs::write(&outside_file, b"x").unwrap();
-
-        let err = tauri::async_runtime::block_on(import_forecast(
-            "no-such-profile".to_string(),
-            Vec::new(),
-            Some(vec![outside_file.to_string_lossy().into_owned()]),
-            None,
-            Vec::new(),
-            Vec::new(),
-            2,
-        ))
-        .unwrap_err();
-
-        assert!(
-            err.contains("outside the chosen source folders"),
-            "expected a select_files-scope rejection, got: {err}"
-        );
-
-        std::fs::remove_dir_all(&unapproved).unwrap();
+    fn import_forecast_requires_sources_before_profile_or_forecast_access() {
+        for selection in [None, Some(Vec::new()), Some(vec!["photo.jpg".to_string()])] {
+            let error = tauri::async_runtime::block_on(import_forecast(
+                "no-such-profile".to_string(),
+                Vec::new(),
+                selection,
+                None,
+                Vec::new(),
+                Vec::new(),
+                2,
+            ))
+            .unwrap_err();
+            assert_eq!(error, "At least one source path is required");
+        }
     }
 
     /// The whole point of `import_await_terminal`: a terminal STATUS is not a
@@ -4277,8 +4263,8 @@ mod tests {
     /// the sidecar to die — and the close handler quits on this call returning.
     /// Drop the `RUNNING_IMPORTS` half of the condition and this test fails,
     /// which is exactly the bug that let the app exit mid-upload.
-    #[test]
-    fn await_terminal_holds_until_the_worker_is_gone_not_just_the_status() {
+    #[tokio::test(start_paused = true)]
+    async fn await_terminal_holds_until_the_worker_is_gone_not_just_the_status() {
         let job_id = format!("await-terminal-{}", Uuid::new_v4());
         let cancel_flag = Arc::new(AtomicBool::new(true));
 
@@ -4294,8 +4280,9 @@ mod tests {
         }
 
         // Status is already terminal, but the worker is still registered.
-        let err =
-            tauri::async_runtime::block_on(import_await_terminal(job_id.clone(), 150)).unwrap_err();
+        let err = import_await_terminal(job_id.clone(), 150)
+            .await
+            .unwrap_err();
         assert!(
             err.contains("shutting down"),
             "a live worker must keep the caller waiting, got: {err}"
@@ -4303,7 +4290,8 @@ mod tests {
 
         // The worker deregisters itself on its way out; only then may we quit.
         lock_running().remove(&job_id);
-        let job = tauri::async_runtime::block_on(import_await_terminal(job_id.clone(), 2_000))
+        let job = import_await_terminal(job_id.clone(), 2_000)
+            .await
             .expect("a terminal job with no live worker must resolve");
         assert!(matches!(job.status, JobStatus::Cancelled));
 
@@ -4313,8 +4301,8 @@ mod tests {
     /// The worker deregisters from `RUNNING_IMPORTS` before it reads the run log
     /// and appends history. Without the finalizing half of the condition, the
     /// app can quit mid-finalization and lose the run's history record.
-    #[test]
-    fn await_terminal_waits_for_the_finalizing_phase_too() {
+    #[tokio::test(start_paused = true)]
+    async fn await_terminal_waits_for_the_finalizing_phase_too() {
         let job_id = format!("await-finalizing-{}", Uuid::new_v4());
         let mut job = terminal_job(&job_id, false);
         job.status = JobStatus::Cancelled;
@@ -4322,15 +4310,17 @@ mod tests {
         lock_running().remove(&job_id);
         lock_finalizing().insert(job_id.clone());
 
-        let err =
-            tauri::async_runtime::block_on(import_await_terminal(job_id.clone(), 150)).unwrap_err();
+        let err = import_await_terminal(job_id.clone(), 150)
+            .await
+            .unwrap_err();
         assert!(
             err.contains("shutting down"),
             "a finalizing worker must keep the caller waiting, got: {err}"
         );
 
         lock_finalizing().remove(&job_id);
-        let job = tauri::async_runtime::block_on(import_await_terminal(job_id.clone(), 2_000))
+        let job = import_await_terminal(job_id.clone(), 2_000)
+            .await
             .expect("a terminal job with no finalizing worker must resolve");
         assert!(matches!(job.status, JobStatus::Cancelled));
         lock_jobs().retain(|j| j.id != job_id);
@@ -4454,8 +4444,8 @@ mod tests {
     /// A blocking task that cannot be interrupted must not hold the caller.
     /// This is the shape of a dead SMB/NFS mount: the walk never returns, so
     /// only abandoning the join bounds the wait.
-    #[test]
-    fn a_blocked_task_is_abandoned_when_its_bound_passes() {
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_task_is_abandoned_when_its_bound_passes() {
         let release = Arc::new(AtomicBool::new(false));
         let release_in_task = release.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -4465,13 +4455,14 @@ mod tests {
             }
         });
 
-        let outcome = tauri::async_runtime::block_on(join_bounded(
+        let outcome = join_bounded(
             task,
             Duration::from_millis(150),
             cancel.as_ref(),
             CANCEL_ABANDON_GRACE,
             None,
-        ))
+        )
+        .await
         .expect("an abandoned join is not a join failure");
 
         assert!(matches!(outcome, BoundedJoin::TimedOut));
@@ -4490,8 +4481,8 @@ mod tests {
     /// A cancel must free the caller even when the task cannot notice it. The
     /// import worker holds the liveness markers app quit waits on, so "cancel
     /// then quit" has to work in seconds, not at the staging deadline.
-    #[test]
-    fn a_cancelled_task_that_never_returns_is_abandoned_after_the_grace() {
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_task_that_never_returns_is_abandoned_after_the_grace() {
         let release = Arc::new(AtomicBool::new(false));
         let release_in_task = release.clone();
         let cancel = Arc::new(AtomicBool::new(true));
@@ -4501,14 +4492,15 @@ mod tests {
             }
         });
 
-        let started = Instant::now();
-        let outcome = tauri::async_runtime::block_on(join_bounded(
+        let started = tokio::time::Instant::now();
+        let outcome = join_bounded(
             task,
             Duration::from_secs(60),
             cancel.as_ref(),
             Duration::from_millis(120),
             None,
-        ))
+        )
+        .await
         .expect("an abandoned join is not a join failure");
 
         assert!(matches!(outcome, BoundedJoin::Abandoned));
@@ -5522,6 +5514,39 @@ mod tests {
         clear_forecast_slot();
     }
 
+    #[tokio::test]
+    async fn album_resolution_requires_one_exact_match() {
+        let stub = ServerStub::start(
+            r#"[{"id":"one","albumName":"Trip"},{"id":"two","albumName":"Trip"},{"id":"three","albumName":"Unique"}]"#,
+        );
+        for name in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                resolve_album_id_by_name(&stub.url, "test-key", name).await,
+                None
+            );
+        }
+        assert_eq!(stub.hits.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            resolve_album_id_by_name("", "test-key", Some("Unique")).await,
+            None
+        );
+        for name in ["Trip", "Missing", "unique"] {
+            assert_eq!(
+                resolve_album_id_by_name(&stub.url, "test-key", Some(name)).await,
+                None
+            );
+        }
+        assert_eq!(
+            resolve_album_id_by_name(&stub.url, "test-key", Some(" Unique ")).await,
+            Some("three".to_string())
+        );
+        let invalid = ServerStub::start("{}");
+        assert_eq!(
+            resolve_album_id_by_name(&invalid.url, "test-key", Some("Unique")).await,
+            None
+        );
+    }
+
     /// Answers every request with one body and counts how many it was asked.
     /// A wipe that refuses before the server must leave the count at zero.
     struct ServerStub {
@@ -6349,7 +6374,7 @@ mod tests {
     /// `normalize_select_files` alone would keep passing if `import_start`
     /// stopped calling it — which is the exact regression this defends.
     #[test]
-    fn both_import_commands_read_a_selection_the_same_way() {
+    fn import_start_preserves_selection_semantics() {
         let root = std::env::temp_dir().join(format!("immich-shuttle-select-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("photo.jpg");
@@ -6387,21 +6412,6 @@ mod tests {
                 .expect("an explicitly empty selection is refused"),
             EMPTY_SELECTION_ERROR
         );
-
-        // And so does the forecast boundary. Zero `source_paths` keeps this off
-        // the process-global approved-root state; the bogus profile id proves
-        // the refusal lands before any profile or keychain work.
-        let err = tauri::async_runtime::block_on(import_forecast(
-            "no-such-profile".to_string(),
-            Vec::new(),
-            Some(Vec::new()),
-            None,
-            Vec::new(),
-            Vec::new(),
-            3,
-        ))
-        .unwrap_err();
-        assert_eq!(err, EMPTY_SELECTION_ERROR);
 
         std::fs::remove_dir_all(&root).unwrap();
     }
