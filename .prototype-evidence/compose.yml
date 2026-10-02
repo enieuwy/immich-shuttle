@@ -1,0 +1,50 @@
+name: immich-shuttle-demo-20261003
+services:
+  server-a:
+    image: ghcr.io/immich-app/immich-server:v2.3.1
+    ports: ["127.0.0.1:22891:2283"]
+    environment:
+      DB_HOSTNAME: db-a
+      DB_USERNAME: demo
+      DB_PASSWORD: synthetic-demo-only
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: redis-a
+    volumes:
+      - ./private/upload-a:/data
+      - ./media:/external/photos:ro
+    depends_on: [db-a, redis-a]
+  server-b:
+    image: ghcr.io/immich-app/immich-server:v2.3.1
+    ports: ["127.0.0.1:22892:2283"]
+    environment:
+      DB_HOSTNAME: db-b
+      DB_USERNAME: demo
+      DB_PASSWORD: synthetic-demo-only
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: redis-b
+    volumes:
+      - ./private/upload-b:/data
+      - ./media:/external/photos:ro
+    depends_on: [db-b, redis-b]
+  redis-a:
+    image: valkey/valkey:8@sha256:81db6d39e1bba3b3ff32bd3a1b19a6d69690f94a3954ec131277b9a26b95b3aa
+  redis-b:
+    image: valkey/valkey:8@sha256:81db6d39e1bba3b3ff32bd3a1b19a6d69690f94a3954ec131277b9a26b95b3aa
+  db-a:
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: synthetic-demo-only
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: --data-checksums
+    volumes: ["./private/db-a:/var/lib/postgresql/data"]
+    shm_size: 128mb
+  db-b:
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: synthetic-demo-only
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: --data-checksums
+    volumes: ["./private/db-b:/var/lib/postgresql/data"]
+    shm_size: 128mb

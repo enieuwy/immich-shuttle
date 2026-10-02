@@ -3,6 +3,8 @@
   import { Plus } from "@lucide/svelte";
 
   import ProfileEditor from "$lib/components/profiles/ProfileEditor.svelte";
+  import MetadataBackup from "$lib/components/profiles/MetadataBackup.svelte";
+  import UpdateCheck from "$lib/components/settings/UpdateCheck.svelte";
   import { profilesState } from "$lib/state/profiles";
   import type { Profile } from "$lib/types";
   import { Button } from "$lib/components/ui/button";
@@ -82,5 +84,7 @@
         {/each}
       {/if}
     </div>
+    <MetadataBackup onNeedsKey={beginEdit} />
+    <UpdateCheck />
   {/if}
 </div>

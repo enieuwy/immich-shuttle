@@ -7,7 +7,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 use crate::models::history::ImportRecord;
 
@@ -35,11 +35,16 @@ struct SourceMeta {
     last_total: u32,
 }
 
-fn store_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Could not resolve app data directory: {e}"))?;
+pub fn data_dir() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("IMMICH_SHUTTLE_DATA_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    dirs::data_dir().map(|p| p.join("com.immich-shuttle.desktop"))
+        .ok_or_else(|| "Could not resolve app data directory".to_string())
+}
+
+fn store_path(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = data_dir()?;
     fs::create_dir_all(&dir).map_err(|e| format!("Could not create app data directory: {e}"))?;
     Ok(dir.join("store.json"))
 }
@@ -84,13 +89,14 @@ fn save(app: &tauri::AppHandle, data: &StoreData) -> Result<(), String> {
 /// the date floor, or the next "only new" import silently skips media whose
 /// capture date predates this run.
 pub fn append_history(
-    app: &tauri::AppHandle,
+    _app: Option<&tauri::AppHandle>,
     record: ImportRecord,
     checkpoint_eligible: bool,
 ) -> Result<(), String> {
     let _guard = lock_store();
 
-    let mut data = load(app)?;
+    let path = data_dir()?.join("store.json");
+    let mut data = read_store_at(&path)?;
     if checkpoint_eligible {
         data.sources.insert(
             checkpoint_key(&record.profile_id, &record.source_paths),
@@ -103,7 +109,9 @@ pub fn append_history(
     data.history.insert(0, record);
     data.history.truncate(100);
 
-    save(app, &data)
+    let content = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    crate::services::private_file::write_atomic_private(&path, &content)
 }
 
 pub fn list_history(app: &tauri::AppHandle) -> Result<Vec<ImportRecord>, String> {

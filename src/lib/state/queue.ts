@@ -19,7 +19,7 @@ import {
 import { BackendError } from "$lib/backendErrors";
 import { errorsState } from "$lib/state/errors";
 import { historyState } from "$lib/state/history";
-import type { ImportJob, ImportOrganization } from "$lib/types";
+import type { ImportInput, ImportJob, ImportOrganization } from "$lib/types";
 
 import { importOptionsState, isDateRangeInvalid, toImmichDateRange } from "$lib/state/import-options";
 import { albumsState } from "$lib/state/albums";
@@ -347,6 +347,14 @@ export const queueState = {
       progressUnlisten();
       progressUnlisten = null;
     }
+  },
+  async startRequest(input: ImportInput) {
+    const pending = (async () => {
+      await importStart(input);
+      await refreshJobs();
+    })();
+    pendingImportStarts.add(pending);
+    try { await pending; } finally { pendingImportStarts.delete(pending); }
   },
   startImport(overrides?: {
     sourcePaths?: string[];

@@ -20,6 +20,8 @@
   import PanelTabs from "./PanelTabs.svelte";
   import { albumsState } from "$lib/state/albums";
   import { userDisplayNames } from "$lib/users";
+  import { panelTab } from "$lib/state/ui";
+  import AnalyticsPanel from "./AnalyticsPanel.svelte";
 
   onMount(() => {
     void historyState.loadHistory();
@@ -75,7 +77,7 @@
   <CardHeader class="flex flex-row items-center gap-2">
     <PanelTabs />
     <div class="ml-auto flex items-center gap-2">
-      {#if $historyState.records.length > 0}
+      {#if $panelTab === "history" && $historyState.records.length > 0}
         <Button
           variant="ghost"
           size="sm"
@@ -92,7 +94,9 @@
   </CardHeader>
 
   <CardContent class="flex flex-col gap-3">
-    {#if $historyState.loading && $historyState.records.length === 0}
+    {#if $panelTab === "stats"}
+      <AnalyticsPanel />
+    {:else if $historyState.loading && $historyState.records.length === 0}
       <p class="py-2 text-sm text-muted-foreground">Loading history…</p>
     {:else if $historyState.records.length === 0}
       <div class="flex flex-col items-center gap-2 py-6 text-center">

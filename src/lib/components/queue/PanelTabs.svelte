@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ListChecks, History } from "@lucide/svelte";
+  import { ListChecks, History, ChartColumn } from "@lucide/svelte";
   import { panelTab } from "$lib/state/ui";
 
   const base =
@@ -22,5 +22,13 @@
     onclick={() => panelTab.set("history")}
   >
     <History class="size-4" /> History
+  </button>
+  <button
+    type="button"
+    class={`${base} ${$panelTab === "stats" ? "bg-card text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
+    aria-pressed={$panelTab === "stats"}
+    onclick={() => panelTab.set("stats")}
+  >
+    <ChartColumn class="size-4" /> Stats
   </button>
 </div>

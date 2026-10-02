@@ -1,4 +1,5 @@
 import type { MediaFile } from "$lib/types";
+import type { PreviewMetadata } from "$lib/previewApi";
 
 export type MediaTypeFilter = "all" | "photo" | "video";
 export type DatePreset = "all" | "7d" | "30d" | "year" | "custom";
@@ -15,6 +16,12 @@ export interface PreviewFilter {
   minBytes: number | null;
   /** Inclusive maximum size in bytes, or null for no upper bound. */
   maxBytes: number | null;
+  /** Selected extensions, with or without a leading dot; empty means all. */
+  extensions?: ReadonlySet<string>;
+  /** Case-insensitive camera make/model substring. */
+  cameraQuery?: string;
+  /** Active GPS predicates exclude metadata that has not loaded yet. */
+  gps?: "all" | "with" | "without";
 }
 
 /** Local calendar date as "YYYY-MM-DD" (the value shape of <input type="date">). */
@@ -66,25 +73,38 @@ export function presetRange(
 }
 
 /**
- * Filter `files` by media type, capture-date window, filename substring, and
- * byte-size bounds. Files whose capture date is unknown are excluded whenever a
- * date bound is active (we can't confirm they fall in range), and included
- * otherwise. The name query is case-insensitive; blank/whitespace means no
- * filter.
+ * Filter files by media type, capture date, filename, extension, size, camera,
+ * and GPS. Active date predicates exclude unknown dates. Active metadata
+ * predicates exclude rows that have not loaded; loaded absence matches only
+ * "without GPS", never a camera query. All predicates combine with AND.
  */
 export function filterFiles(
   files: MediaFile[],
   dates: Map<string, number | null>,
   filter: PreviewFilter,
+  metadata?: ReadonlyMap<string, PreviewMetadata | null>,
 ): MediaFile[] {
   const hasDateBound = filter.fromEpoch !== null || filter.toEpoch !== null;
   const query = filter.nameQuery.trim().toLowerCase();
+  const extensions = new Set(
+    [...(filter.extensions ?? [])].map((extension) => extension.replace(/^\./, "").toLowerCase()),
+  );
+  const camera = filter.cameraQuery?.trim().toLowerCase() ?? "";
   return files.filter((f) => {
     if (filter.type === "photo" && f.is_video) return false;
     if (filter.type === "video" && !f.is_video) return false;
     if (query && !f.name.toLowerCase().includes(query)) return false;
     if (filter.minBytes !== null && f.size_bytes < filter.minBytes) return false;
     if (filter.maxBytes !== null && f.size_bytes > filter.maxBytes) return false;
+    if (extensions.size && !extensions.has(f.extension.replace(/^\./, "").toLowerCase())) return false;
+    const details = metadata?.get(f.path);
+    if (camera && !details?.camera?.toLowerCase().includes(camera)) return false;
+    if (filter.gps && filter.gps !== "all") {
+      if (!metadata?.has(f.path)) return false;
+      const hasGps = details?.gps_lat != null && details?.gps_lon != null;
+      if (filter.gps === "with" && !hasGps) return false;
+      if (filter.gps === "without" && hasGps) return false;
+    }
     if (hasDateBound) {
       const captured = dates.get(f.path) ?? null;
       if (captured === null) return false;

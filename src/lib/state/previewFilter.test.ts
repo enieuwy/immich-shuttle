@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import type { MediaFile } from "$lib/types";
+import type { PreviewMetadata } from "$lib/previewApi";
+import { selectionState } from "./selection";
 import {
   dayEndEpoch,
   dayStartEpoch,
@@ -73,6 +75,7 @@ describe("filterFiles", () => {
     minBytes: null,
     maxBytes: null,
   };
+  afterEach(() => selectionState.clear());
   const run = (overrides: Partial<PreviewFilter>, input = files) =>
     filterFiles(input, dates, { ...base, ...overrides });
 
@@ -112,5 +115,44 @@ describe("filterFiles", () => {
     expect(run({ minBytes: 1000 }, sized)).toEqual([mid, big]);
     expect(run({ maxBytes: 2000 }, sized)).toEqual([small, mid]);
     expect(run({ minBytes: 1000, maxBytes: 2000 }, sized)).toEqual([mid]);
+  });
+
+  it("matches normalized extension membership and combines all existing predicates", () => {
+    const uppercase = { ...photoB, extension: ".JPG", size_bytes: 1500 };
+    const raw = file("b.CR3");
+    const input = [photoA, uppercase, raw, video];
+    expect(run({ extensions: new Set(["jpeg", ".jpg"]) }, input)).toEqual([photoA, uppercase]);
+    expect(run({ extensions: new Set([".CR3"]) }, input)).toEqual([raw]);
+    expect(run({
+      type: "photo", nameQuery: "B.", extensions: new Set(["jpg"]),
+      minBytes: 1500, maxBytes: 1500, fromEpoch: JUN_15, toEpoch: JUN_15,
+    }, input)).toEqual([uppercase]);
+    expect(run({ extensions: new Set(["mp4"]), type: "photo" }, input)).toEqual([]);
+  });
+
+  it("distinguishes missing metadata, missing GPS, and valid zero coordinates", () => {
+    const details: PreviewMetadata = {
+      camera: "Drone Test Camera", lens: null, width: 4000, height: 3000,
+      gps_lat: 0, gps_lon: 0, iso: 100, exposure: "1/100 s",
+    };
+    const metadata = new Map<string, PreviewMetadata | null>([
+      [photoA.path, details], [photoB.path, { ...details, camera: "Other Camera", gps_lat: null }],
+      [video.path, null],
+    ]);
+    expect(filterFiles(files, dates, { ...base, gps: "with" }, metadata)).toEqual([photoA]);
+    expect(filterFiles(files, dates, { ...base, gps: "without" }, metadata)).toEqual([photoB, video]);
+    expect(filterFiles(files, dates, { ...base, gps: "without" }, new Map())).toEqual([]);
+    expect(filterFiles(files, dates, { ...base, cameraQuery: "  DRONE ", gps: "with" }, metadata)).toEqual([photoA]);
+    expect(filterFiles(files, dates, { ...base, cameraQuery: "drone", gps: "without" }, metadata)).toEqual([]);
+  });
+
+  it("keeps hidden picks when selecting and inverting an extension-filtered subset", () => {
+    selectionState.selectOnly([photoA.path]);
+    const shown = run({ extensions: new Set(["mp4"]) });
+    selectionState.add(shown.map((file) => file.path));
+    expect(selectionState.paths()).toEqual([photoA.path, video.path]);
+    selectionState.invert(shown.map((file) => file.path));
+    expect(selectionState.paths()).toEqual([photoA.path]);
+    expect(run({})).toEqual(files);
   });
 });

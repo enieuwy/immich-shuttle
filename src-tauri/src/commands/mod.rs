@@ -8,3 +8,6 @@ pub mod profiles;
 pub mod settings;
 pub mod tags;
 pub mod users;
+pub mod profile_backup;
+pub mod update_check;
+pub mod import_tools;
