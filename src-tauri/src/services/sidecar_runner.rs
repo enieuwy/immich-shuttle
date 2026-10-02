@@ -193,7 +193,10 @@ impl Drop for TempConfig {
 /// config file is created with exclusive semantics (`create_new`) at 0600 — a
 /// local attacker can neither pre-create nor symlink-hijack the path. The
 /// returned guard removes the whole directory when the run finishes.
-fn write_api_key_config(api_key: &str, source: Option<&(String, String)>) -> Result<TempConfig, String> {
+fn write_api_key_config(
+    api_key: &str,
+    source: Option<&(String, String)>,
+) -> Result<TempConfig, String> {
     let dir = std::env::temp_dir().join(format!("immich-shuttle-{}", Uuid::new_v4()));
     #[cfg(unix)]
     let dir_builder = {
@@ -337,7 +340,10 @@ fn emit_progress(
     if let Some(app) = app {
         let _ = app.emit("import-progress", payload);
     } else {
-        println!("{}", serde_json::json!({"event": "progress", "data": payload}));
+        println!(
+            "{}",
+            serde_json::json!({"event": "progress", "data": payload})
+        );
     }
 }
 
@@ -492,33 +498,38 @@ fn build_upload_args(request: &UploadRequest, config_path: &Path) -> Vec<String>
     // honors --into-album; the folder modes derive albums/tags from the tree and
     // ignore any single-album selection.
     if request.extended.source.folder_options() {
-    match request.organization {
-        Organization::SingleAlbum => {
-            args.push("--folder-as-album=NONE".to_string());
-            if let Some(album) = request.into_album.as_deref() {
-                let album = album.trim();
-                if !album.is_empty() {
-                    args.push(format!("--into-album={album}"));
+        match request.organization {
+            Organization::SingleAlbum => {
+                args.push("--folder-as-album=NONE".to_string());
+                if let Some(album) = request.into_album.as_deref() {
+                    let album = album.trim();
+                    if !album.is_empty() {
+                        args.push(format!("--into-album={album}"));
+                    }
                 }
             }
+            Organization::FolderName => args.push("--folder-as-album=FOLDER".to_string()),
+            Organization::FolderPath => {
+                args.push("--folder-as-album=PATH".to_string());
+                args.push("--album-path-joiner= / ".to_string());
+            }
+            Organization::FolderTags => {
+                args.push("--folder-as-album=NONE".to_string());
+                args.push("--folder-as-tags".to_string());
+            }
         }
-        Organization::FolderName => args.push("--folder-as-album=FOLDER".to_string()),
-        Organization::FolderPath => {
-            args.push("--folder-as-album=PATH".to_string());
-            args.push("--album-path-joiner= / ".to_string());
-        }
-        Organization::FolderTags => {
-            args.push("--folder-as-album=NONE".to_string());
-            args.push("--folder-as-tags".to_string());
-        }
-    }
     }
     // Do not pause background jobs or change source-server jobs for a migration.
     args.push("--pause-immich-jobs=false".to_string());
     if request.extended.dry_run {
         args.push("--dry-run".to_string());
     }
-    if let Some(zone) = request.extended.time_zone.as_deref().filter(|v| !v.trim().is_empty()) {
+    if let Some(zone) = request
+        .extended
+        .time_zone
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+    {
         args.push(format!("--time-zone={zone}"));
     }
     if request.extended.source.folder_options() {
@@ -587,8 +598,15 @@ fn build_upload_args(request: &UploadRequest, config_path: &Path) -> Vec<String>
 
     if request.extended.source == crate::services::import_source::ImportSource::Immich {
         for arg in &mut args {
-            if ["--date-range=", "--include-type=", "--include-extensions=", "--exclude-extensions="]
-                .iter().any(|prefix| arg.starts_with(prefix)) {
+            if [
+                "--date-range=",
+                "--include-type=",
+                "--include-extensions=",
+                "--exclude-extensions=",
+            ]
+            .iter()
+            .any(|prefix| arg.starts_with(prefix))
+            {
                 *arg = format!("--from-{}", &arg[2..]);
             }
         }
@@ -766,20 +784,28 @@ pub async fn run_upload(
     app: Option<AppHandle>,
     request: UploadRequest,
 ) -> Result<SidecarResult, RunUploadError> {
-    let config = write_api_key_config(&request.api_key, request.source_credentials.as_ref()).map_err(RunUploadError::Other)?;
+    let config = write_api_key_config(&request.api_key, request.source_credentials.as_ref())
+        .map_err(RunUploadError::Other)?;
     // Pre-create the run log 0600 so immich-go's --log-file output (which can
     // carry an x-api-key header) is not world-readable on shared machines.
     create_private_log(&request.log_path).map_err(RunUploadError::Other)?;
     let args = build_upload_args(&request, &config.path);
 
     let (mut rx, child) = if let Some(app) = &app {
-        let (rx, child) = app.shell().sidecar("immich-go")
+        let (rx, child) = app
+            .shell()
+            .sidecar("immich-go")
             .map_err(|e| RunUploadError::Other(e.to_string()))?
-            .env("GODEBUG", "netdns=cgo").args(args).spawn()
-            .map_err(|e| RunUploadError::Other(format!("Could not spawn immich-go sidecar: {e}")))?;
+            .env("GODEBUG", "netdns=cgo")
+            .args(args)
+            .spawn()
+            .map_err(|e| {
+                RunUploadError::Other(format!("Could not spawn immich-go sidecar: {e}"))
+            })?;
         (rx, RunningChild::Desktop(child))
     } else {
-        let (rx, child) = crate::services::headless_process::spawn(args).map_err(RunUploadError::Other)?;
+        let (rx, child) =
+            crate::services::headless_process::spawn(args).map_err(RunUploadError::Other)?;
         (rx, RunningChild::Headless(child))
     };
     let mut child = Some(child);
@@ -796,7 +822,9 @@ pub async fn run_upload(
         &mut child,
         &request.cancel_flag,
         &mut progress,
-        |snapshot, current_path| emit_progress(app.as_ref(), &request.job_id, snapshot, current_path),
+        |snapshot, current_path| {
+            emit_progress(app.as_ref(), &request.job_id, snapshot, current_path)
+        },
     )
     .await;
 

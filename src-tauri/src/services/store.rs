@@ -39,7 +39,8 @@ pub fn data_dir() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("IMMICH_SHUTTLE_DATA_DIR") {
         return Ok(PathBuf::from(path));
     }
-    dirs::data_dir().map(|p| p.join("com.immich-shuttle.desktop"))
+    dirs::data_dir()
+        .map(|p| p.join("com.immich-shuttle.desktop"))
         .ok_or_else(|| "Could not resolve app data directory".to_string())
 }
 
@@ -110,7 +111,9 @@ pub fn append_history(
     data.history.truncate(100);
 
     let content = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     crate::services::private_file::write_atomic_private(&path, &content)
 }
 

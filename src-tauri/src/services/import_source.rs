@@ -56,8 +56,13 @@ impl ImportExtensions {
         }
         if let Some(value) = &self.completion_webhook_url {
             let url = reqwest::Url::parse(value).map_err(|_| "Invalid callback URL.")?;
-            if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
-                return Err("Callback requires an HTTP(S) URL without embedded credentials.".into());
+            if !matches!(url.scheme(), "http" | "https")
+                || !url.username().is_empty()
+                || url.password().is_some()
+            {
+                return Err(
+                    "Callback requires an HTTP(S) URL without embedded credentials.".into(),
+                );
             }
         }
         Ok(())

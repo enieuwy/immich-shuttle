@@ -618,16 +618,30 @@ impl ImmichClient {
         let mut seen = HashSet::new();
         let mut page = 1u32;
         loop {
-            let value = self.request_json(Method::POST, &["search", "metadata"], Some(json!({
-                "deviceId": device_id, "page": page, "size": 1000, "withExif": true
-            }))).await?;
-            let result = value.get("assets").ok_or("Search response has no assets.")?;
-            let items = result.get("items").and_then(Value::as_array).ok_or("Search response has no asset items.")?;
+            let value = self
+                .request_json(
+                    Method::POST,
+                    &["search", "metadata"],
+                    Some(json!({
+                        "deviceId": device_id, "page": page, "size": 1000, "withExif": true
+                    })),
+                )
+                .await?;
+            let result = value
+                .get("assets")
+                .ok_or("Search response has no assets.")?;
+            let items = result
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or("Search response has no asset items.")?;
             for item in items {
                 if item.get("deviceId").and_then(Value::as_str) != Some(device_id) {
                     return Err("Search returned an asset from another device.".into());
                 }
-                let id = item.get("id").and_then(Value::as_str).ok_or("Asset has no id.")?;
+                let id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or("Asset has no id.")?;
                 if !seen.insert(id.to_string()) {
                     return Err("Search repeated an asset; reconciliation is incomplete.".into());
                 }
@@ -649,12 +663,22 @@ impl ImmichClient {
 
     pub async fn add_assets_to_album(&self, album_id: &str, ids: &[String]) -> Result<(), String> {
         for chunk in ids.chunks(500) {
-            let value = self.request_json(Method::PUT, &["albums", album_id, "assets"], Some(json!({"ids": chunk}))).await?;
-            let rows = value.as_array().ok_or("Album assignment returned no results.")?;
-            if rows.len() != chunk.len() || rows.iter().any(|row| {
-                row.get("success").and_then(Value::as_bool) != Some(true)
-                    && row.get("error").and_then(Value::as_str) != Some("duplicate")
-            }) {
+            let value = self
+                .request_json(
+                    Method::PUT,
+                    &["albums", album_id, "assets"],
+                    Some(json!({"ids": chunk})),
+                )
+                .await?;
+            let rows = value
+                .as_array()
+                .ok_or("Album assignment returned no results.")?;
+            if rows.len() != chunk.len()
+                || rows.iter().any(|row| {
+                    row.get("success").and_then(Value::as_bool) != Some(true)
+                        && row.get("error").and_then(Value::as_str) != Some("duplicate")
+                })
+            {
                 return Err("The server did not confirm every album assignment.".into());
             }
         }
@@ -663,34 +687,61 @@ impl ImmichClient {
 
     /// Unknown headroom remains unknown; a missing admin permission is not zero space.
     pub async fn storage_headroom(&self) -> Result<Value, String> {
-        let user = self.request_json(Method::GET, &["users", "me"], None).await?;
-        let quota = user.get("quotaSizeInBytes").and_then(Value::as_u64)
+        let user = self
+            .request_json(Method::GET, &["users", "me"], None)
+            .await?;
+        let quota = user
+            .get("quotaSizeInBytes")
+            .and_then(Value::as_u64)
             .filter(|size| *size > 0)
             .zip(user.get("quotaUsageInBytes").and_then(Value::as_u64))
             .map(|(size, used)| size.saturating_sub(used));
-        let disk = self.request_json(Method::GET, &["server", "storage"], None).await;
-        let disk_free = disk.as_ref().ok().and_then(|v| v.get("diskAvailableRaw")).and_then(Value::as_u64);
+        let disk = self
+            .request_json(Method::GET, &["server", "storage"], None)
+            .await;
+        let disk_free = disk
+            .as_ref()
+            .ok()
+            .and_then(|v| v.get("diskAvailableRaw"))
+            .and_then(Value::as_u64);
         let available = match (quota, disk_free) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        Ok(json!({"available_bytes": available, "quota_remaining_bytes": quota,
-            "disk_available_bytes": disk_free, "disk_warning": disk.err()}))
+        Ok(
+            json!({"available_bytes": available, "quota_remaining_bytes": quota,
+            "disk_available_bytes": disk_free, "disk_warning": disk.err()}),
+        )
     }
 
     pub async fn correct_capture_date(&self, id: &str, date: &str) -> Result<(), String> {
-        self.request_json(Method::PUT, &["assets", id], Some(json!({"dateTimeOriginal": date}))).await?;
+        self.request_json(
+            Method::PUT,
+            &["assets", id],
+            Some(json!({"dateTimeOriginal": date})),
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn register_library(&self, name: &str, server_path: &str) -> Result<Value, String> {
         let user = self.get_my_user().await?;
-        let library = self.request_json(Method::POST, &["libraries"], Some(json!({
-            "name": name, "ownerId": user.id, "importPaths": [server_path]
-        }))).await?;
-        let id = library.get("id").and_then(Value::as_str).ok_or("Library response has no id.")?;
+        let library = self
+            .request_json(
+                Method::POST,
+                &["libraries"],
+                Some(json!({
+                    "name": name, "ownerId": user.id, "importPaths": [server_path]
+                })),
+            )
+            .await?;
+        let id = library
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("Library response has no id.")?;
         // Keep the library id in the error so a failed scan is recoverable without creating duplicates.
-        self.request_json(Method::POST, &["libraries", id, "scan"], Some(json!({}))).await
+        self.request_json(Method::POST, &["libraries", id, "scan"], Some(json!({})))
+            .await
             .map_err(|e| format!("Library {id} exists, but its scan failed: {e}"))?;
         Ok(library)
     }

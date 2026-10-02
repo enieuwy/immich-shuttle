@@ -96,7 +96,7 @@ export const historyState = {
   },
 };
 
-export type ReplayOutcome = "staged" | "no-request" | "profile-missing" | "busy";
+export type ReplayOutcome = "staged" | "no-request" | "profile-missing" | "busy" | "unsupported-request";
 
 /**
  * Value equality over an options snapshot. The store holds only primitives and
@@ -123,8 +123,9 @@ function sameOptions(a: ImportOptionsSnapshot, b: ImportOptionsSnapshot): boolea
  * confirm and start. Does NOT auto-start — deletion/wipe safety requires a fresh
  * look. Returns "no-request" for records saved before request persistence,
  * "profile-missing" when the recorded profile has since been deleted, and
- * "busy" when a replay is already in flight (nothing is mutated in any of
- * these cases), else "staged".
+ * "busy" when a replay is already in flight, and "unsupported-request" when
+ * replay cannot preserve the saved options. These outcomes change no stores.
+ * Otherwise returns "staged".
  *
  * Never rejects: this is a multi-step staging sequence writing several shared
  * stores, so it can't be made transactional cheaply, and HistoryPanel awaits
@@ -135,6 +136,27 @@ function sameOptions(a: ImportOptionsSnapshot, b: ImportOptionsSnapshot): boolea
 export async function replayImport(record: ImportRecord): Promise<ReplayOutcome> {
   const request = record.request;
   if (!request) return "no-request";
+  // The standard import form cannot restore migration options. Do not turn
+  // a recorded plan into an upload or silently discard another source mode.
+  const hasExtendedOptions = Object.entries(request.extended ?? {}).some(([key, value]) => {
+    if (value === undefined) return false;
+    switch (key) {
+      case "source": return value !== "folder";
+      case "date_from_name": return value !== null;
+      case "dry_run":
+      case "public_link": return value !== false;
+      case "clock_offset_minutes": return value !== 0;
+      case "source_profile_id":
+      case "time_zone":
+      case "completion_webhook_url": return value !== null;
+      case "share_user_ids": return !Array.isArray(value) || value.length !== 0;
+      case "share_role": return value !== null && value !== "viewer";
+      default: return true;
+    }
+  });
+  if (hasExtendedOptions || request.album_ids.length > 1 || record.album_ids.length > 1) {
+    return "unsupported-request";
+  }
 
   // Single-flight: this check runs synchronously, before any await, so no
   // second call through THIS function can ever start while one is already in

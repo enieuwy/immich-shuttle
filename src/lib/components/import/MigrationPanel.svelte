@@ -5,7 +5,7 @@
   import { albumsState } from "$lib/state/albums";
   import { sourceState } from "$lib/state/source";
   import { selectionState } from "$lib/state/selection";
-  import { importOptionsState, toImmichDateRange } from "$lib/state/import-options";
+  import { importOptionsState, isDateRangeInvalid, toImmichDateRange } from "$lib/state/import-options";
   import { queueState } from "$lib/state/queue";
   import { panelTab } from "$lib/state/ui";
   import type { ImportExtensions, ImportInput } from "$lib/types";
@@ -52,6 +52,9 @@
     const selection = useSelection && kind === "folder";
     if (selection && ($sourceState.scanOutcome !== "complete" || $selectionState.selected.size === 0)) {
       throw new Error("Complete a source scan and select at least one file first.");
+    }
+    if (!selection && isDateRangeInvalid(options.dateFrom, options.dateTo)) {
+      throw new Error("The From date must not be after the To date.");
     }
     const sourcePaths = kind === "immich" ? [] : selection ? [...$sourceState.selectedPaths] : paths.split("\n").map(p => p.trim()).filter(Boolean);
     const album = $albumsState.availableAlbums.find(a => a.id === selectedAlbums[0]);

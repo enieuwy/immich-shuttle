@@ -69,6 +69,10 @@
       errorsState.addError(
         "This import can't be repeated — it was recorded before request details were saved.",
       );
+    } else if (outcome === "unsupported-request") {
+      errorsState.addError(
+        "This import uses options that History cannot restore safely. Review them in Migration and import planning.",
+      );
     }
   }
 </script>

@@ -536,7 +536,8 @@ fn to_result(path_str: &str, file: &Path) -> Result<ThumbResult, String> {
         return Err("preview_output_too_large".to_string());
     }
     let mut bytes = Vec::with_capacity(len as usize);
-    source.take(MAX_PREVIEW_OUTPUT_BYTES + 1)
+    source
+        .take(MAX_PREVIEW_OUTPUT_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_PREVIEW_OUTPUT_BYTES {
@@ -1180,11 +1181,22 @@ mod tests {
         let image = image::load_from_memory(&decoded).unwrap();
         assert_eq!((image.width(), image.height()), (900, 600));
         let oversized = dir.join("oversized.png");
-        image::RgbImage::new(MAX_PREVIEW_PX + 1, 1).save(&oversized).unwrap();
-        assert_eq!(to_result("source", &oversized).unwrap_err(), "preview_output_dimensions_exceed_limit");
+        image::RgbImage::new(MAX_PREVIEW_PX + 1, 1)
+            .save(&oversized)
+            .unwrap();
+        assert_eq!(
+            to_result("source", &oversized).unwrap_err(),
+            "preview_output_dimensions_exceed_limit"
+        );
         let oversized_bytes = dir.join("oversized.jpg");
-        fs::File::create(&oversized_bytes).unwrap().set_len(MAX_PREVIEW_OUTPUT_BYTES + 1).unwrap();
-        assert_eq!(to_result("source", &oversized_bytes).unwrap_err(), "preview_output_too_large");
+        fs::File::create(&oversized_bytes)
+            .unwrap()
+            .set_len(MAX_PREVIEW_OUTPUT_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            to_result("source", &oversized_bytes).unwrap_err(),
+            "preview_output_too_large"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -11,10 +11,16 @@ static FULL_IMAGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Render a larger, aspect-preserving inspection image, without exposing the original.
 #[tauri::command]
-pub async fn preview_full_image(path: String, max_px: u32, token: u64) -> Result<ThumbResult, String> {
+pub async fn preview_full_image(
+    path: String,
+    max_px: u32,
+    token: u64,
+) -> Result<ThumbResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _decode = FULL_IMAGE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        if preview_session_cancelled(token) { return Err("Preview cancelled".to_string()); }
+        if preview_session_cancelled(token) {
+            return Err("Preview cancelled".to_string());
+        }
         let source = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
         if !crate::services::source_guard::is_within_approved(&source.to_string_lossy()) {
             return Err("File is outside the selected sources".to_string());
@@ -24,14 +30,20 @@ pub async fn preview_full_image(path: String, max_px: u32, token: u64) -> Result
             max_px.clamp(256, crate::services::thumbnailer::MAX_PREVIEW_PX),
         );
         result.path = path;
-        if preview_session_cancelled(token) { return Err("Preview cancelled".to_string()); }
+        if preview_session_cancelled(token) {
+            return Err("Preview cancelled".to_string());
+        }
         match outcome {
             ThumbnailOutcome::Ok => Ok(result),
-            ThumbnailOutcome::Unsupported => Err("No image renderer supports this file".to_string()),
+            ThumbnailOutcome::Unsupported => {
+                Err("No image renderer supports this file".to_string())
+            }
             ThumbnailOutcome::Cancelled => Err("Preview cancelled".to_string()),
             ThumbnailOutcome::Failed(_) => Err("Could not render this image".to_string()),
         }
-    }).await.map_err(|e| e.to_string())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Metadata remains optional; videos and containers without EXIF return null.
@@ -41,22 +53,35 @@ pub async fn preview_metadata(
     token: u64,
 ) -> Result<Vec<crate::models::media::PreviewMetadataRow>, String> {
     use crate::models::media::PreviewMetadataRow;
-    if paths.len() > 128 { return Err("Metadata batches are limited to 128 files".to_string()); }
+    if paths.len() > 128 {
+        return Err("Metadata batches are limited to 128 files".to_string());
+    }
     let mut results = Vec::with_capacity(paths.len());
     for chunk in paths.chunks(4) {
-        if preview_session_cancelled(token) { break; }
-        let handles: Vec<_> = chunk.iter().cloned().map(|path| {
-            tauri::async_runtime::spawn_blocking(move || {
-                let metadata = if preview_session_cancelled(token) {
-                    None
-                } else {
-                    std::fs::canonicalize(&path).ok().filter(|source|
-                        crate::services::source_guard::is_within_approved(&source.to_string_lossy())
-                    ).and_then(|source| metadata_reader::metadata(&source))
-                };
-                PreviewMetadataRow { path, metadata }
+        if preview_session_cancelled(token) {
+            break;
+        }
+        let handles: Vec<_> = chunk
+            .iter()
+            .cloned()
+            .map(|path| {
+                tauri::async_runtime::spawn_blocking(move || {
+                    let metadata = if preview_session_cancelled(token) {
+                        None
+                    } else {
+                        std::fs::canonicalize(&path)
+                            .ok()
+                            .filter(|source| {
+                                crate::services::source_guard::is_within_approved(
+                                    &source.to_string_lossy(),
+                                )
+                            })
+                            .and_then(|source| metadata_reader::metadata(&source))
+                    };
+                    PreviewMetadataRow { path, metadata }
+                })
             })
-        }).collect();
+            .collect();
         for handle in handles {
             results.push(handle.await.map_err(|e| e.to_string())?);
         }
@@ -68,7 +93,8 @@ pub async fn preview_metadata(
 #[tauri::command]
 pub async fn preview_video(path: String, token: u64) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || preview_media::open(path, token))
-        .await.map_err(|e| e.to_string())?
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

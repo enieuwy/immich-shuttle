@@ -254,14 +254,16 @@ mod tests {
     }
 }
 
+mod cli;
 mod commands;
 mod models;
 mod services;
-mod cli;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    if let Some(code) = cli::try_run() { std::process::exit(code); }
+    if let Some(code) = cli::try_run() {
+        std::process::exit(code);
+    }
     tauri::Builder::default()
         // MUST stay the first plugin: it decides whether this process is the
         // owner or a duplicate launch before any other setup runs.
@@ -307,7 +309,9 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(prune_startup_artifacts);
             Ok(())
         })
-        .register_uri_scheme_protocol("preview-media", |_context, request| commands::preview::preview_media_response(request))
+        .register_uri_scheme_protocol("preview-media", |_context, request| {
+            commands::preview::preview_media_response(request)
+        })
         .invoke_handler(tauri::generate_handler![
             commands::profile_backup::profiles_export,
             commands::profile_backup::profiles_backup_read,

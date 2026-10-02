@@ -1,6 +1,9 @@
 pub mod device_detector;
 pub mod discovery;
+pub mod headless_process;
 pub mod immich_client;
+pub mod import_actions;
+pub mod import_source;
 pub mod keychain;
 pub mod logs;
 pub mod media_scanner;
@@ -14,6 +17,3 @@ pub mod store;
 pub mod thumbnailer;
 pub mod url_resolver;
 pub mod wipe;
-pub mod import_source;
-pub mod headless_process;
-pub mod import_actions;

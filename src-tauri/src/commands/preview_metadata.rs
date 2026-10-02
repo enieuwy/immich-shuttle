@@ -1,12 +1,18 @@
 //! Bounded, optional EXIF extraction for inspection and camera/GPS filtering.
 use crate::models::media::PreviewMetadata;
-use std::{fs::File, io::{Cursor, Read}, path::Path};
+use std::{
+    fs::File,
+    io::{Cursor, Read},
+    path::Path,
+};
 
 const MAX_EXIF_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(super) fn metadata(path: &Path) -> Option<PreviewMetadata> {
-    if matches!(path.extension()?.to_str()?.to_ascii_lowercase().as_str(),
-        "mp4" | "mov" | "m4v" | "avi" | "mkv" | "webm") {
+    if matches!(
+        path.extension()?.to_str()?.to_ascii_lowercase().as_str(),
+        "mp4" | "mov" | "m4v" | "avi" | "mkv" | "webm"
+    ) {
         return None;
     }
     // TIFF/RAW pointers outside the bounded prefix remain unavailable. Preview
@@ -15,15 +21,22 @@ pub(super) fn metadata(path: &Path) -> Option<PreviewMetadata> {
     let len = source.metadata().ok()?.len().min(MAX_EXIF_BYTES);
     let mut bytes = Vec::with_capacity(len as usize);
     source.take(MAX_EXIF_BYTES).read_to_end(&mut bytes).ok()?;
-    let exif = exif::Reader::new().read_from_container(&mut Cursor::new(bytes)).ok()?;
+    let exif = exif::Reader::new()
+        .read_from_container(&mut Cursor::new(bytes))
+        .ok()?;
     Some(from_exif(&exif))
 }
 
 fn text(exif: &exif::Exif, tag: exif::Tag) -> Option<String> {
     let value = &exif.get_field(tag, exif::In::PRIMARY)?.value;
-    let exif::Value::Ascii(parts) = value else { return None };
+    let exif::Value::Ascii(parts) = value else {
+        return None;
+    };
     let bytes = parts.first()?;
-    let value = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]).trim_matches('\0').trim().to_string();
+    let value = String::from_utf8_lossy(&bytes[..bytes.len().min(512)])
+        .trim_matches('\0')
+        .trim()
+        .to_string();
     (!value.is_empty()).then_some(value)
 }
 
@@ -32,8 +45,12 @@ fn uint(exif: &exif::Exif, tag: exif::Tag) -> Option<u32> {
 }
 
 fn gps(exif: &exif::Exif, coord: exif::Tag, reference: exif::Tag, max: f64) -> Option<f64> {
-    let exif::Value::Rational(parts) = &exif.get_field(coord, exif::In::PRIMARY)?.value else { return None };
-    if parts.len() != 3 || parts.iter().any(|r| r.denom == 0) { return None; }
+    let exif::Value::Rational(parts) = &exif.get_field(coord, exif::In::PRIMARY)?.value else {
+        return None;
+    };
+    if parts.len() != 3 || parts.iter().any(|r| r.denom == 0) {
+        return None;
+    }
     let degrees = parts[0].to_f64();
     let minutes = parts[1].to_f64();
     let seconds = parts[2].to_f64();
@@ -47,12 +64,19 @@ fn gps(exif: &exif::Exif, coord: exif::Tag, reference: exif::Tag, max: f64) -> O
 }
 
 fn coordinate(degrees: f64, minutes: f64, seconds: f64, negative: bool, max: f64) -> Option<f64> {
-    if !degrees.is_finite() || !minutes.is_finite() || !seconds.is_finite()
-        || degrees < 0.0 || !(0.0..60.0).contains(&minutes) || !(0.0..60.0).contains(&seconds) {
+    if !degrees.is_finite()
+        || !minutes.is_finite()
+        || !seconds.is_finite()
+        || degrees < 0.0
+        || !(0.0..60.0).contains(&minutes)
+        || !(0.0..60.0).contains(&seconds)
+    {
         return None;
     }
     let value = degrees + minutes / 60.0 + seconds / 3600.0;
-    if value > max { return None; }
+    if value > max {
+        return None;
+    }
     Some(if negative { -value } else { value })
 }
 
@@ -60,23 +84,43 @@ fn from_exif(exif: &exif::Exif) -> PreviewMetadata {
     let model = text(exif, exif::Tag::Model);
     let make = text(exif, exif::Tag::Make);
     let camera = match (make, model) {
-        (Some(make), Some(model)) if !model.to_lowercase().starts_with(&make.to_lowercase()) => Some(format!("{make} {model}")),
+        (Some(make), Some(model)) if !model.to_lowercase().starts_with(&make.to_lowercase()) => {
+            Some(format!("{make} {model}"))
+        }
         (_, Some(model)) => Some(model),
         (make, None) => make,
     };
     PreviewMetadata {
         camera,
         lens: text(exif, exif::Tag::LensModel),
-        width: uint(exif, exif::Tag::PixelXDimension).or_else(|| uint(exif, exif::Tag::ImageWidth)).filter(|v| *v > 0),
-        height: uint(exif, exif::Tag::PixelYDimension).or_else(|| uint(exif, exif::Tag::ImageLength)).filter(|v| *v > 0),
-        gps_lat: gps(exif, exif::Tag::GPSLatitude, exif::Tag::GPSLatitudeRef, 90.0),
-        gps_lon: gps(exif, exif::Tag::GPSLongitude, exif::Tag::GPSLongitudeRef, 180.0),
+        width: uint(exif, exif::Tag::PixelXDimension)
+            .or_else(|| uint(exif, exif::Tag::ImageWidth))
+            .filter(|v| *v > 0),
+        height: uint(exif, exif::Tag::PixelYDimension)
+            .or_else(|| uint(exif, exif::Tag::ImageLength))
+            .filter(|v| *v > 0),
+        gps_lat: gps(
+            exif,
+            exif::Tag::GPSLatitude,
+            exif::Tag::GPSLatitudeRef,
+            90.0,
+        ),
+        gps_lon: gps(
+            exif,
+            exif::Tag::GPSLongitude,
+            exif::Tag::GPSLongitudeRef,
+            180.0,
+        ),
         iso: uint(exif, exif::Tag::PhotographicSensitivity),
-        exposure: exif.get_field(exif::Tag::ExposureTime, exif::In::PRIMARY).and_then(|field| {
-            let exif::Value::Rational(values) = &field.value else { return None };
-            let value = values.first()?;
-            (value.denom != 0).then(|| format!("{}/{} s", value.num, value.denom))
-        }),
+        exposure: exif
+            .get_field(exif::Tag::ExposureTime, exif::In::PRIMARY)
+            .and_then(|field| {
+                let exif::Value::Rational(values) = &field.value else {
+                    return None;
+                };
+                let value = values.first()?;
+                (value.denom != 0).then(|| format!("{}/{} s", value.num, value.denom))
+            }),
     }
 }
 
@@ -92,10 +136,18 @@ mod tests {
         bytes.extend_from_slice(&count.to_le_bytes());
         let model_offset = 8 + 2 + usize::from(count) * 12 + 4;
         let entry = |tag: u16, kind: u16, count: u32, value: u32| {
-            [tag.to_le_bytes().as_slice(), kind.to_le_bytes().as_slice(), count.to_le_bytes().as_slice(), value.to_le_bytes().as_slice()].concat()
+            [
+                tag.to_le_bytes().as_slice(),
+                kind.to_le_bytes().as_slice(),
+                count.to_le_bytes().as_slice(),
+                value.to_le_bytes().as_slice(),
+            ]
+            .concat()
         };
         bytes.extend(entry(0x0110, 2, 5, model_offset as u32));
-        if with_gps { bytes.extend(entry(0x8825, 4, 1, model_offset as u32 + 5)); }
+        if with_gps {
+            bytes.extend(entry(0x8825, 4, 1, model_offset as u32 + 5));
+        }
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(b"Test\0");
         if with_gps {
@@ -122,7 +174,9 @@ mod tests {
 
     #[test]
     fn reads_camera_and_signed_gps_from_jpeg() {
-        let parsed = exif::Reader::new().read_from_container(&mut Cursor::new(exif_fixture(true))).unwrap();
+        let parsed = exif::Reader::new()
+            .read_from_container(&mut Cursor::new(exif_fixture(true)))
+            .unwrap();
         let metadata = from_exif(&parsed);
         assert_eq!(metadata.camera.as_deref(), Some("Test"));
         assert_eq!(metadata.gps_lat, Some(-31.5));
@@ -131,7 +185,9 @@ mod tests {
 
     #[test]
     fn missing_gps_remains_absent() {
-        let parsed = exif::Reader::new().read_from_container(&mut Cursor::new(exif_fixture(false))).unwrap();
+        let parsed = exif::Reader::new()
+            .read_from_container(&mut Cursor::new(exif_fixture(false)))
+            .unwrap();
         let metadata = from_exif(&parsed);
         assert_eq!(metadata.camera.as_deref(), Some("Test"));
         assert_eq!(metadata.gps_lat, None);

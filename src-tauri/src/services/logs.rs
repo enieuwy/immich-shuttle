@@ -13,8 +13,10 @@ pub fn logs_dir() -> Result<PathBuf, String> {
     let dir = if let Some(path) = std::env::var_os("IMMICH_SHUTTLE_DATA_DIR") {
         PathBuf::from(path).join("logs")
     } else {
-        dirs::data_local_dir().ok_or("Could not resolve local data directory")?
-            .join("immich-shuttle").join("logs")
+        dirs::data_local_dir()
+            .ok_or("Could not resolve local data directory")?
+            .join("immich-shuttle")
+            .join("logs")
     };
     fs::create_dir_all(&dir).map_err(|e| format!("Could not create log directory: {e}"))?;
     // Run logs can contain an immich-go x-api-key header at higher verbosity;

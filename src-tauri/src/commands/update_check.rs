@@ -1,6 +1,6 @@
 //! Explicit, notification-only release checks. No updater or background fetch.
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 pub const RELEASES_URL: &str = "https://github.com/enieuwy/immich-shuttle/releases";
 const RELEASE_API: &str = "https://api.github.com/repos/enieuwy/immich-shuttle/releases/latest";
@@ -22,8 +22,10 @@ pub struct UpdateStatus {
 }
 
 fn compare_release(current: &str, latest: &str) -> Result<bool, String> {
-    let parse = |value: &str| semver::Version::parse(value.strip_prefix('v').unwrap_or(value))
-        .map_err(|_| "Release version is not valid semantic versioning".to_string());
+    let parse = |value: &str| {
+        semver::Version::parse(value.strip_prefix('v').unwrap_or(value))
+            .map_err(|_| "Release version is not valid semantic versioning".to_string())
+    };
     let current = parse(current)?;
     let latest = parse(latest)?;
     // Build metadata does not change version precedence.
@@ -31,15 +33,26 @@ fn compare_release(current: &str, latest: &str) -> Result<bool, String> {
 }
 
 async fn fetch_release(client: &reqwest::Client, url: &str) -> Result<Release, String> {
-    let mut response = client.get(url)
+    let mut response = client
+        .get(url)
         .header("Accept", "application/vnd.github+json")
-        .send().await.map_err(|e| format!("Could not check releases: {e}"))?
-        .error_for_status().map_err(|e| format!("Release service returned an error: {e}"))?;
-    if response.content_length().is_some_and(|n| n > MAX_RESPONSE_BYTES as u64) {
+        .send()
+        .await
+        .map_err(|e| format!("Could not check releases: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Release service returned an error: {e}"))?;
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+    {
         return Err("Release response exceeds the size limit".into());
     }
     let mut body = Vec::with_capacity(response.content_length().unwrap_or(0) as usize);
-    while let Some(chunk) = response.chunk().await.map_err(|e| format!("Could not read release response: {e}"))? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("Could not read release response: {e}"))?
+    {
         if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
             return Err("Release response exceeds the size limit".into());
         }
@@ -56,13 +69,19 @@ pub async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateStatus, St
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
-        .build().map_err(|e| format!("Could not create release client: {e}"))?;
+        .build()
+        .map_err(|e| format!("Could not create release client: {e}"))?;
     let release = fetch_release(&client, RELEASE_API).await?;
     if release.draft || release.prerelease {
         return Err("Release service did not return a stable public release".into());
     }
     let update_available = compare_release(&current_version, &release.tag_name)?;
-    Ok(UpdateStatus { current_version, latest_version: release.tag_name, update_available, releases_url: RELEASES_URL })
+    Ok(UpdateStatus {
+        current_version,
+        latest_version: release.tag_name,
+        update_available,
+        releases_url: RELEASES_URL,
+    })
 }
 
 #[tauri::command]
@@ -93,14 +112,26 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            for body in [r#"{"tag_name":"v0.10.0","draft":false,"prerelease":false}"#, "invalid-json"] {
+            for body in [
+                r#"{"tag_name":"v0.10.0","draft":false,"prerelease":false}"#,
+                "invalid-json",
+            ] {
                 let (mut connection, _) = listener.accept().unwrap();
                 let mut request = [0u8; 4096];
                 connection.read(&mut request).unwrap();
-                write!(connection, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
             }
         });
-        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
         let url = format!("http://{address}/latest");
         let release = fetch_release(&client, &url).await.unwrap();
         assert!(compare_release("0.8.1", &release.tag_name).unwrap());

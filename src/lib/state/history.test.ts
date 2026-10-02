@@ -112,6 +112,50 @@ describe("historyState", () => {
 });
 
 describe("replayImport", () => {
+  it.each([
+    { extended: { dry_run: true } },
+    { extended: { source: "google_photos" as const } },
+    { extended: { source: "immich" as const, source_profile_id: "p1" } },
+    { extended: { clock_offset_minutes: 60 } },
+    { extended: { completion_webhook_url: "http://127.0.0.1:12345" } },
+    { extended: { public_link: true } },
+    { extended: { date_from_name: true } },
+    { extended: { date_from_name: false } },
+    { album_ids: ["one", "two"] },
+  ])("refuses an unsupported request without changing the reviewed import state: %j", async (overrides) => {
+    await saveProfile("p1", "https://one.example.com");
+    await saveProfile("p2", "https://two.example.com");
+    profilesState.setActiveProfile("p2");
+    const options = get(importOptionsState);
+    const source = get(sourceState);
+    const albums = get(albumsState);
+    const outcome = await replayImport(importRecord("unsupported", {
+      ...overrides, source_paths: ["/must-not-scan"], keep_files: false,
+    }));
+    expect(outcome).toBe("unsupported-request");
+    expect(get(profilesState).activeProfileId).toBe("p2");
+    expect(get(importOptionsState)).toEqual(options);
+    expect(get(sourceState)).toEqual(source);
+    expect(get(albumsState)).toEqual(albums);
+    expect(get(historyState).replaying).toBe(false);
+  });
+
+  it("restores a standard folder request with Rust's serialized extension defaults", async () => {
+    await saveProfile("p1", "https://one.example.com");
+    const outcome = await replayImport(importRecord("default-extensions", {
+      source_paths: ["/folder"], keep_files: true,
+      extended: {
+        source: "folder", source_profile_id: null, date_from_name: null,
+        time_zone: null, clock_offset_minutes: 0, dry_run: false,
+        completion_webhook_url: null, share_user_ids: [], share_role: null, public_link: false,
+      },
+    }));
+    expect(outcome).toBe("staged");
+    expect(get(profilesState).activeProfileId).toBe("p1");
+    expect(get(sourceState).selectedPaths).toEqual(["/folder"]);
+    expect(get(importOptionsState).keepFiles).toBe(true);
+  });
+
   it("refuses a second replay while the first is still staging, and only the first commits", async () => {
     await saveProfile("p1", "https://one.example.com");
     await saveProfile("p2", "https://two.example.com");
