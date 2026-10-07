@@ -8,6 +8,10 @@
 - Advisory capacity check, external-library registration, profile metadata backup, release check, history analytics, and a headless CLI.
 
 ### Fixes
+- Clock correction waits up to 30 seconds for the server's extracted capture date and reports incomplete correction when metadata remains unavailable.
+- Server migrations use UTC unless a time zone is requested, so the desktop time zone does not shift capture dates.
+- Folder image/video filters use the bundled uploader's extension lists and intersect explicit extension filters.
+- Imports report incomplete results when the uploader leaves assets pending; callbacks report failure and the CLI exits with an error.
 - Folder-name, folder-path, and folder-tag imports ignore the selected single album without clearing the picker.
 - Forecast requests reject an empty source list before taking the forecast slot or reading credentials.
 - Log reads and appends accept only supported log basenames and reject existing symbolic links.

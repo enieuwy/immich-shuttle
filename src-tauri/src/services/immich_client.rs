@@ -660,6 +660,10 @@ impl ImmichClient {
         }
     }
 
+    pub async fn asset(&self, id: &str) -> Result<Value, String> {
+        self.request_json(Method::GET, &["assets", id], None).await
+    }
+
     pub async fn add_assets_to_album(&self, album_id: &str, ids: &[String]) -> Result<(), String> {
         for chunk in ids.chunks(500) {
             let value = self

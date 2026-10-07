@@ -3,6 +3,56 @@ use crate::{
     services::immich_client::ImmichClient,
 };
 use serde_json::{json, Value};
+use std::time::Duration;
+
+const CAPTURE_METADATA_WAIT: Duration = Duration::from_secs(30);
+const CAPTURE_METADATA_POLL: Duration = Duration::from_millis(250);
+
+fn capture_date(asset: &Value) -> Option<&str> {
+    asset
+        .pointer("/exifInfo/dateTimeOriginal")
+        .and_then(Value::as_str)
+        .filter(|date| !date.is_empty())
+}
+
+async fn extracted_capture_date(
+    client: &ImmichClient,
+    asset: &Value,
+    id: &str,
+    is_cancelled: &(impl Fn() -> bool + Send + Sync),
+) -> Result<chrono::DateTime<chrono::FixedOffset>, String> {
+    let parse = |date: &str| {
+        chrono::DateTime::parse_from_rfc3339(date)
+            .map_err(|_| "Asset capture date is invalid".to_string())
+    };
+    if let Some(date) = capture_date(asset) {
+        return parse(date);
+    }
+
+    // Search can return an uploaded asset before Immich extracts its EXIF.
+    // Never use the provisional filesystem date as the clock correction basis.
+    tokio::time::timeout(CAPTURE_METADATA_WAIT, async {
+        loop {
+            if is_cancelled() {
+                return Err("Import cancelled.".into());
+            }
+            let metadata = client.asset(id).await?;
+            if is_cancelled() {
+                return Err("Import cancelled.".into());
+            }
+            if let Some(date) = capture_date(&metadata) {
+                return parse(date);
+            }
+            tokio::time::sleep(CAPTURE_METADATA_POLL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "Capture date correction is incomplete: asset {id} has no extracted capture date after 30 seconds."
+        ))
+    })
+}
 
 pub async fn apply(
     client: &ImmichClient,
@@ -40,13 +90,7 @@ pub async fn apply(
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or("Asset has no id")?;
-            let date = asset
-                .pointer("/exifInfo/dateTimeOriginal")
-                .and_then(Value::as_str)
-                .or_else(|| asset.get("fileCreatedAt").and_then(Value::as_str))
-                .ok_or("Asset has no capture date")?;
-            let date = chrono::DateTime::parse_from_rfc3339(date)
-                .map_err(|_| "Asset capture date is invalid")?;
+            let date = extracted_capture_date(client, asset, id, &is_cancelled).await?;
             let corrected = date
                 .checked_add_signed(chrono::Duration::minutes(i64::from(
                     input.extended.clock_offset_minutes,
@@ -146,6 +190,13 @@ mod tests {
     }
 
     async fn spawn_http_stub(cancel_after: Option<usize>) -> HttpStub {
+        spawn_http_stub_with_metadata(cancel_after, Vec::new()).await
+    }
+
+    async fn spawn_http_stub_with_metadata(
+        cancel_after: Option<usize>,
+        metadata: Vec<Value>,
+    ) -> HttpStub {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (requests_tx, requests) = mpsc::unbounded_channel();
@@ -153,6 +204,7 @@ mod tests {
         let server_cancelled = Arc::clone(&cancelled);
         let handle = tokio::spawn(async move {
             let mut count = 0;
+            let mut metadata_index = 0;
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     continue;
@@ -193,9 +245,20 @@ mod tests {
                     .split_whitespace()
                     .nth(1)
                     .unwrap();
-                let payload: Value =
-                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-                let body = if path.ends_with("/assets") {
+                let payload: Value = request
+                    .split_once("\r\n\r\n")
+                    .filter(|(_, body)| !body.is_empty())
+                    .map(|(_, body)| serde_json::from_str(body).unwrap())
+                    .unwrap_or(Value::Null);
+                let body = if request.starts_with("GET ") {
+                    let row = metadata
+                        .get(metadata_index)
+                        .or_else(|| metadata.last())
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    metadata_index += 1;
+                    row.to_string()
+                } else if path.ends_with("/assets") {
                     let rows: Vec<Value> = payload["ids"]
                         .as_array()
                         .unwrap()
@@ -243,8 +306,8 @@ mod tests {
 
     fn assets() -> Vec<Value> {
         vec![
-            json!({"id": "asset-1", "fileCreatedAt": "2026-03-15T12:00:00Z"}),
-            json!({"id": "asset-2", "fileCreatedAt": "2026-03-15T13:00:00Z"}),
+            json!({"id": "asset-1", "exifInfo": {"dateTimeOriginal": "2026-03-15T12:00:00Z"}}),
+            json!({"id": "asset-2", "exifInfo": {"dateTimeOriginal": "2026-03-15T13:00:00Z"}}),
         ]
     }
 
@@ -263,6 +326,98 @@ mod tests {
             );
         }
         paths
+    }
+
+    #[tokio::test]
+    async fn clock_correction_waits_for_exif_instead_of_using_filesystem_date() {
+        let mut stub = spawn_http_stub_with_metadata(
+            None,
+            vec![
+                json!({"id": "asset-1", "fileCreatedAt": "2023-11-14T22:13:20Z",
+                    "exifInfo": {"dateTimeOriginal": null}}),
+                json!({"id": "asset-1", "fileCreatedAt": "2023-11-14T22:13:20Z",
+                    "exifInfo": {"dateTimeOriginal": "2020-01-02T03:04:05Z"}}),
+            ],
+        )
+        .await;
+        let client = ImmichClient::new(&stub.url, "test-key");
+        let mut input = input();
+        input.extended.clock_offset_minutes = 90;
+        let assets = [json!({"id": "asset-1", "fileCreatedAt": "2023-11-14T22:13:20Z"})];
+        apply(&client, &input, &assets, None, &stub.url, || false)
+            .await
+            .unwrap();
+
+        let first = stub.requests.try_recv().unwrap();
+        let second = stub.requests.try_recv().unwrap();
+        let correction = stub.requests.try_recv().unwrap();
+        assert!(first.starts_with("GET /api/assets/asset-1 "));
+        assert!(second.starts_with("GET /api/assets/asset-1 "));
+        assert!(correction.starts_with("PUT /api/assets/asset-1 "));
+        let payload: Value =
+            serde_json::from_str(correction.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(payload["dateTimeOriginal"], "2020-01-02T04:34:05+00:00");
+        assert!(stub.requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unavailable_capture_metadata_reports_incomplete_without_correction() {
+        let mut stub = spawn_http_stub_with_metadata(
+            None,
+            vec![json!({"id": "asset-1", "fileCreatedAt": "2023-11-14T22:13:20Z"})],
+        )
+        .await;
+        let client = ImmichClient::new(&stub.url, "test-key");
+        let mut input = input();
+        input.extended.clock_offset_minutes = 90;
+        let server_url = stub.url.clone();
+        let action = tokio::spawn(async move {
+            apply(
+                &client,
+                &input,
+                &[json!({"id": "asset-1", "fileCreatedAt": "2023-11-14T22:13:20Z"})],
+                None,
+                &server_url,
+                || false,
+            )
+            .await
+        });
+        let request = stub.requests.recv().await.unwrap();
+        assert!(request.starts_with("GET /api/assets/asset-1 "));
+        // Establish real HTTP I/O before advancing virtual time; otherwise an
+        // idle paused runtime can expire the request before the stub accepts it.
+        tokio::time::pause();
+        tokio::time::advance(CAPTURE_METADATA_WAIT).await;
+        assert_eq!(
+            action.await.unwrap().unwrap_err(),
+            "Capture date correction is incomplete: asset asset-1 has no extracted capture date after 30 seconds."
+        );
+        while let Ok(request) = stub.requests.try_recv() {
+            assert!(request.starts_with("GET /api/assets/asset-1 "));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_capture_metadata_wait_prevents_correction() {
+        let mut stub = spawn_http_stub_with_metadata(Some(1), vec![json!({})]).await;
+        let client = ImmichClient::new(&stub.url, "test-key");
+        let mut input = input();
+        input.extended.clock_offset_minutes = 90;
+        let cancelled = Arc::clone(&stub.cancelled);
+        assert_eq!(
+            apply(
+                &client,
+                &input,
+                &[json!({"id": "asset-1", "fileCreatedAt": "2023-11-14T22:13:20Z"})],
+                None,
+                &stub.url,
+                || cancelled.load(Ordering::SeqCst),
+            )
+            .await
+            .unwrap_err(),
+            "Import cancelled."
+        );
+        assert_eq!(request_paths(&mut stub), ["/api/assets/asset-1"]);
     }
 
     #[tokio::test]

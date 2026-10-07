@@ -469,6 +469,62 @@ fn reap_diagnostic(outcome: ReapOutcome) -> Option<String> {
     }
 }
 
+fn migration_time_zone(request: &UploadRequest) -> Option<&str> {
+    (request.extended.source == crate::services::import_source::ImportSource::Immich).then(|| {
+        request
+            .extended
+            .time_zone
+            .as_deref()
+            .map(str::trim)
+            .filter(|zone| !zone.is_empty())
+            .unwrap_or("UTC")
+    })
+}
+
+// Match immich-go v0.32.0's internal/filetypes/supported.go, not the narrower
+// preview allowlist. Its folder reader ignores --include-type.
+const UPLOAD_VIDEO_EXTENSIONS: &[&str] = &[
+    ".3gp", ".avi", ".flv", ".insv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpg", ".mts",
+    ".webm", ".wmv",
+];
+const UPLOAD_IMAGE_EXTENSIONS: &[&str] = &[
+    ".3fr", ".ari", ".arw", ".avif", ".bmp", ".cap", ".cin", ".cr2", ".cr3", ".crw", ".dcr",
+    ".dng", ".erf", ".fff", ".gif", ".heic", ".heif", ".hif", ".iiq", ".insp", ".jpe", ".jpeg",
+    ".jpg", ".jxl", ".k25", ".kdc", ".mrw", ".nef", ".orf", ".ori", ".pef", ".png", ".psd", ".raf",
+    ".raw", ".rw2", ".rwl", ".sr2", ".srf", ".srw", ".tif", ".tiff", ".webp", ".x3f",
+];
+
+fn included_extensions(request: &UploadRequest) -> Option<String> {
+    let type_extensions = if request.extended.source.folder_options() {
+        match request.include_type.as_deref() {
+            Some("VIDEO") => Some(UPLOAD_VIDEO_EXTENSIONS),
+            Some("IMAGE") => Some(UPLOAD_IMAGE_EXTENSIONS),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(extensions) = type_extensions {
+        let mut included = String::new();
+        for extension in extensions.iter().copied().filter(|extension| {
+            request.include_extensions.is_empty()
+                || request
+                    .include_extensions
+                    .iter()
+                    .any(|requested| requested.eq_ignore_ascii_case(extension))
+        }) {
+            included.push_str(extension);
+            included.push(',');
+        }
+        // Sidecars remain readable, and a disjoint type/extension intersection
+        // must not become an empty list, which immich-go interprets as all media.
+        included.push_str(".json,.xmp");
+        Some(included)
+    } else {
+        (!request.include_extensions.is_empty()).then(|| request.include_extensions.join(","))
+    }
+}
+
 /// Build the immich-go `upload from-folder` argument vector for a run. Pure (no
 /// I/O) so the flag mapping — especially the organization-mode -> folder/album/
 /// tag flags — is unit-testable. The API key travels in `config_path`, never on
@@ -529,12 +585,14 @@ fn build_upload_args(request: &UploadRequest, config_path: &Path) -> Vec<String>
     if request.extended.dry_run {
         args.push("--dry-run".to_string());
     }
-    if let Some(zone) = request
-        .extended
-        .time_zone
-        .as_deref()
-        .filter(|v| !v.trim().is_empty())
-    {
+    if let Some(zone) = migration_time_zone(request).or_else(|| {
+        request
+            .extended
+            .time_zone
+            .as_deref()
+            .map(str::trim)
+            .filter(|zone| !zone.is_empty())
+    }) {
         args.push(format!("--time-zone={zone}"));
     }
     if request.extended.source.folder_options() {
@@ -588,11 +646,8 @@ fn build_upload_args(request: &UploadRequest, config_path: &Path) -> Vec<String>
             args.push(format!("--include-type={include_type}"));
         }
     }
-    if !request.include_extensions.is_empty() {
-        args.push(format!(
-            "--include-extensions={}",
-            request.include_extensions.join(",")
-        ));
+    if let Some(extensions) = included_extensions(request) {
+        args.push(format!("--include-extensions={extensions}"));
     }
     if !request.exclude_extensions.is_empty() {
         args.push(format!(
@@ -797,20 +852,25 @@ pub async fn run_upload(
     let args = build_upload_args(&request, &config.path);
 
     let (mut rx, child) = if let Some(app) = &app {
-        let (rx, child) = app
+        let mut command = app
             .shell()
             .sidecar("immich-go")
             .map_err(|e| RunUploadError::Other(e.to_string()))?
-            .env("GODEBUG", "netdns=cgo")
-            .args(args)
-            .spawn()
-            .map_err(|e| {
-                RunUploadError::Other(format!("Could not spawn immich-go sidecar: {e}"))
-            })?;
+            .env("GODEBUG", "netdns=cgo");
+        if let Some(zone) = migration_time_zone(&request) {
+            // immich-go converts API timestamps to time.Local, then formats
+            // multipart dates with a literal Z. A migration must not inherit
+            // the desktop zone when the user requests no override.
+            command = command.env("TZ", zone);
+        }
+        let (rx, child) = command.args(args).spawn().map_err(|e| {
+            RunUploadError::Other(format!("Could not spawn immich-go sidecar: {e}"))
+        })?;
         (rx, RunningChild::Desktop(child))
     } else {
         let (rx, child) =
-            crate::services::headless_process::spawn(args).map_err(RunUploadError::Other)?;
+            crate::services::headless_process::spawn(args, migration_time_zone(&request))
+                .map_err(RunUploadError::Other)?;
         (rx, RunningChild::Headless(child))
     };
     let mut child = Some(child);
@@ -1038,8 +1098,73 @@ mod tests {
         req.exclude_extensions = vec![".gif".to_string()];
         let args = build_upload_args(&req, Path::new("/cfg.yaml"));
         assert!(args.contains(&"--include-type=VIDEO".to_string()));
-        assert!(args.contains(&"--include-extensions=.mp4,.mov".to_string()));
+        assert!(args.contains(&"--include-extensions=.mov,.mp4,.json,.xmp".to_string()));
         assert!(args.contains(&"--exclude-extensions=.gif".to_string()));
+    }
+
+    #[test]
+    fn folder_type_filters_use_all_uploader_formats_not_only_preview_formats() {
+        for (kind, expected, forbidden) in [("VIDEO", ".mts", ".jpg"), ("IMAGE", ".cr3", ".mp4")] {
+            let mut req = request(Organization::SingleAlbum, None);
+            req.include_type = Some(kind.into());
+            let args = build_upload_args(&req, Path::new("/cfg.yaml"));
+            let extensions = args
+                .iter()
+                .find_map(|arg| arg.strip_prefix("--include-extensions="))
+                .unwrap()
+                .split(',')
+                .collect::<Vec<_>>();
+            assert!(extensions.contains(&expected));
+            assert!(!extensions.contains(&forbidden));
+            assert!(extensions.contains(&".json") && extensions.contains(&".xmp"));
+        }
+    }
+
+    #[test]
+    fn folder_type_filters_intersect_explicit_extensions_without_widening_empty_matches() {
+        for (requested, expected) in [
+            (vec![".jpg", ".mp4", ".mts"], ".mp4,.mts,.json,.xmp"),
+            (vec![".jpg"], ".json,.xmp"),
+        ] {
+            let mut req = request(Organization::SingleAlbum, None);
+            req.include_type = Some("VIDEO".into());
+            req.include_extensions = requested.into_iter().map(str::to_string).collect();
+            req.exclude_extensions = vec![".mts".into()];
+            let args = build_upload_args(&req, Path::new("/cfg.yaml"));
+            assert!(args.contains(&format!("--include-extensions={expected}")));
+            assert!(args.contains(&"--exclude-extensions=.mts".into()));
+        }
+    }
+
+    #[test]
+    fn no_type_filter_preserves_explicit_extensions_and_unfiltered_selections() {
+        let mut req = request(Organization::SingleAlbum, None);
+        req.include_extensions = vec![".jpg".into(), ".webm".into()];
+        let args = build_upload_args(&req, Path::new("/cfg.yaml"));
+        assert!(args.contains(&"--include-extensions=.jpg,.webm".into()));
+        req.include_extensions.clear();
+        let args = build_upload_args(&req, Path::new("/cfg.yaml"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("--include-extensions=")));
+    }
+
+    #[test]
+    fn migration_defaults_to_utc_for_both_arguments_and_process_environment() {
+        let mut req = request(Organization::SingleAlbum, None);
+        req.extended.source = crate::services::import_source::ImportSource::Immich;
+        for zone in [None, Some(""), Some(" \t ")] {
+            req.extended.time_zone = zone.map(str::to_string);
+            let args = build_upload_args(&req, Path::new("/cfg.yaml"));
+            assert!(args.contains(&"--time-zone=UTC".into()));
+            assert_eq!(migration_time_zone(&req), Some("UTC"));
+        }
+        req.extended.time_zone = Some("Europe/Amsterdam".into());
+        let args = build_upload_args(&req, Path::new("/cfg.yaml"));
+        assert!(args.contains(&"--time-zone=Europe/Amsterdam".into()));
+        assert_eq!(migration_time_zone(&req), Some("Europe/Amsterdam"));
+        req.extended.source = crate::services::import_source::ImportSource::Folder;
+        assert_eq!(migration_time_zone(&req), None);
     }
 
     #[test]

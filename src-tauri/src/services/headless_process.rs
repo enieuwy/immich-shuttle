@@ -69,7 +69,10 @@ fn drain(mut input: impl Read + Send + 'static, tx: Sender<CommandEvent>, stderr
     });
 }
 
-pub fn spawn(args: Vec<String>) -> Result<(Receiver<CommandEvent>, NativeChild), String> {
+pub fn spawn(
+    args: Vec<String>,
+    time_zone: Option<&str>,
+) -> Result<(Receiver<CommandEvent>, NativeChild), String> {
     let mut command = Command::new(sidecar_path()?);
     command
         .args(args)
@@ -77,6 +80,9 @@ pub fn spawn(args: Vec<String>) -> Result<(Receiver<CommandEvent>, NativeChild),
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(zone) = time_zone {
+        command.env("TZ", zone);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

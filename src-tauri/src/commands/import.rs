@@ -1276,12 +1276,30 @@ fn import_error_log_line(job_id: &str, error: &FileError) -> String {
     )
 }
 
+/// Assets immich-go offered but left unprocessed, for the run's fault and
+/// gates. A dry run plans without uploading, so its tracking report says
+/// nothing about unfinished work; intentional filtering is reported by
+/// immich-go as Discarded, never Pending, and is not counted by the parser.
+fn unfinished_assets(pending_assets: u32, dry_run: bool) -> u32 {
+    if dry_run {
+        0
+    } else {
+        pending_assets
+    }
+}
+
+/// Whether the run can account for every file it touched AND every asset it
+/// was offered. Gates both the wipe prompt and the checkpoint.
 fn manifest_evidence_is_complete(
     manifest_present: bool,
     unmanifested_paths: usize,
     unresolved_file_events: u32,
+    unfinished_assets: u32,
 ) -> bool {
-    manifest_present && unmanifested_paths == 0 && unresolved_file_events == 0
+    manifest_present
+        && unmanifested_paths == 0
+        && unresolved_file_events == 0
+        && unfinished_assets == 0
 }
 
 /// Error returned when the renderer asks to import an explicitly empty subset.
@@ -1607,6 +1625,9 @@ struct RunFaultInputs<'a> {
     unmanifested_paths: usize,
     /// `file=` records in the run log that resolved to no invocation root.
     unresolved_file_events: u32,
+    /// Offered assets that never reached a final state (see
+    /// `unfinished_assets`).
+    unfinished_assets: u32,
 }
 
 /// The aggregate faults of a completed run, one user-facing clause each, or
@@ -1646,6 +1667,7 @@ fn aggregate_fault_reasons(inputs: RunFaultInputs<'_>) -> Vec<String> {
         manifest_present,
         unmanifested_paths,
         unresolved_file_events,
+        unfinished_assets,
     } = inputs;
     let mut reasons = Vec::new();
     match outcome {
@@ -1695,6 +1717,11 @@ fn aggregate_fault_reasons(inputs: RunFaultInputs<'_>) -> Vec<String> {
     if unresolved_file_events > 0 {
         reasons.push(format!(
             "{unresolved_file_events} upload result(s) in the run log could not be matched to a source file, so those files were kept."
+        ));
+    }
+    if unfinished_assets > 0 {
+        reasons.push(format!(
+            "{unfinished_assets} asset(s) were found but never uploaded, skipped, or reported as failed by immich-go, so they are still pending."
         ));
     }
     reasons
@@ -2784,10 +2811,12 @@ pub async fn start_import(
                 completed_asset_paths.len(),
                 run.scan_errors,
             );
+            let unfinished = unfinished_assets(run.pending_assets, extended.dry_run);
             let evidence_complete = manifest_evidence_is_complete(
                 pre_sidecar_manifest.is_some(),
                 unmanifested_paths,
                 run.unresolved_file_events,
+                unfinished,
             );
             let wipe_eligible =
                 classified_wipe_eligible && evidence_complete && folder_source && !extended.dry_run;
@@ -2823,6 +2852,7 @@ pub async fn start_import(
                 manifest_present: pre_sidecar_manifest.is_some(),
                 unmanifested_paths,
                 unresolved_file_events: run.unresolved_file_events,
+                unfinished_assets: unfinished,
             });
             incomplete = !faults.is_empty();
             let mut pending_wipe_stored = false;
@@ -4055,6 +4085,7 @@ mod tests {
             manifest_present: true,
             unmanifested_paths: 0,
             unresolved_file_events: 0,
+            unfinished_assets: 0,
         }
     }
 
@@ -5392,6 +5423,114 @@ mod tests {
         assert_eq!(plan.album_link_name.as_deref(), Some("Holiday"));
     }
 
+    /// The run-log tail immich-go 0.32.0 wrote for malformed Takeout JSON: one
+    /// image discovered, nothing uploaded, exit 0, `Pending: 1`.
+    const PENDING_TAIL: &str = "2026-10-07 23:43:00 INF   Processed:           0  (0 B)\n\
+2026-10-07 23:43:00 INF   Discarded:           0  (0 B)\n\
+2026-10-07 23:43:00 INF   Errors:              0  (0 B)\n\
+2026-10-07 23:43:00 INF   Pending:             1  (816 B)\n";
+
+    /// Terminal evidence the way the finalizer assembles it for a clean exit.
+    fn pending_run_evidence(
+        run: &crate::services::stdout_parser::RunProgress,
+        dry_run: bool,
+    ) -> (RunClassification, bool, TerminalEvidence) {
+        let unfinished = unfinished_assets(run.pending_assets, dry_run);
+        let classification = classify_completed_run(
+            run.progress.uploaded,
+            run.progress.duplicates,
+            CLEAN_EXIT,
+            0,
+            false,
+            run.completed_paths.len(),
+            run.scan_errors,
+        );
+        let complete = manifest_evidence_is_complete(true, 0, 0, unfinished);
+        let faults = aggregate_fault_reasons(RunFaultInputs {
+            unfinished_assets: unfinished,
+            ..clean_fault_inputs()
+        });
+        let evidence = terminal_evidence(RunEvidenceInputs {
+            failed: matches!(classification.status, JobStatus::Failed),
+            progress: run.progress.clone(),
+            file_error_count: 0,
+            faults: &faults,
+            keep_files: false,
+            awaiting_wipe_confirmation: false,
+            pending_wipe_store_failed: false,
+        });
+        (classification, complete, evidence)
+    }
+
+    #[test]
+    fn pending_assets_with_a_clean_exit_set_error_and_block_wipe_and_checkpoint() {
+        let root = "/media/takeout";
+        let log = format!(
+            "2026-10-07 23:42:59 INF discovered image file=takeout:Takeout/broken.jpg\n{PENDING_TAIL}"
+        );
+        let run = crate::services::stdout_parser::parse_run_progress(&log, &[root.into()], None);
+        assert_eq!(run.pending_assets, 1);
+        let (classification, complete, evidence) = pending_run_evidence(&run, false);
+        assert!(!complete, "unfinished assets withhold wipe and checkpoint");
+        let error = evidence.error.expect("pending assets are a terminal fault");
+        assert!(error.contains("1 asset(s)"), "{error}");
+        // `error` set is what makes callback `success` and the CLI exit read
+        // false; nothing about the exit code can restore either.
+        assert!(evidence.summary.unwrap().contains("did not finish cleanly"));
+        // The gate in the finalizer: wipe/checkpoint need the classification
+        // AND complete evidence.
+        assert!(!(classification.wipe_eligible && complete));
+        assert!(!(classification.checkpoint_eligible && complete));
+    }
+
+    #[test]
+    fn a_landed_run_with_pending_assets_stays_completed_but_is_incomplete() {
+        let root = "/media/card";
+        let log = format!(
+            "2026-10-07 23:42:59 INF uploaded successfully file={root}:DCIM/IMG_1.JPG\n{PENDING_TAIL}"
+        );
+        let run = crate::services::stdout_parser::parse_run_progress(&log, &[root.into()], None);
+        assert_eq!(run.progress.uploaded, 1);
+        let (classification, complete, evidence) = pending_run_evidence(&run, false);
+        assert!(
+            matches!(classification.status, JobStatus::Completed),
+            "the partial-landed status policy is unchanged"
+        );
+        assert!(
+            classification.wipe_eligible && classification.checkpoint_eligible,
+            "the classifier alone would have allowed both"
+        );
+        assert!(!complete, "but the pending asset withholds them");
+        assert!(evidence.error.is_some(), "and the job carries an error");
+    }
+
+    #[test]
+    fn clean_filtered_and_dry_runs_have_no_unfinished_assets() {
+        let root = "/media/card";
+        // Filtering reports Discarded, not Pending.
+        let filtered = format!(
+            "2026-10-07 23:42:59 INF uploaded successfully file={root}:a.jpg\n\
+2026-10-07 23:43:00 INF   Processed:           1  (1 B)\n\
+2026-10-07 23:43:00 INF   Discarded:           4  (4 B)\n\
+2026-10-07 23:43:00 INF   Errors:              0  (0 B)\n\
+2026-10-07 23:43:00 INF   Pending:             0  (0 B)\n"
+        );
+        let run =
+            crate::services::stdout_parser::parse_run_progress(&filtered, &[root.into()], None);
+        let (classification, complete, evidence) = pending_run_evidence(&run, false);
+        assert!(complete);
+        assert!(classification.wipe_eligible && classification.checkpoint_eligible);
+        assert!(evidence.error.is_none());
+
+        // A dry run's report is not unfinished work.
+        let dry =
+            crate::services::stdout_parser::parse_run_progress(PENDING_TAIL, &[root.into()], None);
+        assert_eq!(dry.pending_assets, 1);
+        let (_, complete, evidence) = pending_run_evidence(&dry, true);
+        assert!(complete);
+        assert!(evidence.error.is_none());
+    }
+
     /// PARTIAL-RUN-LOOKS-CLEAN: one photo uploads, immich-go then reports an
     /// aggregate ERR with no `file=` (the source could not be enumerated) and
     /// exits non-zero. The landed asset clears `failed`, so the run stays
@@ -6410,7 +6549,8 @@ mod tests {
             completed.len(),
             0,
         );
-        let evidence_complete = manifest_evidence_is_complete(true, 0, run.unresolved_file_events);
+        let evidence_complete =
+            manifest_evidence_is_complete(true, 0, run.unresolved_file_events, 0);
         assert!(!evidence_complete);
         assert!(
             !(classification.wipe_eligible && evidence_complete),

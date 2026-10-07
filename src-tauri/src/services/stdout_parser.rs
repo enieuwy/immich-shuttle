@@ -32,6 +32,11 @@ pub struct RunProgress {
     /// the local invocation roots nor the selected source server's asset IDs.
     /// A parse miss must remain visible rather than silently zeroing a tally.
     pub unresolved_file_events: u32,
+    /// Assets immich-go offered but never brought to a final state, from the
+    /// `Pending:` row of its end-of-run "Asset Tracking Report" (summed over
+    /// every report in the log). Processed, Discarded (intentional filtering)
+    /// and Errors rows are not unfinished work and are not counted here.
+    pub pending_assets: u32,
 }
 
 /// Truncate an unquoted attribute value at the RIGHTMOST occurrence of each
@@ -278,6 +283,8 @@ pub struct ProgressAccumulator {
     /// Upload/duplicate events that match neither invocation roots nor the
     /// selected source server's asset IDs. Keep format drift visible.
     unresolved_file_events: u32,
+    /// `Pending:` rows of the end-of-run Asset Tracking Report, summed.
+    pending_assets: u32,
     /// A trailing line not yet terminated by '\n'; reparsed once its rest arrives.
     pending: String,
     source_paths: Vec<String>,
@@ -342,6 +349,7 @@ impl ProgressAccumulator {
             completed_paths: self.completed_paths.clone(),
             scan_errors: self.scan_errors,
             unresolved_file_events: self.unresolved_file_events,
+            pending_assets: self.pending_assets,
         }
     }
 
@@ -369,6 +377,20 @@ impl ProgressAccumulator {
         let Some(message) = info_line_message(line) else {
             return;
         };
+        // The report row is the only INF message that begins with indentation
+        // (see `info_line_message`), so a filename cannot forge it: file
+        // events begin with their event name. Format, from immich-go 0.32.0:
+        // `  Pending:             1  (816 B)`.
+        if let Some(rest) = message.strip_prefix("  Pending:") {
+            if let Some(count) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|count| count.parse::<u32>().ok())
+            {
+                self.pending_assets = self.pending_assets.saturating_add(count);
+            }
+            return;
+        }
         let uploaded = message.starts_with("uploaded successfully");
         if uploaded || message.starts_with("server has duplicate") {
             // `file` is terminal: embedded attribute-like text belongs to the
@@ -495,6 +517,69 @@ mod tests {
 2026-06-24 16:10:32 INF   discovered image                   :     193  (3.8 GB)\n\
 2026-06-24 16:10:32 INF   uploaded successfully              :      50  (3.3 GB)\n\
 2026-06-24 16:10:32 INF   server has duplicate               :     144  (2.9 GB)";
+
+    /// The end-of-run report immich-go 0.32.0 writes, with the given rows.
+    fn tracking_report(processed: u32, discarded: u32, errors: u32, pending: u32) -> String {
+        format!(
+            "2026-10-07 23:43:00 INF Asset Tracking Report:\n\
+2026-10-07 23:43:00 INF =====================\n\
+2026-10-07 23:43:00 INF Total Assets:          {total}  (816 B)\n\
+2026-10-07 23:43:00 INF   Processed:           {processed}  (0 B)\n\
+2026-10-07 23:43:00 INF   Discarded:           {discarded}  (0 B)\n\
+2026-10-07 23:43:00 INF   Errors:              {errors}  (0 B)\n\
+2026-10-07 23:43:00 INF   Pending:             {pending}  (816 B)\n",
+            total = processed + discarded + errors + pending
+        )
+    }
+
+    #[test]
+    fn pending_row_of_the_asset_tracking_report_is_counted() {
+        // Captured shape: malformed Takeout JSON, one discovered image, no upload.
+        let log = format!(
+            "2026-10-07 23:42:59 INF discovered image file=takeout:Takeout/broken.jpg\n\
+2026-10-07 23:42:59 WRN missing metadata file=takeout:Takeout/broken.jpg\n{}\
+2026-10-07 23:43:00 INF ⚠️  WARNING: 1 assets did not reach a final state!\n",
+            tracking_report(0, 0, 0, 1)
+        );
+        let run = parse_run_progress(&log, &["/media/takeout".to_string()], None);
+        assert_eq!(run.pending_assets, 1);
+        assert_eq!(run.progress.uploaded, 0);
+        assert_eq!(run.progress.total, 1);
+    }
+
+    #[test]
+    fn clean_and_filtered_reports_have_no_pending_assets() {
+        // Discarded is intentional filtering; Errors are per-file failures.
+        let log = tracking_report(3, 2, 1, 0);
+        assert_eq!(parse_run_progress(&log, &[], None).pending_assets, 0);
+        assert_eq!(parse_run_progress("", &[], None).pending_assets, 0);
+    }
+
+    #[test]
+    fn pending_rows_sum_across_reports_and_survive_chunking() {
+        let log = format!(
+            "{}{}",
+            tracking_report(1, 0, 0, 2),
+            tracking_report(0, 0, 0, 3)
+        );
+        let whole = parse_run_progress(&log, &[], None);
+        assert_eq!(whole.pending_assets, 5);
+        let mut acc = ProgressAccumulator::with_source(&[], None);
+        for chunk in log.as_bytes().chunks(7) {
+            acc.push_chunk(&String::from_utf8_lossy(chunk));
+        }
+        acc.finish();
+        assert_eq!(acc.snapshot().pending_assets, 5);
+    }
+
+    #[test]
+    fn a_filename_cannot_forge_a_pending_row() {
+        let log = "2026-10-07 23:43:00 INF uploaded successfully file=/r:a/  Pending: 9\n";
+        assert_eq!(
+            parse_run_progress(log, &["/r".to_string()], None).pending_assets,
+            0
+        );
+    }
 
     #[test]
     fn counts_events_not_summary_report() {
