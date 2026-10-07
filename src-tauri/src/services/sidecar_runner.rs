@@ -866,6 +866,47 @@ mod tests {
     }
 
     #[test]
+    fn date_range_discards_blank_values_and_trims_a_nonempty_range() {
+        let mut req = request(Organization::SingleAlbum, None);
+        for (range, expected) in [
+            ("", None),
+            (" \t\n ", None),
+            (
+                "  2026-01-01,2026-01-31  ",
+                Some("--date-range=2026-01-01,2026-01-31"),
+            ),
+        ] {
+            req.date_range = Some(range.to_string());
+            let args = build_upload_args(&req, Path::new("/cfg.yaml"));
+            let ranges: Vec<&str> = args
+                .iter()
+                .filter(|arg| arg.starts_with("--date-range"))
+                .map(String::as_str)
+                .collect();
+            assert_eq!(ranges, expected.into_iter().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn concurrent_tasks_omits_zero_and_preserves_positive_limits() {
+        let mut req = request(Organization::SingleAlbum, None);
+        for (tasks, expected) in [
+            (0, None),
+            (1, Some("--concurrent-tasks=1")),
+            (16, Some("--concurrent-tasks=16")),
+        ] {
+            req.concurrent_tasks = Some(tasks);
+            let args = build_upload_args(&req, Path::new("/cfg.yaml"));
+            let limits: Vec<&str> = args
+                .iter()
+                .filter(|arg| arg.starts_with("--concurrent-tasks"))
+                .map(String::as_str)
+                .collect();
+            assert_eq!(limits, expected.into_iter().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
     fn resilience_and_tag_flags_absent_by_default() {
         let args = args_for(Organization::SingleAlbum, None);
         assert!(!args.iter().any(|a| a.starts_with("--on-errors")));

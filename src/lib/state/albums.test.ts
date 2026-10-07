@@ -202,6 +202,46 @@ describe("albumsState", () => {
     expect(get(albumsState).selectedAlbumIds).toEqual(["a2"]);
   });
 
+  it.each([
+    {
+      failUsers: false,
+      warning: 'Album "Holiday" created, but could not create a public link.',
+    },
+    {
+      failUsers: true,
+      warning:
+        'Album "Holiday" created, but could not share it with the selected users and could not create a public link.',
+    },
+  ])("keeps the album after link failure (user sharing fails: $failUsers)", async ({ failUsers, warning }) => {
+    await useProfile();
+    await albumsState.loadAlbums();
+    // A previous successful link must not survive the failed follow-up.
+    await albumsState.createAlbum("Previous", [], true);
+    albumsState.selectAlbum("a1");
+    const album = { id: `link-failure-${failUsers}`, album_name: "Holiday", shared_with: [] };
+    vi.mocked(api.albumCreate).mockResolvedValueOnce(album);
+    const reportError = vi.spyOn(errorsState, "addError");
+    try {
+      if (failUsers) {
+        vi.mocked(api.albumShareUsers).mockRejectedValueOnce(new Error("share failed"));
+      }
+      vi.mocked(api.albumShareLink).mockRejectedValueOnce(new Error("link failed"));
+
+      const created = await albumsState.createAlbum("Holiday", ["u1"], true);
+
+      expect(created).toEqual(album);
+      expect(get(albumsState).availableAlbums).toContainEqual(created);
+      expect(get(albumsState).selectedAlbumIds).toEqual([album.id]);
+      expect(get(albumsState).selectedAlbums).toEqual([created]);
+      expect(get(albumsState).shareLinkUrl).toBeNull();
+      expect(get(albumsState).creating).toBe(false);
+      expect(reportError).toHaveBeenCalledTimes(1);
+      expect(reportError).toHaveBeenCalledWith(warning);
+    } finally {
+      reportError.mockRestore();
+    }
+  });
+
   it("forwards the share role (defaulting to viewer) to albumShareUsers", async () => {
     await useProfile();
 

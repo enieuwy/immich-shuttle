@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+- Folder-name, folder-path, and folder-tag imports ignore the selected single album without clearing the picker.
+- Forecast requests reject an empty source list before taking the forecast slot or reading credentials.
+- Log reads and appends accept only supported log basenames and reject existing symbolic links.
+- Invalid server URLs no longer retain credentials or appear verbatim in API errors.
+- Host-side album navigation rejects URL syntax inside album IDs.
+- Windows mount-root checks use the existing bounded volume-identity probe.
+- The safety-lease error now explains that it blocks all imports until restart.
+
+### Maintenance
+- Add coverage for credential rollback, album sharing, avatar responses, error classification, album resolution, and failed wipe reads.
+- Replace polling and host probes in selected tests with explicit synchronization, injected probes, or virtual time.
+- Document the source guard as a consistency check, not independent proof of user consent.
+
+### Known limits
+- The final checksum and path-based Trash operation are separate. A concurrent pathname replacement can still occur between them.
+- Some import admission and finalization paths still perform synchronous filesystem calls on the async runtime.
+
 ## v0.8.1 - 2026-09-03
 
 ### Safety

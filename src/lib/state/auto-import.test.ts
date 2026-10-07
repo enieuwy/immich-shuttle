@@ -309,7 +309,7 @@ describe("autoImportState", () => {
   });
 
   it("accept replays a saved rule's profile, album, and wipe policy", async () => {
-    deviceRulesState.saveRule(card, savedRule);
+    deviceRulesState.saveRule(card, { ...savedRule, organization: "single_album" });
     autoImportState.setEnabled(true);
     autoImportState.observe([]);
     autoImportState.observe([card]);
@@ -323,7 +323,7 @@ describe("autoImportState", () => {
       keep_files: false,
       stack_raw_jpeg: false,
       stack_burst: true,
-      organization: "folder_path",
+      organization: "single_album",
     });
   });
 
@@ -434,12 +434,13 @@ describe("autoImportState", () => {
   });
 
   it("offers a legacy rule as unconfirmed and keeps originals without a fresh confirmation", async () => {
-    deviceRulesState._reset({ "name:CANON_EOS": savedRule });
+    const rule = { ...savedRule, organization: "single_album" as const };
+    deviceRulesState._reset({ "name:CANON_EOS": rule });
     autoImportState.setEnabled(true);
     autoImportState.observe([]);
     autoImportState.observe([card]);
 
-    expect(get(autoImportState).candidateRule).toEqual(savedRule);
+    expect(get(autoImportState).candidateRule).toEqual(rule);
     expect(get(autoImportState).candidateRuleNeedsConfirmation).toBe(true);
 
     await autoImportState.accept();
@@ -450,7 +451,7 @@ describe("autoImportState", () => {
     // The migrated rule records what was actually confirmed, so the next insert of this
     // card cannot resurrect the unconfirmed delete policy.
     expect(deviceRulesState.lookup(card)).toEqual({
-      rule: { ...savedRule, keepFiles: true },
+      rule: { ...rule, keepFiles: true },
       needsConfirmation: false,
     });
   });

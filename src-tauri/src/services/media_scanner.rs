@@ -98,6 +98,15 @@ pub(crate) fn acquire_scan_roots_with_grace(
     roots: &[String],
     grace: Duration,
 ) -> Result<InFlightScanRoots, String> {
+    acquire_scan_roots_before_wait(purpose, roots, grace, || {})
+}
+
+fn acquire_scan_roots_before_wait(
+    purpose: ScanPurpose,
+    roots: &[String],
+    grace: Duration,
+    mut before_wait: impl FnMut(),
+) -> Result<InFlightScanRoots, String> {
     let keys = claim_keys(purpose, roots);
     let (lock, released) = &*IN_FLIGHT_SCAN_ROOTS;
     let mut in_flight = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -110,6 +119,7 @@ pub(crate) fn acquire_scan_roots_with_grace(
                 roots[taken]
             ));
         }
+        before_wait();
         let (guard, _) = released
             .wait_timeout(in_flight, remaining)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -545,23 +555,39 @@ mod tests {
 
     #[test]
     fn a_released_walk_admits_the_next_claim_without_waiting_out_the_grace() {
-        use std::{thread, time::Duration};
+        use std::{sync::mpsc, thread};
 
         let root = format!("/slow-but-alive-{}", Uuid::new_v4());
         let guard = acquire_scan_roots(ScanPurpose::Scan, std::slice::from_ref(&root))
             .expect("first walk claims root");
-        // Models the real sequence: the caller cancels the previous walk, which
-        // then returns at its next entry while the new claim is already waiting.
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(150));
-            drop(guard);
+        let (waiting_tx, waiting_rx) = mpsc::sync_channel(0);
+        let (claimed_tx, claimed_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let mut waiting = Some(waiting_tx);
+            let second = acquire_scan_roots_before_wait(
+                ScanPurpose::Scan,
+                std::slice::from_ref(&root),
+                CLAIM_GRACE,
+                || {
+                    if let Some(waiting) = waiting.take() {
+                        waiting.send(()).expect("signal the waiting claim");
+                    }
+                },
+            );
+            claimed_tx.send(second).expect("publish the next claim");
         });
 
-        let started = Instant::now();
-        let second = acquire_scan_roots(ScanPurpose::Scan, std::slice::from_ref(&root))
-            .expect("a walk that returns must not fail the next claim");
-        assert!(started.elapsed() < CLAIM_GRACE);
-        drop(second);
+        // The claimant holds the registry lock until it enters the condition
+        // wait, so this drop cannot release the root before the wait starts.
+        waiting_rx.recv().expect("the next claim is waiting");
+        drop(guard);
+        let second = claimed_rx.recv_timeout(CLAIM_GRACE / 2);
+        worker.join().expect("the claimant exits");
+        drop(
+            second
+                .expect("guard release wakes the claimant before the grace expires")
+                .expect("the released root admits the next claim"),
+        );
     }
 
     #[test]

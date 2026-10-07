@@ -183,8 +183,7 @@ fn append_path_segments<'a>(
 }
 
 fn api_endpoint_urls(server_url: &str, endpoint_segments: &[&str]) -> Result<Vec<Url>, String> {
-    let base =
-        server_base_url(server_url).ok_or_else(|| format!("Invalid server URL: {server_url}"))?;
+    let base = server_base_url(server_url).ok_or_else(|| "Invalid server URL".to_string())?;
 
     // Prefer Immich's standard `/api` path, then retry the bare endpoint for a
     // reverse proxy that strips `/api`.
@@ -841,7 +840,7 @@ fn share_link_payload(album_id: &str) -> Value {
 pub fn normalize_server_url(value: &str) -> String {
     let trimmed = value.trim();
     let Some(url) = server_base_url(trimmed) else {
-        return trimmed.trim_end_matches('/').to_string();
+        return String::new();
     };
 
     let serialized = url.as_str();
@@ -995,6 +994,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_images_reject_redirects_and_invalid_content() {
+        let mut target = spawn_http_stub(|_| http_response("200 OK", &[], "{}")).await;
+        let destination = target.url.clone();
+        let source =
+            spawn_http_stub(move |_| http_response("302 Found", &[("location", &destination)], ""))
+                .await;
+        assert_eq!(
+            ImmichClient::new(&source.url, "test-key")
+                .get_profile_image("user")
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(target.requests.try_recv().is_err());
+        for (mime, body) in [("text/html", "GIF89a"), ("image/gif", "not an image")] {
+            let stub = spawn_http_stub(move |_| format!("HTTP/1.1 200 OK\r\ncontent-type: {mime}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())).await;
+            assert_eq!(
+                ImmichClient::new(&stub.url, "test-key")
+                    .get_profile_image("user")
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_image_falls_back_and_uses_the_content_signature() {
+        let mut stub = spawn_http_stub(|request| {
+            if request.starts_with("GET /api/") {
+                http_response("404 Not Found", &[], "")
+            } else {
+                "HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: 6\r\nconnection: close\r\n\r\nGIF89a".to_string()
+            }
+        }).await;
+        assert_eq!(
+            ImmichClient::new(&stub.url, "test-key")
+                .get_profile_image("user")
+                .await
+                .unwrap(),
+            Some((b"GIF89a".to_vec(), "image/gif".to_string()))
+        );
+        assert!(next_request(&mut stub)
+            .await
+            .starts_with("GET /api/users/user/profile-image "));
+        assert!(next_request(&mut stub)
+            .await
+            .starts_with("GET /users/user/profile-image "));
+    }
+
+    #[tokio::test]
+    async fn album_sharing_rejects_invalid_roles_before_network_access() {
+        let mut stub = spawn_http_stub(|_| http_response("200 OK", &[], "{}")).await;
+        let client = ImmichClient::new(&stub.url, "test-key");
+        for role in ["admin", "owner", ""] {
+            assert!(client
+                .share_album_users("album", &["user".to_string()], role)
+                .await
+                .unwrap_err()
+                .starts_with("Invalid album share role:"));
+        }
+        assert!(stub.requests.try_recv().is_err());
+        for role in ["viewer", "editor"] {
+            client
+                .share_album_users("album", &["user".to_string()], role)
+                .await
+                .unwrap();
+            let request = next_request(&mut stub).await;
+            assert!(request.starts_with("PUT /api/albums/album/users "));
+            let body: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({"albumUsers": [{"userId": "user", "role": role}]})
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn authenticated_json_redirects_follow_only_the_same_origin() {
         const API_KEY: &str = "redirect-test-api-key";
 
@@ -1035,12 +1113,7 @@ mod tests {
             .expect_err("cross-origin redirect must be refused");
         assert!(error.contains("302"), "unexpected redirect error: {error}");
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                cross_origin_target.requests.recv()
-            )
-            .await
-            .is_err(),
+            cross_origin_target.requests.try_recv().is_err(),
             "the client followed the cross-origin redirect"
         );
     }
@@ -1459,6 +1532,23 @@ mod tests {
         ] {
             assert_eq!(normalize_server_url(input), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_server_urls_do_not_survive_normalization_or_errors() {
+        let malformed = "https://test-user:test-password@";
+        assert_eq!(normalize_server_url(malformed), "");
+        assert_eq!(
+            super::api_endpoint_urls(malformed, &["server", "ping"]).unwrap_err(),
+            "Invalid server URL"
+        );
+        assert_eq!(
+            ImmichClient::new(malformed, "test-key")
+                .ping()
+                .await
+                .unwrap_err(),
+            "Invalid server URL"
+        );
     }
 
     /// API error text reaches app.log and the job card, so a server URL that

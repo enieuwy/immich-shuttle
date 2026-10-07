@@ -200,12 +200,9 @@ pub(crate) mod test_store {
         /// given, standing in for a credential store that accepts a write and
         /// then serves something else back.
         corrupt_next_write: Option<String>,
-        /// One-shot: the rollback's restoring `set` fails with this message.
-        /// Consumed only after `corrupt_next_write`, so a test can arm both and
-        /// have the write under test be accepted-then-corrupted while the undo
-        /// that follows it fails — the case where the store keeps a secret the
-        /// caller was told was not saved.
-        fail_restore: Option<String>,
+        /// One-shot failures after the given number of successful operations.
+        fail_get_after: Option<(usize, String)>,
+        fail_set_after: Option<(usize, String)>,
         /// One-shot: the next `delete` fails with this message. This is the
         /// rollback's other branch, taken when there was no previous secret.
         fail_next_delete: Option<String>,
@@ -235,7 +232,8 @@ pub(crate) mod test_store {
         let mut state = state();
         state.secrets.clear();
         state.corrupt_next_write = None;
-        state.fail_restore = None;
+        state.fail_get_after = None;
+        state.fail_set_after = None;
         state.fail_next_delete = None;
     }
 
@@ -251,12 +249,20 @@ pub(crate) mod test_store {
         state().secrets.get(profile_id).cloned()
     }
 
+    pub(crate) fn snapshot() -> HashMap<String, String> {
+        state().secrets.clone()
+    }
+
     pub(crate) fn corrupt_next_write(stored_instead: &str) {
         state().corrupt_next_write = Some(stored_instead.to_string());
     }
 
-    pub(crate) fn fail_restore(error: &str) {
-        state().fail_restore = Some(error.to_string());
+    pub(crate) fn fail_get_after(successful_reads: usize, error: &str) {
+        state().fail_get_after = Some((successful_reads, error.to_string()));
+    }
+
+    pub(crate) fn fail_set_after(successful_writes: usize, error: &str) {
+        state().fail_set_after = Some((successful_writes, error.to_string()));
     }
 
     pub(crate) fn fail_next_delete(error: &str) {
@@ -267,17 +273,27 @@ pub(crate) mod test_store {
 
     impl super::CredentialStore for FakeStore {
         fn get(&self, profile_id: &str) -> Result<Option<String>, String> {
-            Ok(state().secrets.get(profile_id).cloned())
+            let mut state = state();
+            if let Some((remaining, _)) = &mut state.fail_get_after {
+                if *remaining == 0 {
+                    return Err(state.fail_get_after.take().unwrap().1);
+                }
+                *remaining -= 1;
+            }
+            Ok(state.secrets.get(profile_id).cloned())
         }
 
         fn set(&self, profile_id: &str, api_key: &str) -> Result<(), String> {
             let mut state = state();
+            if let Some((remaining, _)) = &mut state.fail_set_after {
+                if *remaining == 0 {
+                    return Err(state.fail_set_after.take().unwrap().1);
+                }
+                *remaining -= 1;
+            }
             if let Some(stored) = state.corrupt_next_write.take() {
                 state.secrets.insert(profile_id.to_string(), stored);
                 return Ok(());
-            }
-            if let Some(error) = state.fail_restore.take() {
-                return Err(error);
             }
             state
                 .secrets
@@ -394,6 +410,40 @@ mod tests {
         assert_eq!(get_api_key(&profile).unwrap().as_deref(), Some("old-key"));
     }
 
+    #[test]
+    fn an_initial_read_failure_keeps_the_previous_api_key() {
+        let _guard = test_store::exclusive();
+        test_store::reset();
+        let profile = format!("__unit_keychain_{}", uuid::Uuid::new_v4());
+        test_store::seed(&profile, "old-key");
+        test_store::fail_get_after(0, "credential store is locked");
+
+        let error = store_api_key(&profile, "new-key").expect_err("the initial read fails");
+
+        assert!(error.contains("read the API key from the keychain"));
+        assert!(error.contains("credential store is locked"));
+        assert_eq!(test_store::peek(&profile).as_deref(), Some("old-key"));
+    }
+
+    #[test]
+    fn a_readback_error_restores_the_exact_previous_credential_state() {
+        let _guard = test_store::exclusive();
+        for previous in [None, Some("old-key")] {
+            test_store::reset();
+            let profile = format!("__unit_keychain_{}", uuid::Uuid::new_v4());
+            if let Some(api_key) = previous {
+                test_store::seed(&profile, api_key);
+            }
+            test_store::fail_get_after(1, "credential store becomes unavailable");
+
+            let error = store_api_key(&profile, "new-key").expect_err("the readback fails");
+
+            assert!(error.contains("verify the API key in the keychain after writing"));
+            assert!(error.contains("credential store becomes unavailable"));
+            assert_eq!(test_store::peek(&profile).as_deref(), previous);
+        }
+    }
+
     /// With no previous credential there is nothing to restore, so the rejected
     /// key must be removed — a leftover key makes an unsaved profile look
     /// connected and lets a later command authenticate with it.
@@ -422,7 +472,7 @@ mod tests {
         let profile = format!("__unit_keychain_{}", uuid::Uuid::new_v4());
         test_store::seed(&profile, "old-key");
         test_store::corrupt_next_write("garbage");
-        test_store::fail_restore("keychain is locked");
+        test_store::fail_set_after(1, "keychain is locked");
 
         let error = store_api_key(&profile, "new-key").expect_err("readback mismatch must fail");
 

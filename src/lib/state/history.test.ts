@@ -304,9 +304,9 @@ describe("replayImport", () => {
     // flight -- the scan is the last await of the replay and ProfileSelector
     // stays interactive for all of it.
     const gate = Promise.withResolvers<ScanSummary>();
-    let scanStarted = false;
+    const scanStarted = Promise.withResolvers<void>();
     vi.mocked(api.scanSourcesStream).mockImplementationOnce(() => {
-      scanStarted = true;
+      scanStarted.resolve();
       return gate.promise;
     });
 
@@ -314,7 +314,7 @@ describe("replayImport", () => {
     const errorCountBefore = get(errorsState).length;
 
     const replay = replayImport(record);
-    await vi.waitFor(() => expect(scanStarted).toBe(true));
+    await scanStarted.promise;
 
     profilesState.setActiveProfile("p2");
     gate.resolve({
@@ -345,9 +345,9 @@ describe("replayImport", () => {
     await saveProfile("p2", "https://two.example.com");
 
     const gate = Promise.withResolvers<ScanSummary>();
-    let scanStarted = false;
+    const scanStarted = Promise.withResolvers<void>();
     vi.mocked(api.scanSourcesStream).mockImplementationOnce(() => {
-      scanStarted = true;
+      scanStarted.resolve();
       return gate.promise;
     });
 
@@ -355,7 +355,7 @@ describe("replayImport", () => {
     const errorCountBefore = get(errorsState).length;
 
     const replay = replayImport(record);
-    await vi.waitFor(() => expect(scanStarted).toBe(true));
+    await scanStarted.promise;
 
     // The user switches profiles and then picks a fresh card for it. That
     // selection supersedes the replay's scan and owns the source from here on.
@@ -428,9 +428,9 @@ describe("replayImport", () => {
     importOptionsState.setOverwrite(false);
 
     const gate = Promise.withResolvers<ScanSummary>();
-    let scanStarted = false;
+    const scanStarted = Promise.withResolvers<void>();
     vi.mocked(api.scanSourcesStream).mockImplementationOnce(() => {
-      scanStarted = true;
+      scanStarted.resolve();
       return gate.promise;
     });
 
@@ -441,7 +441,7 @@ describe("replayImport", () => {
     });
 
     const replay = replayImport(record);
-    await vi.waitFor(() => expect(scanStarted).toBe(true));
+    await scanStarted.promise;
 
     // The user switches profiles and then edits the options themselves. From
     // here the options are theirs, so the replay's cleanup owns nothing --

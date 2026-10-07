@@ -442,19 +442,36 @@ describe("queueState", () => {
     expect(payload?.organization).toBe("single_album");
   });
 
-  it("forwards the selected folder organization mode to importStart", async () => {
-    await activateProfileWithSource();
+  it.each(["folder_name", "folder_path", "folder_tags"] as const)(
+    "ignores the selected album when organizing by %s",
+    async (organization) => {
+      await activateProfileWithSource();
+      await albumsState.loadAlbums();
+      albumsState.selectAlbum("a1");
+      importOptionsState.setOrganization(organization);
+      try {
+        await queueState.startImport();
+        expect(vi.mocked(api.importStart).mock.lastCall?.[0]).toMatchObject({
+          organization,
+          album_ids: [],
+          into_album: null,
+        });
+        expect(get(albumsState).selectedAlbumIds).toEqual(["a1"]);
 
-    importOptionsState.setOrganization("folder_path");
-    await queueState.startImport();
-    expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.organization).toBe("folder_path");
-
-    importOptionsState.setOrganization("folder_tags");
-    await queueState.startImport();
-    expect(vi.mocked(api.importStart).mock.lastCall?.[0]?.organization).toBe("folder_tags");
-
-    importOptionsState.setOrganization("single_album");
-  });
+        // Explicit device-rule organization also overrides the picker and target.
+        importOptionsState.setOrganization("single_album");
+        await queueState.startImport({ organization, albumIds: ["missing"], intoAlbum: "Trip" });
+        expect(vi.mocked(api.importStart).mock.lastCall?.[0]).toMatchObject({
+          organization,
+          album_ids: [],
+          into_album: null,
+        });
+      } finally {
+        importOptionsState.setOrganization("single_album");
+        albumsState.clearSelection();
+      }
+    },
+  );
 
   it("honors profileId, intoAlbum, and stack overrides (device rules)", async () => {
     await saveTestProfile("p1");
@@ -469,7 +486,7 @@ describe("queueState", () => {
       keepFiles: false,
       stackRawJpeg: false,
       stackBurst: true,
-      organization: "folder_name",
+      organization: "single_album",
     });
 
     const payload = vi.mocked(api.importStart).mock.lastCall?.[0];
@@ -479,7 +496,7 @@ describe("queueState", () => {
       keep_files: false,
       stack_raw_jpeg: false,
       stack_burst: true,
-      organization: "folder_name",
+      organization: "single_album",
     });
   });
 

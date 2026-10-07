@@ -72,6 +72,14 @@ fn openable_immich_url(base: &str, album_id: Option<&str>) -> Result<String, Str
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
         return Err("Immich server URL must start with http:// or https://.".to_string());
     }
+    if let Some(id) = album_id {
+        if !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err("Invalid Immich album ID.".to_string());
+        }
+    }
     Ok(immich_web_url(base, album_id))
 }
 
@@ -91,6 +99,21 @@ pub async fn open_in_immich(profile_id: String, album_id: Option<String>) -> Res
 #[cfg(test)]
 mod tests {
     use super::{immich_web_url, openable_immich_url};
+
+    #[test]
+    fn album_navigation_rejects_url_syntax() {
+        for id in [
+            "../photos",
+            "a/b",
+            "a?view=photos",
+            "a#fragment",
+            "a%2Fb",
+            ".",
+            "a\\b",
+        ] {
+            assert!(openable_immich_url("https://immich.example.com", Some(id)).is_err());
+        }
+    }
 
     #[test]
     fn album_url_targets_the_album() {

@@ -250,22 +250,41 @@ describe("runImportShutdown", () => {
    * originals to the Trash, so quitting through it leaves the card half deleted
    * with nothing left to retry. It cannot be cancelled, so shutdown waits.
    */
-  it("waits for a confirmed wipe before closing", async () => {
+  it("waits for a confirmed wipe before cancelling imports and closing", async () => {
+    vi.useFakeTimers();
     const wipe = Promise.withResolvers<void>();
+    const cancelImport = vi.fn(() => Promise.resolve());
+    const awaitTerminal = vi.fn(() => Promise.resolve({}));
     let closed = false;
-
-    const shutdown = runImportShutdown(deps({ pendingWipes: [wipe.promise] })).then(
-      (outcome) => {
+    try {
+      const shutdown = runImportShutdown(
+        deps({
+          pendingWipes: [wipe.promise],
+          runningJobIds: ["job-1"],
+          cancelImport,
+          awaitTerminal,
+        }),
+      ).then((outcome) => {
         closed = true;
         return outcome;
-      },
-    );
-    await Promise.resolve();
-    expect(closed).toBe(false);
+      });
+      // Drain the normal async shutdown path without expiring the wipe timeout.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cancelImport).not.toHaveBeenCalled();
+      expect(awaitTerminal).not.toHaveBeenCalled();
+      expect(closed).toBe(false);
 
-    wipe.resolve();
+      wipe.resolve();
 
-    expect(await shutdown).toEqual({ kind: "complete" });
+      expect(await shutdown).toEqual({ kind: "complete" });
+      expect(cancelImport).toHaveBeenCalledTimes(1);
+      expect(cancelImport).toHaveBeenCalledWith("job-1");
+      expect(awaitTerminal).toHaveBeenCalledTimes(1);
+      expect(awaitTerminal).toHaveBeenCalledWith("job-1", 1_000);
+      expect(closed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   /**
