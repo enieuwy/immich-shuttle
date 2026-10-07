@@ -27,6 +27,7 @@ export interface BackupImportResult {
   merged: number;
   needs_api_key: string[];
   ui_settings: BackupUiSettings | null;
+  keep_files_on_disk: boolean | null;
 }
 
 export interface UpdateStatus {
@@ -52,6 +53,9 @@ export function readMetadata(path: string): Promise<MetadataBackup> {
 }
 export function importMetadata(backup: MetadataBackup, restoreSettings: boolean): Promise<BackupImportResult> {
   return command("profiles_import", { backup, restoreSettings });
+}
+export function getImportDefaults(): Promise<MetadataBackup["defaults"]> {
+  return command("profiles_defaults");
 }
 export function checkForUpdates(): Promise<UpdateStatus> {
   return command("check_for_updates");

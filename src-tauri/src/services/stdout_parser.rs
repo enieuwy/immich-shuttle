@@ -28,11 +28,9 @@ pub struct RunProgress {
     /// A source immich-go could not enumerate shows up here and nowhere else, so
     /// this is what tells a "nothing was even read" run apart from a clean one.
     pub scan_errors: u32,
-    /// Number of `uploaded successfully` / `server has duplicate` events whose
-    /// `file=` value failed to resolve against any invocation root. Resolution
-    /// is now mandatory for a line to be tallied at all (see
-    /// `fs_path_from_file_attr`), so a parse miss would otherwise silently
-    /// zero the count instead of surfacing as an anomaly.
+    /// Number of upload/duplicate events whose `file=` value matches neither
+    /// the local invocation roots nor the selected source server's asset IDs.
+    /// A parse miss must remain visible rather than silently zeroing a tally.
     pub unresolved_file_events: u32,
 }
 
@@ -277,21 +275,23 @@ pub struct ProgressAccumulator {
     errors: u32,
     /// Aggregate error events with no `file=` (e.g. an unreadable source root).
     scan_errors: u32,
-    /// Non-empty `file=` values on `uploaded successfully` / `server has
-    /// duplicate` lines that failed to resolve against any invocation root.
-    /// Resolution is now mandatory for a line to be tallied at all, so a
-    /// parse miss would otherwise silently zero the count instead of
-    /// surfacing as an anomaly worth logging.
+    /// Upload/duplicate events that match neither invocation roots nor the
+    /// selected source server's asset IDs. Keep format drift visible.
     unresolved_file_events: u32,
     /// A trailing line not yet terminated by '\n'; reparsed once its rest arrives.
     pending: String,
     source_paths: Vec<String>,
+    source_server_url: Option<String>,
 }
 
 impl ProgressAccumulator {
-    pub fn with_source_paths(source_paths: &[String]) -> Self {
+    pub fn with_source(source_paths: &[String], source_server_url: Option<&str>) -> Self {
         Self {
             source_paths: source_paths.to_vec(),
+            // immich-go Client.Open removes one trailing slash before naming
+            // its ImmichFS. Match that exact name, including ports and base paths.
+            source_server_url: source_server_url
+                .map(|url| url.strip_suffix('/').unwrap_or(url).to_string()),
             ..Self::default()
         }
     }
@@ -321,7 +321,12 @@ impl ProgressAccumulator {
     pub fn progress_view(&self) -> (JobProgress, Option<&str>) {
         (
             JobProgress {
-                total: self.total,
+                total: if self.source_server_url.is_some() {
+                    self.total
+                        .max(self.uploaded.saturating_add(self.duplicates))
+                } else {
+                    self.total
+                },
                 uploaded: self.uploaded,
                 duplicates: self.duplicates,
                 errors: self.errors,
@@ -364,40 +369,36 @@ impl ProgressAccumulator {
         let Some(message) = info_line_message(line) else {
             return;
         };
-        if message.starts_with("uploaded successfully") {
-            // `file` is the terminal attribute of this event shape, so the
-            // whole remainder of the line is the filename. Cutting it at a
-            // key-like substring would tally (and offer for deletion) a
-            // different sibling path than the one that was uploaded.
+        let uploaded = message.starts_with("uploaded successfully");
+        if uploaded || message.starts_with("server has duplicate") {
+            // `file` is terminal: embedded attribute-like text belongs to the
+            // filename. Local paths and remote asset IDs have separate resolvers.
             if let Some(file) = terminal_file_value(message).filter(|f| !f.is_empty()) {
-                // Tallying and dedup both require resolution now: an
-                // unresolvable `file=` did not come from the scan (it may be a
-                // forged record — a filename containing a newline can inject an
-                // extra log line, see fs_path_from_file_attr), so it must never
-                // inflate `uploaded` or the checkpoint-eligible "landed"
-                // signal derived from it. Dedupe on the resolved path (not the
-                // raw logged value) so two differently-spelled but
-                // equivalent-after-resolution values still collapse to one.
-                match fs_path_from_file_attr(&file, &self.source_paths) {
-                    Some(path) => {
-                        if self.seen_paths.insert(path.clone()) {
-                            self.uploaded = self.uploaded.saturating_add(1);
-                            self.completed_paths.push(path);
-                        }
-                    }
-                    None => {
-                        self.unresolved_file_events = self.unresolved_file_events.saturating_add(1);
-                    }
-                }
-            }
-        } else if message.starts_with("server has duplicate") {
-            // Same terminal shape as `uploaded successfully` above.
-            if let Some(file) = terminal_file_value(message).filter(|f| !f.is_empty()) {
-                match fs_path_from_file_attr(&file, &self.source_paths) {
-                    Some(path) => {
-                        if self.seen_paths.insert(path.clone()) {
-                            self.duplicates = self.duplicates.saturating_add(1);
-                            self.completed_paths.push(path);
+                let (identity, local_path) = if let Some(server) = &self.source_server_url {
+                    // immich-go's ImmichFS names assets as <source URL>:<UUID>.
+                    // Never turn this identity into a filesystem wipe candidate.
+                    let id = file
+                        .strip_prefix(server.as_str())
+                        .and_then(|rest| rest.strip_prefix(':'))
+                        .and_then(|id| uuid::Uuid::parse_str(id).ok());
+                    (id.map(|id| id.to_string()), None)
+                } else {
+                    let path = fs_path_from_file_attr(&file, &self.source_paths);
+                    (path.clone(), path)
+                };
+                match identity {
+                    Some(identity) => {
+                        // Both outcomes share the identity set, so repeated or
+                        // differently spelled events cannot count an asset twice.
+                        if self.seen_paths.insert(identity) {
+                            if uploaded {
+                                self.uploaded = self.uploaded.saturating_add(1);
+                            } else {
+                                self.duplicates = self.duplicates.saturating_add(1);
+                            }
+                            if let Some(path) = local_path {
+                                self.completed_paths.push(path);
+                            }
                         }
                     }
                     None => {
@@ -417,11 +418,15 @@ impl ProgressAccumulator {
 /// Counts per-asset event lines (not the indented end-of-run summary, whose
 /// messages start with extra whitespace):
 /// - `discovered image` / `discovered video` -> total assets found
-/// - `uploaded successfully` -> uploaded (de-duplicated, with real fs path)
+/// - `uploaded successfully` -> uploaded (de-duplicated by local path or remote ID)
 /// - `server has duplicate` -> duplicates already on the server
 /// - ERROR lines carrying a `file=` -> per-file upload error events
-pub fn parse_run_progress(contents: &str, source_paths: &[String]) -> RunProgress {
-    let mut acc = ProgressAccumulator::with_source_paths(source_paths);
+pub fn parse_run_progress(
+    contents: &str,
+    source_paths: &[String],
+    source_server_url: Option<&str>,
+) -> RunProgress {
+    let mut acc = ProgressAccumulator::with_source(source_paths, source_server_url);
     acc.push_chunk(contents);
     acc.finish();
     acc.snapshot()
@@ -493,7 +498,7 @@ mod tests {
 
     #[test]
     fn counts_events_not_summary_report() {
-        let p = parse_run_progress(LOG, &["/Volumes/Untitled".to_string()]).progress;
+        let p = parse_run_progress(LOG, &["/Volumes/Untitled".to_string()], None).progress;
         // 2 discovered image + 1 discovered video event lines (NOT the indented
         // "discovered image : 193" summary line).
         assert_eq!(p.total, 3);
@@ -513,7 +518,7 @@ mod tests {
         // (matching what immich-go actually logs); the invocation root is the
         // absolute path production actually passes, resolved via the basename
         // branch of `fs_path_from_file_attr`.
-        let run = parse_run_progress(LOG, &["/Volumes/Untitled".to_string()]);
+        let run = parse_run_progress(LOG, &["/Volumes/Untitled".to_string()], None);
         assert_eq!(
             run.completed_paths,
             vec![
@@ -528,7 +533,7 @@ mod tests {
 
     #[test]
     fn empty_log_is_all_zero() {
-        let p = parse_run_progress("", &[]).progress;
+        let p = parse_run_progress("", &[], None).progress;
         assert_eq!(p.total, 0);
         assert_eq!(p.uploaded, 0);
         assert_eq!(p.duplicates, 0);
@@ -541,7 +546,7 @@ mod tests {
             "2026-06-24 16:10:00 INF uploaded successfully file=/Volumes/CANON:DCIM/IMG_0001.JPG\n\
 2026-06-24 16:10:01 INF uploaded successfully file=C:\\DCIM:IMG_0002.JPG";
         let roots = vec!["/Volumes/CANON".to_string(), "C:\\DCIM".to_string()];
-        let run = parse_run_progress(log, &roots);
+        let run = parse_run_progress(log, &roots, None);
         assert_eq!(
             run.completed_paths,
             vec!["/Volumes/CANON/DCIM/IMG_0001.JPG", "C:\\DCIM/IMG_0002.JPG"]
@@ -553,7 +558,7 @@ mod tests {
         let root = "/Volumes/CANON:Archive";
         let log =
             "2026-06-24 16:10:00 INF uploaded successfully file=/Volumes/CANON:Archive:DCIM/IMG_0001.JPG";
-        let run = parse_run_progress(log, &[root.to_string()]);
+        let run = parse_run_progress(log, &[root.to_string()], None);
         assert_eq!(
             run.completed_paths,
             vec!["/Volumes/CANON:Archive/DCIM/IMG_0001.JPG"]
@@ -565,7 +570,7 @@ mod tests {
         let root = "/Volumes/My Card";
         let log =
             "2026-06-24 16:10:05 INF uploaded successfully file=/Volumes/My Card:DCIM/VID 7.MP4";
-        let run = parse_run_progress(log, &[root.to_string()]);
+        let run = parse_run_progress(log, &[root.to_string()], None);
         assert_eq!(run.completed_paths, vec!["/Volumes/My Card/DCIM/VID 7.MP4"]);
     }
 
@@ -580,7 +585,7 @@ mod tests {
         let log = "2026-06-24 16:10:00 INF uploaded successfully file=Card:IMG_0001.JPG\n\
 2026-06-24 16:10:09 INF uploaded successfully file=Card:IMG_0001.JPG\n\
 2026-06-24 16:10:10 INF server has duplicate file=/Volumes/My Card:DCIM/VID 7.MP4";
-        let run = parse_run_progress(log, &[]);
+        let run = parse_run_progress(log, &[], None);
         assert!(run.completed_paths.is_empty());
         assert_eq!(run.progress.uploaded, 0);
         assert_eq!(run.progress.duplicates, 0);
@@ -594,7 +599,7 @@ mod tests {
         let root = "Card";
         let log = "2026-06-24 16:10:00 INF uploaded successfully file=Card:IMG_0001.JPG\n\
 2026-06-24 16:10:09 INF uploaded successfully file=Card:IMG_0001.JPG";
-        let run = parse_run_progress(log, &[root.to_string()]);
+        let run = parse_run_progress(log, &[root.to_string()], None);
         assert_eq!(run.completed_paths, vec!["Card/IMG_0001.JPG"]);
         assert_eq!(run.progress.uploaded, 1);
     }
@@ -659,7 +664,7 @@ mod tests {
         let log = "2026-06-24 16:09:14 ERR @tmp: file does not exist\n\
 2026-06-24 16:09:14 ERR PRIVATE/AVCHD/BDMV/STREAM: file does not exist";
         assert!(parse_error_log(log, &[]).is_empty());
-        let run = parse_run_progress(log, &[]);
+        let run = parse_run_progress(log, &[], None);
         assert_eq!(run.progress.errors, 0, "not per-file failures");
         assert_eq!(run.scan_errors, 2, "but the source could not be read");
     }
@@ -679,7 +684,7 @@ mod tests {
         let log =
             "2026-06-24 16:10:00 INF uploaded successfully file=/Volumes/CARD:DCIM/real.jpg\n\
 2026-06-24 16:10:00 INF uploaded successfully file=/etc/outside.jpg";
-        let run = parse_run_progress(log, &[root.to_string()]);
+        let run = parse_run_progress(log, &[root.to_string()], None);
 
         assert_eq!(
             run.completed_paths,
@@ -702,7 +707,7 @@ mod tests {
         let staging_root = "/tmp/immich-shuttle-stage-1";
         let log = "2026-06-24 16:10:00 INF uploaded successfully file=/tmp/immich-shuttle-stage-1:IMG_0001.JPG\n\
 2026-06-24 16:10:01 INF server has duplicate file=/tmp/immich-shuttle-stage-1:IMG_0002.JPG";
-        let run = parse_run_progress(log, &[staging_root.to_string()]);
+        let run = parse_run_progress(log, &[staging_root.to_string()], None);
         assert_eq!(run.progress.uploaded, 1);
         assert_eq!(run.progress.duplicates, 1);
         assert_eq!(
@@ -727,7 +732,7 @@ mod tests {
     fn progress_deduplicates_repeated_error_paths() {
         let log = "2026-06-22 14:30:01 ERR server error file=/x/IMG_0003.JPG error=first\n\
 2026-06-22 14:30:09 ERR incomplete processing file=/x/IMG_0003.JPG error=second";
-        assert_eq!(parse_run_progress(log, &[]).progress.errors, 1);
+        assert_eq!(parse_run_progress(log, &[], None).progress.errors, 1);
     }
 
     #[test]
@@ -746,10 +751,10 @@ mod tests {
     #[test]
     fn incremental_chunks_match_full_parse() {
         let roots = vec!["/Volumes/Untitled".to_string()];
-        let full = parse_run_progress(LOG, &roots);
+        let full = parse_run_progress(LOG, &roots, None);
         // Feed the log one byte at a time (each chunk splits lines arbitrarily);
         // the running snapshot must equal a whole-log parse.
-        let mut acc = ProgressAccumulator::with_source_paths(&roots);
+        let mut acc = ProgressAccumulator::with_source(&roots, None);
         let mut buf = [0u8; 4];
         for ch in LOG.chars() {
             acc.push_chunk(ch.encode_utf8(&mut buf));
@@ -767,7 +772,7 @@ mod tests {
     fn finish_flushes_trailing_line_without_newline() {
         // The final "uploaded successfully" line has no trailing '\n'; it must
         // only be counted after finish(), not while still buffered.
-        let mut acc = ProgressAccumulator::with_source_paths(&["Card".to_string()]);
+        let mut acc = ProgressAccumulator::with_source(&["Card".to_string()], None);
         acc.push_chunk("2026-06-24 16:10:21 INF uploaded successfully file=Card:IMG_0001.JPG");
         assert_eq!(acc.snapshot().progress.uploaded, 0);
         acc.finish();
@@ -781,7 +786,7 @@ mod tests {
         let line = "1234567890123456789abcdé ERR file=Card:IMG_0001.JPG";
         assert!(error_line_body(line).is_none());
         assert_eq!(info_line_message(line), None);
-        assert_eq!(parse_run_progress(line, &[]).progress.errors, 0);
+        assert_eq!(parse_run_progress(line, &[], None).progress.errors, 0);
     }
 
     // ---- basename fsRoot resolution (the P0 regression) ----
@@ -797,7 +802,7 @@ mod tests {
     #[test]
     fn resolves_basename_fsroot_against_absolute_invocation_root() {
         let log = "2026-08-06 12:14:10 INF uploaded successfully file=igo-verify:DCIM/100MSDCF/IMG_0001.JPG";
-        let run = parse_run_progress(log, &["/tmp/igo-verify".to_string()]);
+        let run = parse_run_progress(log, &["/tmp/igo-verify".to_string()], None);
         assert_eq!(run.progress.uploaded, 1);
         assert_eq!(
             run.completed_paths,
@@ -814,7 +819,7 @@ mod tests {
     fn ambiguous_basename_resolves_to_nothing() {
         let roots = vec!["/a/DCIM".to_string(), "/b/DCIM".to_string()];
         let log = "2026-06-24 16:10:00 INF uploaded successfully file=DCIM:IMG_0001.JPG";
-        let run = parse_run_progress(log, &roots);
+        let run = parse_run_progress(log, &roots, None);
         assert!(run.completed_paths.is_empty());
         assert_eq!(run.progress.uploaded, 0);
         assert_eq!(run.unresolved_file_events, 1);
@@ -828,6 +833,7 @@ mod tests {
         let run = parse_run_progress(
             "2026-06-24 16:10:00 INF uploaded successfully file=/etc/outside.jpg",
             &["/Volumes/CARD".to_string()],
+            None,
         );
         assert!(run.completed_paths.is_empty());
         assert_eq!(run.progress.uploaded, 0);
@@ -847,7 +853,7 @@ mod tests {
 2026-06-24 16:10:22 INF uploaded successfully file=/Volumes/CARD:DCIM/photo error=inside.jpg\n\
 2026-06-24 16:10:23 INF uploaded successfully file=/Volumes/CARD:DCIM/photo reason=inside.jpg\n\
 2026-06-24 16:10:24 INF uploaded successfully file=/Volumes/CARD:DCIM/photo discovered_at=inside.jpg";
-        let run = parse_run_progress(log, &["/Volumes/CARD".to_string()]);
+        let run = parse_run_progress(log, &["/Volumes/CARD".to_string()], None);
         assert_eq!(
             run.completed_paths,
             vec![
@@ -869,7 +875,7 @@ mod tests {
 2026-06-24 16:10:32 INF server has duplicate file=/Volumes/CARD:DCIM/clip error=inside.mp4\n\
 2026-06-24 16:10:33 INF server has duplicate file=/Volumes/CARD:DCIM/clip reason=inside.mp4\n\
 2026-06-24 16:10:34 INF server has duplicate file=/Volumes/CARD:DCIM/clip discovered_at=inside.mp4";
-        let run = parse_run_progress(log, &["/Volumes/CARD".to_string()]);
+        let run = parse_run_progress(log, &["/Volumes/CARD".to_string()], None);
         assert_eq!(
             run.completed_paths,
             vec![
@@ -892,7 +898,7 @@ mod tests {
     fn truncated_sibling_path_is_never_a_wipe_candidate() {
         let log = "2026-06-24 16:10:21 INF uploaded successfully file=/Volumes/CARD:DCIM/photo error=inside.jpg\n\
 2026-06-24 16:10:22 INF server has duplicate file=/Volumes/CARD:DCIM/clip discovered_at=inside.mp4";
-        let run = parse_run_progress(log, &["/Volumes/CARD".to_string()]);
+        let run = parse_run_progress(log, &["/Volumes/CARD".to_string()], None);
         for truncated in ["/Volumes/CARD/DCIM/photo", "/Volumes/CARD/DCIM/clip"] {
             assert!(
                 !run.completed_paths.iter().any(|p| p == truncated),
@@ -944,7 +950,7 @@ mod tests {
     /// what `import_start` logs as an anomaly.
     #[test]
     fn unresolved_file_events_counts_non_resolving_records() {
-        let mut acc = ProgressAccumulator::with_source_paths(&["/Volumes/OtherCard".to_string()]);
+        let mut acc = ProgressAccumulator::with_source(&["/Volumes/OtherCard".to_string()], None);
         acc.push_chunk(
             "2026-06-24 16:10:00 INF uploaded successfully file=Untracked:DCIM/IMG_0001.JPG\n\
 2026-06-24 16:10:01 INF server has duplicate file=Untracked:DCIM/IMG_0002.JPG\n",
@@ -953,5 +959,63 @@ mod tests {
         assert_eq!(run.unresolved_file_events, 2);
         assert_eq!(run.progress.uploaded, 0);
         assert_eq!(run.progress.duplicates, 0);
+    }
+
+    #[test]
+    fn server_asset_events_count_once_without_local_deletion_candidates() {
+        let server = "https://[::1]:2283/immich";
+        let log = "2026-10-07 10:00:00 INF server has duplicate file=https://[::1]:2283/immich:01234567-89ab-cdef-0123-456789abcdef\n\
+2026-10-07 10:00:01 INF server has duplicate file=https://[::1]:2283/immich:01234567-89AB-CDEF-0123-456789ABCDEF\n\
+2026-10-07 10:00:02 INF uploaded successfully file=https://[::1]:2283/immich:01234567-89ab-cdef-0123-456789abcdef\n\
+2026-10-07 10:00:03 INF uploaded successfully file=https://[::1]:2283/immich:11111111-2222-3333-4444-555555555555\n\
+2026-10-07 10:00:04 INF uploaded successfully file=https://[::1]:2283/immich:11111111-2222-3333-4444-555555555555";
+        let run = parse_run_progress(log, &[String::new()], Some(server));
+        assert_eq!(run.progress.uploaded, 1);
+        assert_eq!(run.progress.duplicates, 1);
+        assert_eq!(run.progress.total, 2);
+        assert_eq!(run.unresolved_file_events, 0);
+        assert!(run.completed_paths.is_empty());
+    }
+
+    #[test]
+    fn server_asset_events_require_the_selected_server_and_valid_asset_id() {
+        let server = "https://source.example:2283";
+        let log = "2026-10-07 10:00:00 INF server has duplicate file=https://other.example:2283:01234567-89ab-cdef-0123-456789abcdef\n\
+2026-10-07 10:00:01 INF server has duplicate file=https://source.example:2283.evil:01234567-89ab-cdef-0123-456789abcdef\n\
+2026-10-07 10:00:02 INF server has duplicate file=https://source.example:2283:not-an-asset-id\n\
+2026-10-07 10:00:03 INF uploaded successfully file=/card:photo.jpg";
+        let run = parse_run_progress(log, &["/card".into()], Some(server));
+        assert_eq!(run.progress.uploaded, 0);
+        assert_eq!(run.progress.duplicates, 0);
+        assert_eq!(run.unresolved_file_events, 4);
+        assert!(run.completed_paths.is_empty());
+        let local = parse_run_progress(
+            "2026-10-07 10:00:00 INF server has duplicate file=https://source.example:2283:01234567-89ab-cdef-0123-456789abcdef",
+            &["/card".into()],
+            None,
+        );
+        assert_eq!(local.progress.duplicates, 0);
+        assert_eq!(local.unresolved_file_events, 1);
+    }
+
+    #[test]
+    fn incremental_server_progress_matches_final_parse_and_trailing_slash() {
+        let log = "2026-10-07 10:00:00 INF server has duplicate file=https://source.example/api:01234567-89ab-cdef-0123-456789abcdef\n\
+2026-10-07 10:00:01 INF server has duplicate file=https://source.example/api:11111111-2222-3333-4444-555555555555";
+        let server = Some("https://source.example/api/");
+        let mut acc = ProgressAccumulator::with_source(&[String::new()], server);
+        for chunk in log.as_bytes().chunks(7) {
+            acc.push_chunk(std::str::from_utf8(chunk).unwrap());
+        }
+        assert_eq!(acc.progress_view().0.duplicates, 1);
+        assert!(acc.progress_view().1.is_none());
+        acc.finish();
+        let run = acc.snapshot();
+        let final_run = parse_run_progress(log, &[String::new()], server);
+        assert_eq!(run.progress.duplicates, 2);
+        assert_eq!(run.progress.total, 2);
+        assert_eq!(run.progress.duplicates, final_run.progress.duplicates);
+        assert_eq!(run.unresolved_file_events, final_run.unresolved_file_events);
+        assert!(run.completed_paths.is_empty());
     }
 }

@@ -112,6 +112,19 @@ describe("queueState", () => {
     expect(queueState.pendingStarts()).toEqual([]);
   });
 
+  it("tracks a migration start while its request is still being built", async () => {
+    const built = Promise.withResolvers<Parameters<typeof api.importStart>[0]>();
+    const startsBefore = vi.mocked(api.importStart).mock.calls.length;
+    const start = queueState.startRequest(() => built.promise);
+
+    expect(queueState.pendingStarts()).toHaveLength(1);
+    expect(vi.mocked(api.importStart).mock.calls.length).toBe(startsBefore);
+    built.reject(new Error("checkpoint unavailable"));
+    await expect(start).rejects.toThrow("checkpoint unavailable");
+    expect(queueState.pendingStarts()).toEqual([]);
+    expect(vi.mocked(api.importStart).mock.calls.length).toBe(startsBefore);
+  });
+
   it("forwards stack flags to importStart", async () => {
     await activateProfileWithSource();
 

@@ -1,7 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 
-import { importOptionsState, isDateRangeInvalid, toImmichDateRange } from "./import-options";
+vi.mock("$lib/api", () => ({
+  historySourceLastImport: vi.fn(async () => null),
+}));
+
+import { historySourceLastImport } from "$lib/api";
+import { importOptionsState, isDateRangeInvalid, resolveImportDateRange, toImmichDateRange } from "./import-options";
 import type { ImportInput } from "$lib/types";
 
 describe("import date ranges", () => {
@@ -9,6 +14,70 @@ describe("import date ranges", () => {
     expect(isDateRangeInvalid("2026-02-01", "2026-01-01")).toBe(true);
     expect(toImmichDateRange("2026-02-01", "2026-01-01")).toBeNull();
   });
+});
+
+describe("resolveImportDateRange", () => {
+  const onlyNew = { dateFrom: null, dateTo: null, onlyNewSinceLastImport: true };
+  const paths = ["/migration/card-a", "/migration/card-b"];
+
+  beforeEach(() => {
+    vi.mocked(historySourceLastImport).mockReset().mockResolvedValue(null);
+  });
+
+  it("uses the folder migration source checkpoint in the local calendar zone", async () => {
+    vi.mocked(historySourceLastImport).mockResolvedValue(new Date(2026, 2, 15, 12).getTime());
+    await expect(resolveImportDateRange(onlyNew, "destination-profile", paths, false, "folder"))
+      .resolves.toBe("2026-03-15,9999-12-31");
+    expect(historySourceLastImport).toHaveBeenCalledExactlyOnceWith("destination-profile", paths);
+  });
+
+  it("gives explicit dates precedence over the only-new checkpoint", async () => {
+    const options = { ...onlyNew, dateFrom: "2026-01-01", dateTo: "2026-01-31" };
+    await expect(resolveImportDateRange(options, "p", paths, false, "folder"))
+      .resolves.toBe("2026-01-01,2026-01-31");
+    expect(historySourceLastImport).not.toHaveBeenCalled();
+  });
+
+  it("gives an explicit selection precedence over dates and only-new", async () => {
+    const options = { ...onlyNew, dateFrom: "2026-02-01", dateTo: "2026-01-01" };
+    await expect(resolveImportDateRange(options, "p", paths, true, "folder")).resolves.toBeNull();
+    expect(historySourceLastImport).not.toHaveBeenCalled();
+  });
+
+  it("uses the checkpoint when an explicit date range is incomplete", async () => {
+    vi.mocked(historySourceLastImport).mockResolvedValue(new Date(2026, 3, 2, 12).getTime());
+    await expect(resolveImportDateRange({ ...onlyNew, dateFrom: "2026-01-01" }, "p", paths, false))
+      .resolves.toBe("2026-04-02,9999-12-31");
+  });
+
+  it("returns no date filter when the folder has no checkpoint", async () => {
+    await expect(resolveImportDateRange(onlyNew, "p", paths, false, "folder")).resolves.toBeNull();
+    expect(historySourceLastImport).toHaveBeenCalledExactlyOnceWith("p", paths);
+  });
+
+  it("does not read a checkpoint when only-new is off", async () => {
+    await expect(resolveImportDateRange({ ...onlyNew, onlyNewSinceLastImport: false }, "p", paths, false))
+      .resolves.toBeNull();
+    expect(historySourceLastImport).not.toHaveBeenCalled();
+  });
+
+  it("refuses to widen a folder migration when its checkpoint cannot be read", async () => {
+    vi.mocked(historySourceLastImport).mockRejectedValue(new Error("Unreadable history store"));
+    await expect(resolveImportDateRange(onlyNew, "p", paths, false, "folder")).rejects.toThrow(
+      'Could not read the last-import checkpoint for this source, so "only new since last import" cannot be applied.',
+    );
+  });
+
+  it.each(["google_photos", "icloud", "immich"] as const)(
+    "does not adopt a folder checkpoint for %s migrations",
+    async (source) => {
+      await expect(resolveImportDateRange(onlyNew, "p", paths, false, source)).resolves.toBeNull();
+      const explicit = { ...onlyNew, dateFrom: "2026-01-01", dateTo: "2026-01-31" };
+      await expect(resolveImportDateRange(explicit, "p", paths, false, source))
+        .resolves.toBe("2026-01-01,2026-01-31");
+      expect(historySourceLastImport).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("hydrateFromRequest", () => {

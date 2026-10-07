@@ -97,6 +97,9 @@
       if (result.ui_settings) {
         try {
           restoreUiSettings(result.ui_settings);
+          if (result.keep_files_on_disk !== null) {
+            importOptionsState.setKeepFiles(result.keep_files_on_disk);
+          }
           message += " Import defaults and display settings restored.";
         } catch (reason) {
           error = `Profiles saved, but display or import settings did not fully persist: ${String(reason)}`;

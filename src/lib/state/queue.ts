@@ -7,7 +7,6 @@ import {
 } from "@tauri-apps/plugin-notification";
 
 import {
-  historySourceLastImport,
   importCancel,
   importClearFinished,
   importConfirmWipe,
@@ -21,7 +20,7 @@ import { errorsState } from "$lib/state/errors";
 import { historyState } from "$lib/state/history";
 import type { ImportInput, ImportJob, ImportOrganization } from "$lib/types";
 
-import { importOptionsState, isDateRangeInvalid, toImmichDateRange } from "$lib/state/import-options";
+import { importOptionsState, isDateRangeInvalid, resolveImportDateRange } from "$lib/state/import-options";
 import { albumsState } from "$lib/state/albums";
 import { createGeneration } from "$lib/state/generation";
 import { activeProfile, profilesState } from "$lib/state/profiles";
@@ -348,9 +347,11 @@ export const queueState = {
       progressUnlisten = null;
     }
   },
-  async startRequest(input: ImportInput) {
+  // Shutdown must see the start while its request is still being built: the
+  // builder may await history before the backend admits the job.
+  async startRequest(buildInput: () => Promise<ImportInput>) {
     const pending = (async () => {
-      await importStart(input);
+      await importStart(await buildInput());
       await refreshJobs();
     })();
     pendingImportStarts.add(pending);
@@ -429,41 +430,7 @@ export const queueState = {
       const selectFiles = overrides?.selectFiles ?? null;
       const hasSelection = !!selectFiles && selectFiles.length > 0;
 
-      // Explicit From/To range wins. Otherwise, "only new since last import"
-      // derives a capture-date floor from this source's stored last-import time.
-      // immich-go's --date-range needs both bounds, so pair the floor with a
-      // far-future upper bound (open-ended "floor," is rejected).
-      let dateRange: string | null = null;
-      if (!hasSelection) {
-        dateRange = toImmichDateRange(options.dateFrom, options.dateTo);
-        if (!dateRange && options.onlyNewSinceLastImport) {
-          // A checkpoint the backend cannot read is NOT "no checkpoint". The
-          // store is now the only record of the date floor, so a read/parse
-          // failure that fell through to `null` would drop the requested
-          // only-new constraint and re-upload the whole card as a full import.
-          // Refuse the start instead: the user asked for an incremental window,
-          // and silently widening it is the one outcome they did not ask for.
-          let lastMs: number | null;
-          try {
-            lastMs = await historySourceLastImport(profile.id, sourcePaths);
-          } catch (error) {
-            throw new Error(
-              `Could not read the last-import checkpoint for this source, so "only new since last import" cannot be applied. Turn it off to import everything, or retry. (${
-                error instanceof Error ? error.message : String(error)
-              })`,
-            );
-          }
-          if (lastMs != null) {
-            // Format in the local calendar zone: immich-go parses --date-range in
-            // local time, so a UTC date could land a day off and skip newer files.
-            const d = new Date(lastMs);
-            const floor = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
-              d.getDate(),
-            ).padStart(2, "0")}`;
-            dateRange = `${floor},9999-12-31`;
-          }
-        }
-      }
+      const dateRange = await resolveImportDateRange(options, profile.id, sourcePaths, hasSelection);
 
       await importStart({
         profile_id: profile.id,

@@ -1,6 +1,7 @@
 import { writable } from "svelte/store";
 
-import type { ImportInput, ImportOrganization } from "$lib/types";
+import { historySourceLastImport } from "$lib/api";
+import type { ImportExtensions, ImportInput, ImportOrganization } from "$lib/types";
 
 type ImportOptionsState = {
   keepFiles: boolean;
@@ -228,4 +229,42 @@ export function isDateRangeInvalid(from: string | null, to: string | null): bool
 export function toImmichDateRange(from: string | null, to: string | null): string | null {
   if (!from || !to || !YMD.test(from) || !YMD.test(to) || isDateRangeInvalid(from, to)) return null;
   return `${from},${to}`;
+}
+
+/**
+ * Explicit files override date filters. Explicit dates override the folder's
+ * only-new checkpoint; other source kinds must not reuse a folder checkpoint.
+ */
+export async function resolveImportDateRange(
+  options: Pick<ImportOptionsSnapshot, "dateFrom" | "dateTo" | "onlyNewSinceLastImport">,
+  profileId: string,
+  sourcePaths: string[],
+  hasSelection: boolean,
+  source: NonNullable<ImportExtensions["source"]> = "folder",
+): Promise<string | null> {
+  if (hasSelection) return null;
+  const explicit = toImmichDateRange(options.dateFrom, options.dateTo);
+  if (explicit || !options.onlyNewSinceLastImport || source !== "folder") return explicit;
+
+  // An unreadable checkpoint is not an absent checkpoint. Refuse to silently
+  // widen the requested only-new window to the complete source.
+  let lastMs: number | null;
+  try {
+    lastMs = await historySourceLastImport(profileId, sourcePaths);
+  } catch (error) {
+    throw new Error(
+      `Could not read the last-import checkpoint for this source, so "only new since last import" cannot be applied. Turn it off to import everything, or retry. (${
+        error instanceof Error ? error.message : String(error)
+      })`,
+    );
+  }
+  if (lastMs == null) return null;
+
+  // immich-go parses date ranges in local time. A UTC date can skip newer files
+  // near the calendar boundary. The uploader requires a complete upper bound.
+  const d = new Date(lastMs);
+  const floor = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate(),
+  ).padStart(2, "0")}`;
+  return `${floor},9999-12-31`;
 }

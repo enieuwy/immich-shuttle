@@ -1,0 +1,12 @@
+# Historical synthetic URL-rejection fixtures, not usable credentials.
+2efe121ef6ff8585674c9fbe57e41c16e81fe3c7:src-tauri/src/commands/profile_backup.rs:generic-credential-uri:394
+ac65177a388106edd540ee607a0b1dbaf9b78f3b:src-tauri/src/commands/profile_backup.rs:generic-credential-uri:271
+# Disposable prototype database passwords: synthetic-demo-only.
+ac65177a388106edd540ee607a0b1dbaf9b78f3b:.prototype-evidence/compose.yml:generic-password:9
+ac65177a388106edd540ee607a0b1dbaf9b78f3b:.prototype-evidence/compose.yml:generic-password:22
+ac65177a388106edd540ee607a0b1dbaf9b78f3b:.prototype-evidence/compose.yml:generic-password:37
+ac65177a388106edd540ee607a0b1dbaf9b78f3b:.prototype-evidence/compose.yml:generic-password:46
+# SHA-256 source-file hashes, not API keys.
+ac65177a388106edd540ee607a0b1dbaf9b78f3b:.prototype-evidence/source-snapshot.json:generic-api-key:20
+ac65177a388106edd540ee607a0b1dbaf9b78f3b:.prototype-evidence/source-snapshot.json:generic-api-key:40
+ac65177a388106edd540ee607a0b1dbaf9b78f3b:.prototype-evidence/source-snapshot.json:generic-api-key:41

@@ -1,8 +1,0 @@
-
-> immich-shuttle@0.8.1 check
-> svelte-check --tsconfig ./tsconfig.json
-
-Loading svelte-check in workspace: /Users/ellis/tmp/feature-prototypes-20261003/worktrees/immich-shuttle
-Getting Svelte diagnostics...
-
-svelte-check found 0 errors and 0 warnings

@@ -60,9 +60,13 @@ pub struct ThumbResult {
 }
 
 fn cache_dir() -> Result<PathBuf, String> {
-    let base = dirs::data_local_dir()
-        .ok_or_else(|| "Could not resolve local data directory".to_string())?;
-    let dir = base.join("immich-shuttle").join("thumbnails");
+    let dir = if let Some(path) = std::env::var_os("IMMICH_SHUTTLE_DATA_DIR") {
+        PathBuf::from(path).join("thumbnails")
+    } else {
+        let base = dirs::data_local_dir()
+            .ok_or_else(|| "Could not resolve local data directory".to_string())?;
+        base.join("immich-shuttle").join("thumbnails")
+    };
     fs::create_dir_all(&dir).map_err(|e| format!("Could not create thumbnail cache dir: {e}"))?;
     Ok(dir)
 }
@@ -734,7 +738,7 @@ fn generate_with_shell(src: &Path, max: u32, out: &Path) -> bool {
                     rgb.put_pixel(x, y, image::Rgb([buf[i + 2], buf[i + 1], buf[i]]));
                 }
             }
-            let thumb = image::DynamicImage::ImageRgb8(rgb).thumbnail(max, max);
+            let thumb = fit_preview(image::DynamicImage::ImageRgb8(rgb), max);
 
             // Encode to a process-unique temp sibling and rename onto `out` only
             // on success, so a concurrent reader of `out` never observes a
@@ -849,6 +853,9 @@ fn generate_sips(src: &Path, max: u32, out: &Path) -> bool {
     let Some(tmp) = temporary_output_path(out, "sips") else {
         return false;
     };
+    let max = image::image_dimensions(src)
+        .map(|(width, height)| max.min(width.max(height)))
+        .unwrap_or(max);
     let mut command = Command::new("/usr/bin/sips");
     command
         .arg("-Z")
@@ -928,6 +935,14 @@ fn thumbnail_decode_limits() -> image::Limits {
     limits
 }
 
+fn fit_preview(image: image::DynamicImage, max: u32) -> image::DynamicImage {
+    if image.width() <= max && image.height() <= max {
+        image
+    } else {
+        image.thumbnail(max, max)
+    }
+}
+
 fn generate_with_image(src: &Path, max: u32, out: &Path) -> bool {
     let mut reader = match image::ImageReader::open(src) {
         Ok(reader) => reader,
@@ -940,9 +955,9 @@ fn generate_with_image(src: &Path, max: u32, out: &Path) -> bool {
         Err(_) => return false,
     };
     let oriented = apply_orientation(src, decoded);
-    let thumb = oriented.thumbnail(max, max);
+    let thumb = fit_preview(oriented, max);
     // JPEG has no alpha channel; flatten to RGB before encoding.
-    let rgb = image::DynamicImage::ImageRgb8(thumb.to_rgb8());
+    let rgb = image::DynamicImage::ImageRgb8(thumb.into_rgb8());
 
     // Encode into a process-unique temp sibling and rename onto `out` only on
     // success, so a concurrent cache-miss on the same key never reads a
@@ -1109,9 +1124,9 @@ fn generate_with_raw_preview(src: &Path, max: u32, out: &Path) -> bool {
         // The embedded preview inherits the sensor's readout orientation, so
         // rotate it the same way the full-decode path does; without this a
         // portrait RAW previews sideways.
-        let thumb = apply_orientation(src, decoded).thumbnail(max, max);
+        let thumb = fit_preview(apply_orientation(src, decoded), max);
         // JPEG has no alpha channel; flatten to RGB before encoding.
-        let rgb = image::DynamicImage::ImageRgb8(thumb.to_rgb8());
+        let rgb = image::DynamicImage::ImageRgb8(thumb.into_rgb8());
         if rgb.save_with_format(&tmp, image::ImageFormat::Jpeg).is_ok()
             && promote_temporary_output(&tmp, out)
         {

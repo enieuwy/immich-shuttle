@@ -61,6 +61,8 @@ function handle(cmd: string, args: InvokeArgs): unknown {
 
   const scenario = getScenario();
   switch (cmd) {
+    case "profiles_defaults":
+      return { keep_files_on_disk: true };
     case "profiles_list":
       return fixtures.profilesForScenario(scenario);
     case "albums_list":

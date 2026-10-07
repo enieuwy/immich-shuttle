@@ -60,6 +60,7 @@ pub struct BackupImportResult {
     pub merged: usize,
     pub needs_api_key: Vec<String>,
     pub ui_settings: Option<UiSettings>,
+    pub keep_files_on_disk: Option<bool>,
 }
 
 fn checked_url(raw: &str) -> Result<String, String> {
@@ -174,17 +175,9 @@ impl Write for SizeLimit {
     }
 }
 
-/// Publish a complete owner-only file without replacing any existing file.
-/// Unlike config writes, this must never chmod the user's chosen directory.
+/// Create a new owner-only backup on filesystems without hard-link support.
+/// A crash can leave an incomplete file; importing it reports a parse error.
 fn write_new_private(path: &Path, content: &str) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let temp = parent.join(format!(
-        ".immich-shuttle-backup-{}.tmp",
-        uuid::Uuid::new_v4()
-    ));
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -192,21 +185,18 @@ fn write_new_private(path: &Path, content: &str) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let result = (|| {
-        let mut file = options
-            .open(&temp)
-            .map_err(|e| format!("Could not create backup: {e}"))?;
-        file.write_all(content.as_bytes())
-            .map_err(|e| format!("Could not write backup: {e}"))?;
-        file.sync_all()
-            .map_err(|e| format!("Could not sync backup: {e}"))?;
-        drop(file);
-        fs::hard_link(&temp, path)
-            .map_err(|e| format!("Could not save backup; choose a new filename: {e}"))?;
-        Ok(())
-    })();
-    let _ = fs::remove_file(&temp);
-    result
+    let mut file = options.open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            "Choose a new backup filename; this file already exists".to_string()
+        } else {
+            format!("Could not create backup: {e}")
+        }
+    })?;
+    file.write_all(content.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|e| {
+            format!("Could not complete backup; remove this incomplete file before retrying: {e}")
+        })
 }
 
 #[tauri::command]
@@ -267,6 +257,13 @@ pub async fn profiles_backup_read(path: String) -> Result<MetadataBackup, String
 }
 
 #[tauri::command]
+pub fn profiles_defaults() -> Result<BackupDefaults, String> {
+    Ok(BackupDefaults {
+        keep_files_on_disk: profile_store::load_config()?.defaults.keep_files_on_disk,
+    })
+}
+
+#[tauri::command]
 pub async fn profiles_import(
     backup: MetadataBackup,
     restore_settings: bool,
@@ -292,6 +289,7 @@ pub async fn profiles_import(
         merged: 0,
         needs_api_key: Vec::new(),
         ui_settings: None,
+        keep_files_on_disk: None,
     };
     for incoming in backup.profiles {
         let existing = config.profiles.iter_mut().find(|p| p.id == incoming.id);
@@ -338,6 +336,7 @@ pub async fn profiles_import(
     if restore_settings {
         config.defaults.keep_files_on_disk = backup.defaults.keep_files_on_disk;
         result.ui_settings = Some(backup.ui_settings);
+        result.keep_files_on_disk = Some(backup.defaults.keep_files_on_disk);
     }
     profile_store::save_config(&config)?;
     Ok(result)
@@ -391,7 +390,7 @@ mod tests {
         secret["profiles"][0]["api_key"] = serde_json::json!("must-not-import");
         assert!(parse_backup(&secret.to_string()).is_err());
         for url in [
-            "http://user:secret@127.0.0.1:2283",
+            "http://user:secret@127.0.0.1:2283", // betterleaks:allow -- synthetic URL rejection fixture
             "http://127.0.0.1:2283?api_key=secret",
             "file:///tmp/photos",
         ] {

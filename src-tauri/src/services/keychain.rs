@@ -213,6 +213,9 @@ pub fn require_api_key(profile_id: &str) -> Result<String, String> {
 }
 
 pub fn delete_api_key(profile_id: &str) -> Result<(), String> {
+    if std::env::var_os("IMMICH_SHUTTLE_API_KEYS_FILE").is_some() {
+        return Err("The explicit credentials file is read-only; edit that file instead.".into());
+    }
     let _guard = keychain_guard();
     credential_store()
         .delete(profile_id)
@@ -349,6 +352,65 @@ pub(crate) mod test_store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::await_holding_lock)] // Serializes process-global config and fake-keychain test seams.
+    #[tokio::test]
+    async fn credentials_file_rejects_profile_deletion_without_touching_keychain() {
+        use crate::services::{private_file::write_atomic_private, profile_store};
+        use crate::{commands::profiles::profile_delete, models::profile::Profile};
+
+        let _config_guard = profile_store::test_config::lock();
+        let _credential_guard = test_store::exclusive();
+        test_store::reset();
+        let dir = profile_store::test_config::use_temp_config_home("credentials-file-delete");
+        let profile_id = "__unit_read_only_profile";
+        profile_store::upsert_profile(Profile {
+            id: profile_id.into(),
+            display_name: "Copied profile".into(),
+            server_url: "https://immich.example.com".into(),
+            lan_server_url: None,
+            wan_server_url: None,
+        })
+        .unwrap();
+        test_store::seed(profile_id, "desktop-key");
+        let before = test_store::snapshot();
+        let path = dir.join("credentials.json");
+        let contents = format!(r#"{{"{profile_id}":"isolated-key"}}"#);
+        write_atomic_private(&path, &contents).unwrap();
+
+        struct CredentialsOverride(Option<std::ffi::OsString>);
+        impl Drop for CredentialsOverride {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(previous) => std::env::set_var("IMMICH_SHUTTLE_API_KEYS_FILE", previous),
+                    None => std::env::remove_var("IMMICH_SHUTTLE_API_KEYS_FILE"),
+                }
+            }
+        }
+        let override_guard = CredentialsOverride(std::env::var_os("IMMICH_SHUTTLE_API_KEYS_FILE"));
+        std::env::set_var("IMMICH_SHUTTLE_API_KEYS_FILE", &path);
+
+        assert_eq!(
+            get_api_key(profile_id).unwrap().as_deref(),
+            Some("isolated-key")
+        );
+        let expected = "The explicit credentials file is read-only; edit that file instead.";
+        assert_eq!(delete_api_key(profile_id).unwrap_err(), expected);
+        assert_eq!(
+            store_api_key(profile_id, "replacement-key").unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            profile_delete(profile_id.into()).await.unwrap_err(),
+            expected
+        );
+        assert_eq!(test_store::snapshot(), before);
+        assert!(profile_store::get_profile(profile_id).is_ok());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+
+        drop(override_guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// End-to-end round trip against the real OS credential store. Ignored by
     /// default because it needs an unlocked keychain/secret-service and would be

@@ -14,7 +14,8 @@ test('default scenario shows the main import workspace', async ({ page }) => {
 
   await expect(page.getByText('Immich Shuttle').first()).toBeVisible();
   await expect(page.getByText('Source').first()).toBeVisible();
-  await expect(page.getByText('Albums').first()).toBeVisible();
+  // The album card's title; the collapsed migration panel also mentions albums.
+  await expect(page.getByText('Destination', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Queue' })).toBeVisible();
   await expect(page.getByText(/photos/i).first()).toBeVisible();
 

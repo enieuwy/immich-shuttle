@@ -37,6 +37,7 @@
   import { openProfileEditor, panelTab } from "$lib/state/ui";
   import { paletteState, themeState } from "$lib/state/theme";
   import { isDateRangeInvalid, importOptionsState } from "$lib/state/import-options";
+  import { getImportDefaults } from "$lib/insights-api";
 
 
   let showManager = $state(false);
@@ -156,6 +157,14 @@
     // Cancellation publishes a terminal status before the worker exits; retain
     // timed-out jobs so a retry cannot mistake that status for safe shutdown.
     const shutdownPendingJobIds = new Set<string>();
+    const keepFilesBeforeDefaults = $importOptionsState.keepFiles;
+    void getImportDefaults().then((defaults) => {
+      if (!disposed && $importOptionsState.keepFiles === keepFilesBeforeDefaults) {
+        importOptionsState.setKeepFiles(defaults.keep_files_on_disk);
+      }
+    }).catch((error) => {
+      if (!disposed) importError = `Could not load import defaults: ${String(error)}`;
+    });
     void profilesState.loadProfiles().then(() => {
       if (getProfilesSnapshot().profiles.length === 0) {
         showOnboarding = true;

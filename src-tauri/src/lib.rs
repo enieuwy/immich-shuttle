@@ -309,13 +309,19 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(prune_startup_artifacts);
             Ok(())
         })
-        .register_uri_scheme_protocol("preview-media", |_context, request| {
-            commands::preview::preview_media_response(request)
-        })
+        .register_asynchronous_uri_scheme_protocol(
+            "preview-media",
+            |_context, request, responder| {
+                tauri::async_runtime::spawn_blocking(move || {
+                    responder.respond(commands::preview::preview_media_response(request));
+                });
+            },
+        )
         .invoke_handler(tauri::generate_handler![
             commands::profile_backup::profiles_export,
             commands::profile_backup::profiles_backup_read,
             commands::profile_backup::profiles_import,
+            commands::profile_backup::profiles_defaults,
             commands::update_check::check_for_updates,
             commands::update_check::open_project_releases,
             commands::import_tools::import_storage,

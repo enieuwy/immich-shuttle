@@ -124,7 +124,8 @@ pub struct UploadRequest {
     pub job_id: String,
     pub server_url: String,
     pub api_key: String,
-    pub source_path: String,
+    /// Positional paths for this invocation. Google Photos parts share one run.
+    pub source_paths: Vec<String>,
     pub log_path: PathBuf,
     /// Paths immich-go is actually invoked against for this run — the temp
     /// staging directory for a hand-picked (staged) import, otherwise the
@@ -281,12 +282,16 @@ struct ProgressReader {
 }
 
 impl ProgressReader {
-    fn new(log_path: PathBuf, log_source_roots: Vec<String>) -> Self {
+    fn new(
+        log_path: PathBuf,
+        log_source_roots: &[String],
+        source_server_url: Option<&str>,
+    ) -> Self {
         Self {
             log_path,
             offset: 0,
             carry: Vec::new(),
-            acc: ProgressAccumulator::with_source_paths(&log_source_roots),
+            acc: ProgressAccumulator::with_source(log_source_roots, source_server_url),
         }
     }
 
@@ -611,7 +616,7 @@ fn build_upload_args(request: &UploadRequest, config_path: &Path) -> Vec<String>
             }
         }
     } else {
-        args.push(request.source_path.clone());
+        args.extend(request.source_paths.iter().cloned());
     }
     args
 }
@@ -814,8 +819,14 @@ pub async fn run_upload(
     // line-flushes through the pipe, so progress is polled from the run log
     // (append-only, written in real time) on a fixed cadence instead. The reader
     // parses only newly-appended bytes each tick.
-    let mut progress =
-        ProgressReader::new(request.log_path.clone(), request.log_source_roots.clone());
+    let mut progress = ProgressReader::new(
+        request.log_path.clone(),
+        &request.log_source_roots,
+        request
+            .source_credentials
+            .as_ref()
+            .map(|(url, _)| url.as_str()),
+    );
 
     let result = drive_run(
         &mut rx,
@@ -857,7 +868,7 @@ mod tests {
             job_id: "job".to_string(),
             server_url: "https://immich.example.com".to_string(),
             api_key: "secret".to_string(),
-            source_path: "/src".to_string(),
+            source_paths: vec!["/src".to_string()],
             log_path: PathBuf::from("/logs/run.log"),
             log_source_roots: vec!["/src".to_string()],
             device_uuid: "dev".to_string(),
@@ -1032,6 +1043,47 @@ mod tests {
     }
 
     #[test]
+    fn google_photos_passes_all_archive_parts_to_one_command() {
+        let mut req = request(Organization::SingleAlbum, None);
+        req.extended.source = crate::services::import_source::ImportSource::GooglePhotos;
+        req.source_paths = vec![
+            "/takeout/part 1.zip".into(),
+            "/takeout/part-2.zip".into(),
+            "/takeout/part-3.zip".into(),
+        ];
+        let args = build_upload_args(&req, Path::new("/cfg.yaml"));
+        assert_eq!(&args[..2], &["upload", "from-google-photos"]);
+        assert_eq!(
+            &args[args.len() - req.source_paths.len()..],
+            &req.source_paths
+        );
+        assert_eq!(args.iter().filter(|arg| *arg == "upload").count(), 1);
+        assert!(!args.iter().any(|arg| arg.starts_with("--folder-as-")));
+    }
+
+    #[test]
+    fn immich_source_has_no_positional_paths_and_keeps_source_filters() {
+        let mut req = request(Organization::SingleAlbum, None);
+        req.extended.source = crate::services::import_source::ImportSource::Immich;
+        req.source_paths.clear();
+        req.date_range = Some("2026-01-01,2026-12-31".into());
+        req.include_type = Some("IMAGE".into());
+        req.include_extensions = vec![".jpg".into()];
+        req.exclude_extensions = vec![".gif".into()];
+        let args = build_upload_args(&req, Path::new("/cfg.yaml"));
+        assert_eq!(&args[..2], &["upload", "from-immich"]);
+        for expected in [
+            "--from-date-range=2026-01-01,2026-12-31",
+            "--from-include-type=IMAGE",
+            "--from-include-extensions=.jpg",
+            "--from-exclude-extensions=.gif",
+        ] {
+            assert!(args.iter().any(|arg| arg == expected), "{args:?}");
+        }
+        assert!(!args.iter().any(|arg| arg == "/src" || arg.is_empty()));
+    }
+
+    #[test]
     fn stderr_buffer_keeps_recent_bounded_lines_as_separate_entries() {
         let mut buffer = StderrBuffer::new();
         for index in 0..=MAX_STDERR_LINES {
@@ -1093,7 +1145,37 @@ mod tests {
     fn reader_for(dir: &Path, contents: &str) -> ProgressReader {
         let log_path = dir.join("run.log");
         fs::write(&log_path, contents).unwrap();
-        ProgressReader::new(log_path, vec![dir.to_string_lossy().to_string()])
+        ProgressReader::new(log_path, &[dir.to_string_lossy().to_string()], None)
+    }
+
+    #[test]
+    fn live_server_progress_counts_duplicates_without_a_local_current_path() {
+        let dir = log_dir();
+        let log_path = dir.join("run.log");
+        fs::write(
+            &log_path,
+            "2026-10-07 10:00:00 INF server has duplicate file=https://source.example:2283:01234567-89ab-cdef-0123-456789abcdef\n\
+2026-10-07 10:00:01 INF server has duplicate file=https://source.example:2283:11111111-2222-3333-4444-555555555555",
+        ).unwrap();
+        let mut reader = ProgressReader::new(
+            log_path,
+            &[String::new()],
+            Some("https://source.example:2283"),
+        );
+        let (progress, path) = reader.poll();
+        assert_eq!(progress.duplicates, 1);
+        assert!(path.is_none());
+        assert_eq!(
+            reader.poll().0.duplicates,
+            1,
+            "polling again must not count the same event twice"
+        );
+        let final_run = reader.finish();
+        assert_eq!(final_run.progress.duplicates, 2);
+        assert_eq!(final_run.progress.total, 2);
+        assert!(final_run.completed_paths.is_empty());
+        assert_eq!(final_run.unresolved_file_events, 0);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn terminated(code: Option<i32>) -> CommandEvent {

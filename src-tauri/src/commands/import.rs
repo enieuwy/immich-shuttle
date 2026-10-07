@@ -995,6 +995,20 @@ fn finalize_job(update: ImportJob, cancel: Option<&AtomicBool>) -> ImportJob {
     stored
 }
 
+/// Finalization no longer owns a RUNNING_IMPORTS entry. A cancellation then
+/// lives in JOBS rather than in the worker's flag; both must gate server writes.
+fn import_is_cancelled(job_id: &str, cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::Relaxed)
+        || JOBS
+            .lock()
+            .map(|jobs| {
+                jobs.iter()
+                    .find(|job| job.id == job_id)
+                    .is_none_or(|job| matches!(job.status, JobStatus::Cancelled))
+            })
+            .unwrap_or(true)
+}
+
 /// Re-verify renderer-supplied selected paths against the user-approved source
 /// roots. The frontend sends `select_files` over IPC, so a compromised or buggy
 /// renderer could point staging at files outside the chosen folders; we reject
@@ -1072,6 +1086,118 @@ fn immutable_source_manifest(
     }
     Ok(manifest)
 }
+type SourceManifestResult = Result<(HashSet<PathBuf>, Option<u64>), String>;
+
+/// Only extension membership is knowable from a filesystem manifest. Keep the
+/// manifest intact: it proves deletion candidates, not uploader eligibility.
+/// Type/date filters, banned names, server format support, and duplicates can
+/// further reduce this upper bound, so it must never reject an import.
+fn capacity_extension_matches(path: &Path, included: &[String], excluded: &[String]) -> bool {
+    let extension = path
+        .extension()
+        .map(|ext| format!(".{}", ext.to_string_lossy().to_ascii_lowercase()))
+        .unwrap_or_default();
+    (included.is_empty() || included.contains(&extension)) && !excluded.contains(&extension)
+}
+
+fn source_byte_upper_bound(
+    manifest: &HashSet<PathBuf>,
+    included: &[String],
+    excluded: &[String],
+    cancel: &AtomicBool,
+    progress: &AtomicU64,
+) -> Result<Option<u64>, String> {
+    let mut bytes = 0u64;
+    for path in manifest {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Source inspection was cancelled.".into());
+        }
+        if !capacity_extension_matches(path, included, excluded) {
+            continue;
+        }
+        let metadata = std::fs::metadata(path);
+        progress.fetch_add(1, Ordering::Relaxed);
+        let Some(total) = metadata.ok().and_then(|meta| bytes.checked_add(meta.len())) else {
+            return Ok(None);
+        };
+        bytes = total;
+    }
+    Ok(Some(bytes))
+}
+
+fn capacity_preflight_warning(
+    source_bytes: Option<u64>,
+    storage: Result<serde_json::Value, String>,
+) -> Option<String> {
+    let Ok(storage) = storage else {
+        return Some(
+            "Capacity preflight is unavailable; server headroom could not be read.".into(),
+        );
+    };
+    let Some(free) = storage
+        .get("available_bytes")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return Some(
+            "Server capacity is unknown; the server did not report quota or disk headroom.".into(),
+        );
+    };
+    let mut warnings = Vec::new();
+    match source_bytes {
+        Some(bytes) if bytes > free => warnings.push(format!(
+            "Advisory capacity estimate: extension-filtered source files occupy up to {bytes} bytes, exceeding server headroom of {free} bytes. Actual upload size may be smaller because of type/date filters, unsupported files, ignored files, or duplicates; the import can continue."
+        )),
+        None => warnings.push(format!(
+            "Capacity preflight cannot estimate source bytes; server headroom is {free} bytes."
+        )),
+        _ => {}
+    }
+    if !storage["disk_warning"].is_null() {
+        warnings.push("Disk capacity is unavailable; only user quota could be checked.".into());
+    }
+    (!warnings.is_empty()).then(|| warnings.join(" "))
+}
+
+/// Google Photos matches media and JSON across all selected takeout parts.
+/// Other sources keep the existing one-path-per-process behavior.
+fn upload_invocations(
+    source: crate::services::import_source::ImportSource,
+    paths: Vec<String>,
+) -> impl Iterator<Item = Vec<String>> {
+    let (mut multipart, mut singles) =
+        if source == crate::services::import_source::ImportSource::GooglePhotos {
+            (Some(paths), Vec::new().into_iter())
+        } else {
+            (None, paths.into_iter())
+        };
+    std::iter::from_fn(move || {
+        multipart
+            .take()
+            .or_else(|| singles.next().map(|path| vec![path]))
+    })
+}
+
+fn reconcile_uploaded_assets(
+    run: &mut crate::services::stdout_parser::RunProgress,
+    source: crate::services::import_source::ImportSource,
+    uploaded_count: usize,
+) {
+    run.progress.uploaded = uploaded_count.min(u32::MAX as usize) as u32;
+    run.progress.total = run.progress.total.max(
+        run.progress
+            .uploaded
+            .saturating_add(run.progress.duplicates),
+    );
+    // Archive members are not local paths. Reconciliation supplies their
+    // new-asset evidence. Server-source duplicate IDs must still resolve.
+    if matches!(
+        source,
+        crate::services::import_source::ImportSource::GooglePhotos
+            | crate::services::import_source::ImportSource::Icloud
+    ) {
+        run.unresolved_file_events = 0;
+    }
+}
 
 /// Await a source-manifest walk under the same silence bound staging uses,
 /// yielding the manifest or the reason there is none.
@@ -1087,7 +1213,7 @@ fn immutable_source_manifest(
 /// fault, offers no delete prompt, and cannot advance the checkpoint, which is
 /// the honest reading of "nothing is known about what was on this source".
 async fn bounded_source_manifest(
-    task: tauri::async_runtime::JoinHandle<Result<(HashSet<PathBuf>, Option<u64>), String>>,
+    task: tauri::async_runtime::JoinHandle<SourceManifestResult>,
     progress: &AtomicU64,
     cancel: &AtomicBool,
     stall: Duration,
@@ -2189,6 +2315,8 @@ pub async fn start_import(
         // log entry can only propose a wipe when it names this immutable set.
         let manifest_selection = select_files.clone();
         let manifest_sources = source_paths.clone();
+        let capacity_included = include_extensions.clone();
+        let capacity_excluded = exclude_extensions.clone();
         let manifest_cancel = cancel_flag.clone();
         let manifest_progress = Arc::new(AtomicU64::new(0));
         let manifest_progress_for_walk = manifest_progress.clone();
@@ -2233,20 +2361,13 @@ pub async fn start_import(
             )?;
             // File inspection shares the walk's bounded join. A stuck metadata
             // call cannot park the async import worker or its shutdown markers.
-            let mut bytes = Some(0u64);
-            for path in &manifest {
-                if manifest_cancel.load(Ordering::Relaxed) {
-                    return Err("Source inspection was cancelled.".into());
-                }
-                bytes = match (bytes, std::fs::metadata(path)) {
-                    (Some(total), Ok(meta)) => total.checked_add(meta.len()),
-                    _ => None,
-                };
-                manifest_progress_for_walk.fetch_add(1, Ordering::Relaxed);
-                if bytes.is_none() {
-                    break;
-                }
-            }
+            let bytes = source_byte_upper_bound(
+                &manifest,
+                &capacity_included,
+                &capacity_excluded,
+                manifest_cancel.as_ref(),
+                manifest_progress_for_walk.as_ref(),
+            )?;
             Ok((manifest, bytes))
         });
         let (pre_sidecar_manifest, source_bytes, manifest_error) = bounded_source_manifest(
@@ -2378,30 +2499,16 @@ pub async fn start_import(
         // job id to the frontend.
         let server_url = url_resolver::resolve_server_url(&profile).await;
         let client = ImmichClient::new(&server_url, &api_key_for_finalization);
-        let mut capacity_warning = None;
-        if folder_source {
-            match (source_bytes, client.storage_headroom().await) {
-                (Some(bytes), Ok(storage)) => {
-                    if storage.get("available_bytes").and_then(serde_json::Value::as_u64).is_some_and(|free| bytes > free) {
-                        finish_staging_exit(&app_clone, &job_id_clone, &profile.id,
-                            format!("Import requires {bytes} bytes, exceeding server headroom of {} bytes. No upload started.", storage["available_bytes"]),
-                            cancel_flag.as_ref(), RunRecord { started_at, source_paths: record_source_paths, request: history_request }).await;
-                        return;
-                    }
-                    if storage["available_bytes"].is_null() {
-                        capacity_warning = Some("Server capacity is unknown; the server did not report quota or disk headroom.".to_string());
-                    } else if !storage["disk_warning"].is_null() {
-                        capacity_warning = Some("Disk capacity is unavailable; only user quota could be checked.".to_string());
-                    }
-                }
-                _ => capacity_warning = Some("Capacity preflight is unavailable; the source size or server headroom could not be read.".to_string()),
-            }
-        }
+        let capacity_warning = if folder_source {
+            capacity_preflight_warning(source_bytes, client.storage_headroom().await)
+        } else {
+            None
+        };
         let request = UploadRequest {
             job_id: job_id_clone.clone(),
             server_url,
             api_key: api_key_clone,
-            source_path: upload_paths[0].clone(),
+            source_paths: Vec::new(),
             log_path,
             log_source_roots: invocation_roots.clone(),
             device_uuid,
@@ -2424,8 +2531,8 @@ pub async fn start_import(
         };
         let mut tally = RunTally::new();
         let mut request = request;
-        for path in upload_paths {
-            request.source_path = path;
+        for paths in upload_invocations(extended.source, upload_paths) {
+            request.source_paths = paths;
             // The loop is iteration only; `absorb` owns what each result means
             // to the run, including which of them must stop it.
             if tally.absorb(run_upload(app_clone.clone(), request.clone()).await) {
@@ -2527,8 +2634,14 @@ pub async fn start_import(
                 ),
             );
         }
-        let mut run =
-            crate::services::stdout_parser::parse_run_progress(&log_contents, &invocation_roots);
+        let mut run = crate::services::stdout_parser::parse_run_progress(
+            &log_contents,
+            &invocation_roots,
+            request
+                .source_credentials
+                .as_ref()
+                .map(|(url, _)| url.as_str()),
+        );
         let reconciliation =
             if !extended.dry_run && matches!(outcome, RunOutcome::Exited { success: true }) {
                 Some(client.assets_for_device(&request.device_uuid).await)
@@ -2537,17 +2650,7 @@ pub async fn start_import(
             };
         let reconciled_assets = reconciliation.as_ref().and_then(|r| r.as_ref().ok());
         if let Some(assets) = reconciled_assets {
-            run.progress.uploaded = assets.len().min(u32::MAX as usize) as u32;
-            run.progress.total = run.progress.total.max(
-                run.progress
-                    .uploaded
-                    .saturating_add(run.progress.duplicates),
-            );
-            // Archive paths are virtual members, not local paths. Their new-asset
-            // evidence comes from the device-scoped server response instead.
-            if !folder_source {
-                run.unresolved_file_events = 0;
-            }
+            reconcile_uploaded_assets(&mut run, extended.source, assets.len());
         }
         // A non-zero count here means some `file=` records in the run log did
         // not resolve against any invocation root. Resolution is now mandatory
@@ -2624,8 +2727,8 @@ pub async fn start_import(
                 leases.insert(job_id_clone.clone());
             }
         }
-        let cancelled =
-            !unconfirmed_termination && (cancelled || cancel_flag.load(Ordering::Relaxed));
+        let cancelled = !unconfirmed_termination
+            && (cancelled || import_is_cancelled(&job_id_clone, cancel_flag.as_ref()));
 
         // Only a completed run can earn the checkpoint; cancelled/failed stay false.
         let mut checkpoint_eligible = false;
@@ -2850,7 +2953,10 @@ pub async fn start_import(
                 "Dry-run plan only. No upload or deletion requested. {}",
                 update.summary.unwrap_or_default()
             ));
-        } else if !cancelled && matches!(outcome, RunOutcome::Exited { success: true }) {
+        } else if !cancelled
+            && !import_is_cancelled(&job_id_clone, cancel_flag.as_ref())
+            && matches!(outcome, RunOutcome::Exited { success: true })
+        {
             let post_result = match reconciliation {
                 Some(Ok(assets))
                     if !incomplete && update.progress.errors == 0 && update.error.is_none() =>
@@ -2861,6 +2967,7 @@ pub async fn start_import(
                         &assets,
                         update.album_id.as_deref(),
                         &request.server_url,
+                        || import_is_cancelled(&job_id_clone, cancel_flag.as_ref()),
                     )
                     .await
                 }
@@ -2913,9 +3020,9 @@ pub async fn start_import(
         // Cancelled; finalize_job refuses to move the job back out of it and
         // returns what is actually stored, so the log/history below record the
         // outcome the user was shown rather than the one this task computed.
-        // No cancel flag here: `cancelled` above was already re-read from it
-        // before the wipe payload was built, and the stored-`Cancelled` guard
-        // inside `finalize_job` covers a cancel that lands later.
+        // The live cancellation closure above also gates every server mutation.
+        // The stored-state guard here preserves the cancellation for callbacks
+        // and history without hiding an unconfirmed worker termination.
         let mut update = finalize_job(update, None);
         deliver_callback(&mut update, &history_request).await;
         persist_run_history(
@@ -4078,6 +4185,7 @@ mod tests {
         let run = crate::services::stdout_parser::parse_run_progress(
             "",
             &[invocation_root.to_string_lossy().into_owned()],
+            None,
         );
         staging::cleanup_staging_dir(staged);
 
@@ -4128,6 +4236,7 @@ mod tests {
         let run = crate::services::stdout_parser::parse_run_progress(
             &log,
             &[invocation_root.to_string_lossy().into_owned()],
+            None,
         );
         staging::cleanup_staging_dir(staged);
 
@@ -4575,12 +4684,50 @@ mod tests {
         lock_jobs().push(job);
         lock_finalizing().insert(job_id.clone());
         assert!(!lock_running().contains_key(&job_id));
+        let flag = AtomicBool::new(false);
+        let is_cancelled = || import_is_cancelled(&job_id, &flag);
+        assert!(
+            !is_cancelled(),
+            "finalization can begin before cancellation"
+        );
 
         tauri::async_runtime::block_on(import_cancel(job_id.clone()))
             .expect("a finalizing import still accepts cancellation");
 
         let stored = get_job(&job_id).expect("the cancelled job remains stored");
         assert!(matches!(stored.status, JobStatus::Cancelled));
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "no worker flag remains to signal"
+        );
+        assert!(
+            is_cancelled(),
+            "the callback must read the new stored cancellation"
+        );
+        let mut actions = replayable_input("p1");
+        actions.extended.clock_offset_minutes = 60;
+        actions.extended.share_user_ids = vec!["viewer".into()];
+        actions.extended.public_link = true;
+        let error = tauri::async_runtime::block_on(crate::services::import_actions::apply(
+            &ImmichClient::new("", "isolated-test-key"),
+            &actions,
+            &[serde_json::json!({"id": "asset", "fileCreatedAt": "2026-10-07T10:00:00Z"})],
+            Some("confirmed-album"),
+            "",
+            is_cancelled,
+        ))
+        .expect_err("a cancelled finalization cannot begin server actions");
+        assert_eq!(error, "Import cancelled.");
+        let receipt = run_history_record(
+            &finalize_job(terminal_job(&job_id, false), None),
+            RunRecord {
+                started_at: 0,
+                source_paths: Vec::new(),
+                request: replayable_input("p1"),
+            },
+            false,
+        );
+        assert!(matches!(receipt.status, RecordStatus::Cancelled));
 
         lock_finalizing().remove(&job_id);
         lock_jobs().retain(|job| job.id != job_id);
@@ -5263,7 +5410,7 @@ mod tests {
              2026-06-24 16:10:01 ERR DCIM/SUB: file does not exist\n"
         );
 
-        let run = crate::services::stdout_parser::parse_run_progress(&log, &roots);
+        let run = crate::services::stdout_parser::parse_run_progress(&log, &roots, None);
         let file_errors = crate::services::stdout_parser::parse_error_log(&log, &roots);
         assert_eq!(run.progress.uploaded, 1, "one asset landed");
         assert_eq!(run.scan_errors, 1, "and one source could not be read");
@@ -6246,7 +6393,7 @@ mod tests {
              2026-06-24 16:10:01 INF uploaded successfully file=/elsewhere/unknown.jpg\n",
             root.display()
         );
-        let run = crate::services::stdout_parser::parse_run_progress(&log, &roots);
+        let run = crate::services::stdout_parser::parse_run_progress(&log, &roots, None);
         assert_eq!(run.progress.uploaded, 1);
         assert_eq!(
             run.unresolved_file_events, 1,
@@ -6715,5 +6862,320 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn capacity_estimate_filters_extensions_without_narrowing_the_manifest() {
+        let root = std::env::temp_dir().join(format!("capacity-filter-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let photo = root.join("photo.JPG");
+        let video = root.join("excluded.mp4");
+        let unsupported = root.join("unsupported.txt");
+        std::fs::write(&photo, b"photo").unwrap();
+        std::fs::File::create(&video)
+            .unwrap()
+            .set_len(10_000)
+            .unwrap();
+        std::fs::File::create(&unsupported)
+            .unwrap()
+            .set_len(20_000)
+            .unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let cancel = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let manifest = immutable_source_manifest(None, &roots, &cancel, &progress).unwrap();
+        let mut input = replayable_input("p1");
+        input.source_paths = roots;
+        input.include_type = Some("IMAGE".into());
+        input.include_extensions = vec![" JPG ".into(), "mp4".into()];
+        input.exclude_extensions = vec![".MP4".into()];
+        input.date_range = Some("2026-01-01,2026-12-31".into());
+        let plan = plan_import_start(&input).unwrap();
+        let bytes = source_byte_upper_bound(
+            &manifest,
+            &plan.include_extensions,
+            &plan.exclude_extensions,
+            &cancel,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(
+            bytes,
+            Some(5),
+            "the excluded video cannot cause a capacity rejection"
+        );
+        assert!(capacity_preflight_warning(
+            bytes,
+            Ok(serde_json::json!({"available_bytes": 5, "disk_warning": null})),
+        )
+        .is_none());
+        assert_eq!(
+            manifest.len(),
+            3,
+            "capacity filters must not change deletion evidence"
+        );
+        for file in [&photo, &video, &unsupported] {
+            assert!(manifest.contains(&file.canonicalize().unwrap()));
+        }
+        let (kept, dropped) =
+            retain_paths_in_manifest(vec![video.to_string_lossy().into_owned()], Some(&manifest));
+        assert_eq!(
+            kept.len(),
+            1,
+            "the immutable manifest stays independent of filters"
+        );
+        assert_eq!(dropped, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn capacity_estimate_preserves_selection_and_exclusion_precedence() {
+        let root = std::env::temp_dir().join(format!("capacity-selection-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let selected = root.join("selected.jpg");
+        let unselected = root.join("unselected.jpg");
+        std::fs::write(&selected, b"small").unwrap();
+        std::fs::File::create(&unselected)
+            .unwrap()
+            .set_len(10_000)
+            .unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let selection = vec![selected.to_string_lossy().into_owned()];
+        let cancel = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let manifest =
+            immutable_source_manifest(Some(&selection), &roots, &cancel, &progress).unwrap();
+        assert_eq!(
+            source_byte_upper_bound(&manifest, &[], &[], &cancel, &progress).unwrap(),
+            Some(5)
+        );
+        let include = normalize_extensions(&["JPG".into()]);
+        let exclude = normalize_extensions(&[".jpg".into()]);
+        assert_eq!(
+            source_byte_upper_bound(&manifest, &include, &exclude, &cancel, &progress).unwrap(),
+            Some(0),
+            "an explicit exclusion wins over inclusion",
+        );
+        let missing = root.join("unreadable.mp4");
+        let mut evidence = manifest.clone();
+        evidence.insert(missing);
+        assert_eq!(
+            source_byte_upper_bound(&evidence, &include, &[], &cancel, &progress).unwrap(),
+            Some(5),
+            "excluded metadata reads must not erase a useful bound",
+        );
+        assert_eq!(
+            source_byte_upper_bound(&evidence, &[], &[], &cancel, &progress).unwrap(),
+            None,
+            "an unreadable included file makes the estimate unknown",
+        );
+        cancel.store(true, Ordering::Relaxed);
+        assert!(source_byte_upper_bound(&manifest, &[], &[], &cancel, &progress).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn capacity_preflight_reports_advisory_shortfalls_and_boundary_conditions() {
+        for (bytes, free, warned) in [(0, 0, false), (5, 5, false), (4, 5, false), (6, 5, true)] {
+            let warning = capacity_preflight_warning(
+                Some(bytes),
+                Ok(serde_json::json!({"available_bytes": free, "disk_warning": null})),
+            );
+            assert_eq!(
+                warning.is_some(),
+                warned,
+                "{bytes} source bytes, {free} free"
+            );
+            if let Some(warning) = warning {
+                assert!(warning.contains("Advisory"));
+                assert!(warning.contains("type/date filters"));
+                assert!(warning.contains("unsupported files"));
+                assert!(warning.contains("duplicates"));
+                assert!(warning.contains("the import can continue"));
+            }
+        }
+        let quota_only = capacity_preflight_warning(
+            Some(6),
+            Ok(serde_json::json!({"available_bytes": 5, "disk_warning": "not permitted"})),
+        )
+        .unwrap();
+        assert!(quota_only.contains("exceeding server headroom of 5 bytes"));
+        assert!(quota_only.contains("only user quota"));
+        let unknown_source = capacity_preflight_warning(
+            None,
+            Ok(serde_json::json!({"available_bytes": 5, "disk_warning": null})),
+        )
+        .unwrap();
+        assert!(unknown_source.contains("cannot estimate source bytes"));
+        assert!(unknown_source.contains("headroom is 5 bytes"));
+        let unknown_server = capacity_preflight_warning(
+            Some(6),
+            Ok(serde_json::json!({"available_bytes": null, "disk_warning": null})),
+        )
+        .unwrap();
+        assert!(unknown_server.contains("capacity is unknown"));
+        assert!(capacity_preflight_warning(Some(6), Err("offline".into()))
+            .unwrap()
+            .contains("headroom could not be read"));
+    }
+
+    #[test]
+    fn google_photos_multipart_request_uses_one_invocation_without_changing_other_sources() {
+        use crate::services::import_source::ImportSource;
+        let parts: Vec<String> = vec![
+            "/takeout/part 1.zip".into(),
+            "/takeout/part-2.zip".into(),
+            "/takeout/part-3.zip".into(),
+        ];
+        let mut input = replayable_input("p1");
+        input.extended.source = ImportSource::GooglePhotos;
+        input.source_paths = parts.clone();
+        let plan = plan_import_start(&input).unwrap();
+        assert_eq!(plan.source_paths, parts);
+        assert_eq!(
+            upload_invocations(input.extended.source, plan.source_paths).collect::<Vec<_>>(),
+            vec![parts.clone()],
+            "photos and JSON in different parts must reach the same metadata matcher",
+        );
+        for source in [ImportSource::Folder, ImportSource::Icloud] {
+            assert_eq!(
+                upload_invocations(source, parts.clone()).collect::<Vec<_>>(),
+                parts
+                    .iter()
+                    .map(|part| vec![part.clone()])
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(
+            upload_invocations(ImportSource::Immich, vec![String::new()]).collect::<Vec<_>>(),
+            vec![vec![String::new()]],
+            "the server source keeps one invocation without filesystem arguments",
+        );
+    }
+
+    #[tokio::test]
+    async fn server_duplicates_survive_reconciliation_queue_history_cli_and_callback() {
+        use crate::services::{import_source::ImportSource, stdout_parser::parse_run_progress};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let source = "https://source.example:2283";
+        let log = "2026-10-07 10:00:00 INF server has duplicate file=https://source.example:2283:01234567-89ab-cdef-0123-456789abcdef\n\
+2026-10-07 10:00:01 INF server has duplicate file=https://source.example:2283:11111111-2222-3333-4444-555555555555\n\
+2026-10-07 10:00:02 INF server has duplicate file=https://source.example:2283:11111111-2222-3333-4444-555555555555";
+        let mut run = parse_run_progress(log, &[String::new()], Some(source));
+        reconcile_uploaded_assets(&mut run, ImportSource::Immich, 0);
+        assert_eq!(
+            run.progress.uploaded, 0,
+            "reconciliation only counts new destination assets"
+        );
+        assert_eq!(run.progress.duplicates, 2);
+        assert_eq!(run.progress.total, 2);
+        assert!(
+            run.completed_paths.is_empty(),
+            "remote assets never become local wipe candidates"
+        );
+        let classification = classify_completed_run(
+            run.progress.uploaded,
+            run.progress.duplicates,
+            CLEAN_EXIT,
+            0,
+            true,
+            0,
+            run.scan_errors,
+        );
+        assert!(matches!(classification.status, JobStatus::Completed));
+        let job_id = format!("server-duplicates-{}", Uuid::new_v4());
+        let mut job = terminal_job(&job_id, false);
+        job.status = JobStatus::Running;
+        lock_jobs().push(job.clone());
+        job.status = classification.status;
+        job.progress = run.progress;
+        let mut job = finalize_job(job, None);
+        assert_eq!(get_job(&job_id).unwrap().progress.duplicates, 2);
+        let mut input = replayable_input("destination");
+        input.extended.source = ImportSource::Immich;
+        input.extended.source_profile_id = Some("source".into());
+        input.source_paths.clear();
+        let receipt = run_history_record(
+            &job,
+            RunRecord {
+                started_at: 0,
+                source_paths: Vec::new(),
+                request: input.clone(),
+            },
+            false,
+        );
+        assert_eq!(receipt.uploaded, 0);
+        assert_eq!(receipt.duplicates, 2);
+        let cli_result = serde_json::json!({"event": "result", "job": &job});
+        assert_eq!(cli_result["job"]["progress"]["duplicates"], 2);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        input.extended.completion_webhook_url =
+            Some(format!("http://{}/", listener.local_addr().unwrap()));
+        let callback_request = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            let body_start = loop {
+                let read = socket.read(&mut buf).await.unwrap();
+                assert!(read > 0, "the callback must send its complete body");
+                request.extend_from_slice(&buf[..read]);
+                let Some(start) = request
+                    .windows(4)
+                    .position(|bytes| bytes == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                else {
+                    continue;
+                };
+                let header = String::from_utf8_lossy(&request[..start]);
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                if request.len() >= start + length {
+                    break start;
+                }
+            };
+            let body: serde_json::Value = serde_json::from_slice(&request[body_start..]).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            body
+        });
+        deliver_callback(&mut job, &input).await;
+        let callback = tokio::time::timeout(Duration::from_secs(5), callback_request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(callback["uploaded"], 0);
+        assert_eq!(callback["duplicates"], 2);
+        assert_eq!(callback["success"], true);
+        assert!(job.error.is_none());
+        lock_jobs().retain(|job| job.id != job_id);
+    }
+
+    #[test]
+    fn server_reconciliation_keeps_duplicate_counts_and_unresolved_identity_faults() {
+        use crate::services::{import_source::ImportSource, stdout_parser::parse_run_progress};
+        let log = "2026-10-07 10:00:00 INF uploaded successfully file=https://source.example:01234567-89ab-cdef-0123-456789abcdef\n\
+2026-10-07 10:00:01 INF server has duplicate file=https://source.example:11111111-2222-3333-4444-555555555555\n\
+2026-10-07 10:00:02 INF server has duplicate file=https://other.example:22222222-3333-4444-5555-666666666666";
+        let mut run = parse_run_progress(log, &[String::new()], Some("https://source.example"));
+        reconcile_uploaded_assets(&mut run, ImportSource::Immich, 1);
+        assert_eq!(
+            run.progress.uploaded, 1,
+            "reconciliation replaces, rather than adds, new uploads"
+        );
+        assert_eq!(run.progress.duplicates, 1);
+        assert_eq!(
+            run.unresolved_file_events, 1,
+            "new uploads do not prove remote duplicate identities"
+        );
+        assert!(run.completed_paths.is_empty());
     }
 }

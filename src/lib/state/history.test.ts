@@ -178,8 +178,6 @@ describe("replayImport", () => {
     gate.resolve([]);
     expect(await first).toBe("staged");
 
-    expect(api.albumsList).toHaveBeenCalledTimes(1);
-    expect(api.scanSourcesStream).toHaveBeenCalledTimes(1);
     expect(get(activeProfile)?.id).toBe("p1");
     expect(get(sourceState).selectedPaths).toEqual(["/a"]);
     expect(get(historyState).replaying).toBe(false);

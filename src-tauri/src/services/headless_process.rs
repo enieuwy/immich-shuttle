@@ -49,13 +49,13 @@ fn drain(mut input: impl Read + Send + 'static, tx: Sender<CommandEvent>, stderr
             }
             for byte in &chunk[..n] {
                 if *byte == b'\n' || *byte == b'\r' {
-                    if stderr && !line.is_empty() {
-                        if tx
+                    if stderr
+                        && !line.is_empty()
+                        && tx
                             .blocking_send(CommandEvent::Stderr(std::mem::take(&mut line)))
                             .is_err()
-                        {
-                            return;
-                        }
+                    {
+                        return;
                     }
                     line.clear();
                 } else if stderr && line.len() < 4096 {

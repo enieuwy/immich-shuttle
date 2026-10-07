@@ -5,7 +5,7 @@
   import { albumsState } from "$lib/state/albums";
   import { sourceState } from "$lib/state/source";
   import { selectionState } from "$lib/state/selection";
-  import { importOptionsState, isDateRangeInvalid, toImmichDateRange } from "$lib/state/import-options";
+  import { importOptionsState, isDateRangeInvalid, resolveImportDateRange } from "$lib/state/import-options";
   import { queueState } from "$lib/state/queue";
   import { panelTab } from "$lib/state/ui";
   import type { ImportExtensions, ImportInput } from "$lib/types";
@@ -44,7 +44,7 @@
     const result = await open({ directory, multiple: true, title: directory ? "Choose import folders" : "Choose exported archives" });
     if (result) paths = (Array.isArray(result) ? result : [result]).join("\n");
   }
-  function request(dryRun: boolean): ImportInput {
+  async function request(dryRun: boolean): Promise<ImportInput> {
     const profile = $activeProfile;
     if (!profile) throw new Error("Choose a destination profile first.");
     if (selectedAlbums.length && $albumsState.loadedProfileId !== profile.id) throw new Error("Wait for this profile's albums to load.");
@@ -58,10 +58,10 @@
     }
     const sourcePaths = kind === "immich" ? [] : selection ? [...$sourceState.selectedPaths] : paths.split("\n").map(p => p.trim()).filter(Boolean);
     const album = $albumsState.availableAlbums.find(a => a.id === selectedAlbums[0]);
-    return {
+    const input: ImportInput = {
       profile_id: profile.id, source_paths: sourcePaths, album_ids: [...selectedAlbums], keep_files: true,
       stack_raw_jpeg: options.stackRawJpeg, stack_burst: options.stackBurst,
-      concurrent_tasks: options.concurrentTasks, date_range: selection ? null : toImmichDateRange(options.dateFrom, options.dateTo),
+      concurrent_tasks: options.concurrentTasks, date_range: null,
       select_files: selection ? [...$selectionState.selected] : null,
       into_album: album?.album_name ?? null, organization: "single_album", on_errors: options.keepGoingOnErrors ? "continue" : "stop",
       tags: [...options.tags], session_tag: options.sessionTag, overwrite: options.overwrite,
@@ -72,12 +72,13 @@
         dry_run: dryRun, completion_webhook_url: callback.trim() || null,
         share_user_ids: [...recipients], share_role: shareRole, public_link: publicLink },
     };
+    input.date_range = await resolveImportDateRange(options, profile.id, sourcePaths, selection, kind);
+    return input;
   }
   async function start(dryRun: boolean) {
     error = ""; message = ""; busy = true;
     try {
-      const input = request(dryRun);
-      await queueState.startRequest(input);
+      await queueState.startRequest(() => request(dryRun));
       panelTab.set("queue");
       message = dryRun ? "Plan started. Read the dry-run result in Queue before starting an upload." : "Import started. All source originals stay on disk.";
     } catch (reason) { error = String(reason); }
@@ -85,10 +86,20 @@
   }
   async function storage() {
     if (!$activeProfile) return;
+    const profileId = $activeProfile.id;
+    const selectedBytes = kind === "folder" && useSelection && $sourceState.scanOutcome === "complete"
+      ? $sourceState.scanResult?.files.reduce((bytes, file) => bytes + ($selectionState.selected.has(file.path) ? file.size_bytes : 0), 0) ?? null
+      : null;
     error = ""; busy = true;
     try {
-      const info = await invoke<{available_bytes: number | null; disk_warning: string | null}>("import_storage", {profileId: $activeProfile.id});
-      message = info.available_bytes == null ? "The server did not report available capacity." : `Reported headroom: ${(info.available_bytes / 1024 ** 3).toFixed(2)} GiB. Folder imports also check capacity before upload.`;
+      const info = await invoke<{available_bytes: number | null; disk_warning: string | null}>("import_storage", {profileId});
+      if ($activeProfile?.id !== profileId) return;
+      message = info.available_bytes == null ? "The server did not report available capacity." : `Reported headroom: ${info.available_bytes.toLocaleString()} bytes (${(info.available_bytes / 1024 ** 3).toFixed(2)} GiB).`;
+      if (selectedBytes != null && info.available_bytes != null) {
+        message += ` Selected file-size upper bound: ${selectedBytes.toLocaleString()} bytes.`;
+        if (selectedBytes > info.available_bytes) message += " Warning: this exceeds reported headroom.";
+        message += " The uploader may skip filtered files, unsupported files, or duplicates. This estimate does not block imports.";
+      }
       if (info.disk_warning) message += " Disk capacity is unavailable; the server may require admin permission.";
     } catch (reason) { error = String(reason); }
     finally { busy = false; }

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Features
+- Preview lightbox with EXIF details, video playback, and filename, size, camera, and GPS filters.
+- Migration panel for Google Photos Takeout, iCloud exports, and server-to-server copies, with dry-run plans, capture-date correction, sharing, and completion callbacks.
+- Advisory capacity check, external-library registration, profile metadata backup, release check, history analytics, and a headless CLI.
+
 ### Fixes
 - Folder-name, folder-path, and folder-tag imports ignore the selected single album without clearing the picker.
 - Forecast requests reject an empty source list before taking the forecast slot or reading credentials.
