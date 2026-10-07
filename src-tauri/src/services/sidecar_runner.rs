@@ -147,6 +147,8 @@ pub struct UploadRequest {
     pub include_type: Option<String>,
     pub include_extensions: Vec<String>,
     pub exclude_extensions: Vec<String>,
+    pub extended: crate::services::import_source::ImportExtensions,
+    pub source_credentials: Option<(String, String)>,
 }
 
 /// Removes the private per-run config directory (with the api-key file inside)
@@ -191,7 +193,10 @@ impl Drop for TempConfig {
 /// config file is created with exclusive semantics (`create_new`) at 0600 — a
 /// local attacker can neither pre-create nor symlink-hijack the path. The
 /// returned guard removes the whole directory when the run finishes.
-fn write_api_key_config(api_key: &str) -> Result<TempConfig, String> {
+fn write_api_key_config(
+    api_key: &str,
+    source: Option<&(String, String)>,
+) -> Result<TempConfig, String> {
     let dir = std::env::temp_dir().join(format!("immich-shuttle-{}", Uuid::new_v4()));
     #[cfg(unix)]
     let dir_builder = {
@@ -220,8 +225,14 @@ fn write_api_key_config(api_key: &str) -> Result<TempConfig, String> {
         retain: false,
     };
 
-    let escaped = api_key.replace('\\', "\\\\").replace('"', "\\\"");
-    let contents = format!("upload:\n    api-key: \"{escaped}\"\n");
+    let quote = |value: &str| serde_json::to_string(value).expect("string serialization");
+    let mut contents = format!("upload:\n    api-key: {}\n", quote(api_key));
+    if let Some((url, key)) = source {
+        contents.push_str(&format!(
+            "    from-immich:\n        from-server: {}\n        from-api-key: {}\n        from-pause-immich-jobs: false\n",
+            quote(url), quote(key)
+        ));
+    }
 
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -313,7 +324,7 @@ impl ProgressReader {
 
 /// Emit a progress snapshot to the frontend.
 fn emit_progress(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     job_id: &str,
     progress: &crate::models::job::JobProgress,
     current_path: Option<&str>,
@@ -323,14 +334,17 @@ fn emit_progress(
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
     });
-    let _ = app.emit(
-        "import-progress",
-        serde_json::json!({
-            "job_id": job_id,
-            "progress": progress,
-            "current_file": current_file,
-        }),
-    );
+    let payload = serde_json::json!({
+        "job_id": job_id, "progress": progress, "current_file": current_file,
+    });
+    if let Some(app) = app {
+        let _ = app.emit("import-progress", payload);
+    } else {
+        println!(
+            "{}",
+            serde_json::json!({"event": "progress", "data": payload})
+        );
+    }
 }
 
 /// The sidecar control handle the run loop needs: a one-shot kill.
@@ -350,6 +364,19 @@ trait KillHandle {
 impl KillHandle for CommandChild {
     fn kill(self) -> Result<(), String> {
         CommandChild::kill(self).map_err(|error| format!("could not kill sidecar: {error}"))
+    }
+}
+
+enum RunningChild {
+    Desktop(CommandChild),
+    Headless(crate::services::headless_process::NativeChild),
+}
+impl KillHandle for RunningChild {
+    fn kill(self) -> Result<(), String> {
+        match self {
+            Self::Desktop(child) => KillHandle::kill(child),
+            Self::Headless(child) => child.kill(),
+        }
     }
 }
 
@@ -444,7 +471,7 @@ fn reap_diagnostic(outcome: ReapOutcome) -> Option<String> {
 fn build_upload_args(request: &UploadRequest, config_path: &Path) -> Vec<String> {
     let mut args = vec![
         "upload".to_string(),
-        "from-folder".to_string(),
+        request.extended.source.command().to_string(),
         "--server".to_string(),
         request.server_url.clone(),
         "--config".to_string(),
@@ -470,24 +497,44 @@ fn build_upload_args(request: &UploadRequest, config_path: &Path) -> Vec<String>
     // Organization mode -> immich-go folder/tag flags. Only single-album mode
     // honors --into-album; the folder modes derive albums/tags from the tree and
     // ignore any single-album selection.
-    match request.organization {
-        Organization::SingleAlbum => {
-            args.push("--folder-as-album=NONE".to_string());
-            if let Some(album) = request.into_album.as_deref() {
-                let album = album.trim();
-                if !album.is_empty() {
-                    args.push(format!("--into-album={album}"));
+    if request.extended.source.folder_options() {
+        match request.organization {
+            Organization::SingleAlbum => {
+                args.push("--folder-as-album=NONE".to_string());
+                if let Some(album) = request.into_album.as_deref() {
+                    let album = album.trim();
+                    if !album.is_empty() {
+                        args.push(format!("--into-album={album}"));
+                    }
                 }
             }
+            Organization::FolderName => args.push("--folder-as-album=FOLDER".to_string()),
+            Organization::FolderPath => {
+                args.push("--folder-as-album=PATH".to_string());
+                args.push("--album-path-joiner= / ".to_string());
+            }
+            Organization::FolderTags => {
+                args.push("--folder-as-album=NONE".to_string());
+                args.push("--folder-as-tags".to_string());
+            }
         }
-        Organization::FolderName => args.push("--folder-as-album=FOLDER".to_string()),
-        Organization::FolderPath => {
-            args.push("--folder-as-album=PATH".to_string());
-            args.push("--album-path-joiner= / ".to_string());
-        }
-        Organization::FolderTags => {
-            args.push("--folder-as-album=NONE".to_string());
-            args.push("--folder-as-tags".to_string());
+    }
+    // Do not pause background jobs or change source-server jobs for a migration.
+    args.push("--pause-immich-jobs=false".to_string());
+    if request.extended.dry_run {
+        args.push("--dry-run".to_string());
+    }
+    if let Some(zone) = request
+        .extended
+        .time_zone
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+    {
+        args.push(format!("--time-zone={zone}"));
+    }
+    if request.extended.source.folder_options() {
+        if let Some(enabled) = request.extended.date_from_name {
+            args.push(format!("--date-from-name={enabled}"));
         }
     }
 
@@ -549,7 +596,23 @@ fn build_upload_args(request: &UploadRequest, config_path: &Path) -> Vec<String>
         ));
     }
 
-    args.push(request.source_path.clone());
+    if request.extended.source == crate::services::import_source::ImportSource::Immich {
+        for arg in &mut args {
+            if [
+                "--date-range=",
+                "--include-type=",
+                "--include-extensions=",
+                "--exclude-extensions=",
+            ]
+            .iter()
+            .any(|prefix| arg.starts_with(prefix))
+            {
+                *arg = format!("--from-{}", &arg[2..]);
+            }
+        }
+    } else {
+        args.push(request.source_path.clone());
+    }
     args
 }
 
@@ -718,25 +781,33 @@ fn settle_temp_config<L>(
 }
 
 pub async fn run_upload(
-    app: AppHandle,
+    app: Option<AppHandle>,
     request: UploadRequest,
 ) -> Result<SidecarResult, RunUploadError> {
-    let config = write_api_key_config(&request.api_key).map_err(RunUploadError::Other)?;
+    let config = write_api_key_config(&request.api_key, request.source_credentials.as_ref())
+        .map_err(RunUploadError::Other)?;
     // Pre-create the run log 0600 so immich-go's --log-file output (which can
     // carry an x-api-key header) is not world-readable on shared machines.
     create_private_log(&request.log_path).map_err(RunUploadError::Other)?;
     let args = build_upload_args(&request, &config.path);
 
-    let sidecar = app
-        .shell()
-        .sidecar("immich-go")
-        .map_err(|e| RunUploadError::Other(format!("Could not prepare immich-go sidecar: {e}")))?
-        .env("GODEBUG", "netdns=cgo")
-        .args(args);
-
-    let (mut rx, child) = sidecar
-        .spawn()
-        .map_err(|e| RunUploadError::Other(format!("Could not spawn immich-go sidecar: {e}")))?;
+    let (mut rx, child) = if let Some(app) = &app {
+        let (rx, child) = app
+            .shell()
+            .sidecar("immich-go")
+            .map_err(|e| RunUploadError::Other(e.to_string()))?
+            .env("GODEBUG", "netdns=cgo")
+            .args(args)
+            .spawn()
+            .map_err(|e| {
+                RunUploadError::Other(format!("Could not spawn immich-go sidecar: {e}"))
+            })?;
+        (rx, RunningChild::Desktop(child))
+    } else {
+        let (rx, child) =
+            crate::services::headless_process::spawn(args).map_err(RunUploadError::Other)?;
+        (rx, RunningChild::Headless(child))
+    };
     let mut child = Some(child);
 
     // immich-go's --no-ui stdout is a `\r`-refreshed aggregate that never
@@ -751,7 +822,9 @@ pub async fn run_upload(
         &mut child,
         &request.cancel_flag,
         &mut progress,
-        |snapshot, current_path| emit_progress(&app, &request.job_id, snapshot, current_path),
+        |snapshot, current_path| {
+            emit_progress(app.as_ref(), &request.job_id, snapshot, current_path)
+        },
     )
     .await;
 
@@ -766,7 +839,7 @@ pub async fn run_upload(
     // Final authoritative snapshot so the UI lands on the run log's last counts.
     let snapshot = progress.finish();
     emit_progress(
-        &app,
+        app.as_ref(),
         &request.job_id,
         &snapshot.progress,
         snapshot.completed_paths.last().map(String::as_str),
@@ -802,6 +875,8 @@ mod tests {
             include_type: None,
             include_extensions: Vec::new(),
             exclude_extensions: Vec::new(),
+            extended: Default::default(),
+            source_credentials: None,
         }
     }
 
@@ -1289,7 +1364,7 @@ mod tests {
     /// Create a real per-run config directory, settle it against `result`, and
     /// report the directory it used plus everything that was logged.
     fn settle(result: Result<SidecarResult, RunUploadError>) -> (PathBuf, Vec<String>) {
-        let config = write_api_key_config("secret").unwrap();
+        let config = write_api_key_config("secret", None).unwrap();
         let dir = config.dir.clone();
         assert!(
             dir.join("config.yaml").exists(),

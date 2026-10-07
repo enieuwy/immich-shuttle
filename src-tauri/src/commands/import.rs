@@ -1087,23 +1087,29 @@ fn immutable_source_manifest(
 /// fault, offers no delete prompt, and cannot advance the checkpoint, which is
 /// the honest reading of "nothing is known about what was on this source".
 async fn bounded_source_manifest(
-    task: tauri::async_runtime::JoinHandle<Result<HashSet<PathBuf>, String>>,
+    task: tauri::async_runtime::JoinHandle<Result<(HashSet<PathBuf>, Option<u64>), String>>,
     progress: &AtomicU64,
     cancel: &AtomicBool,
     stall: Duration,
-) -> (Option<HashSet<PathBuf>>, Option<String>) {
+) -> (Option<HashSet<PathBuf>>, Option<u64>, Option<String>) {
     match join_bounded(task, stall, cancel, CANCEL_ABANDON_GRACE, Some(progress)).await {
-        Ok(BoundedJoin::Finished(Ok(manifest))) => (Some(manifest), None),
-        Ok(BoundedJoin::Finished(Err(error))) => (None, Some(error)),
+        Ok(BoundedJoin::Finished(Ok((manifest, bytes)))) => (Some(manifest), bytes, None),
+        Ok(BoundedJoin::Finished(Err(error))) => (None, None, Some(error)),
         Ok(BoundedJoin::TimedOut) => (
+            None,
             None,
             Some("The source stopped responding while it was being listed.".to_string()),
         ),
         Ok(BoundedJoin::Abandoned) => (
             None,
+            None,
             Some("Listing the source did not stop when the import was cancelled.".to_string()),
         ),
-        Err(error) => (None, Some(format!("Listing the source failed: {error}"))),
+        Err(error) => (
+            None,
+            None,
+            Some(format!("Listing the source failed: {error}")),
+        ),
     }
 }
 
@@ -1741,9 +1747,11 @@ fn run_history_record(
         finished_at: now_ms(),
         profile_id: update.profile_id.clone(),
         source_paths: record.source_paths,
-        // The album this run actually landed in, resolved from the name
-        // immich-go targeted, rather than whatever id the picker sent.
-        album_ids: update.album_id.clone().into_iter().collect(),
+        album_ids: if record.request.album_ids.len() > 1 {
+            record.request.album_ids.clone()
+        } else {
+            update.album_id.clone().into_iter().collect()
+        },
         status: match &update.status {
             JobStatus::Completed => RecordStatus::Completed,
             JobStatus::Cancelled => RecordStatus::Cancelled,
@@ -1768,7 +1776,7 @@ fn run_history_record(
 /// leaves the same receipt as one that ends during upload: History can replay
 /// it, and the per-source checkpoint decision is taken once, in one place.
 fn persist_run_history(
-    app: &tauri::AppHandle,
+    app: &Option<tauri::AppHandle>,
     update: &ImportJob,
     record: RunRecord,
     verdict: RunVerdict,
@@ -1776,7 +1784,7 @@ fn persist_run_history(
     let checkpoint_eligible =
         verdict.checkpoint_eligible && matches!(update.status, JobStatus::Completed);
     if let Err(err) = crate::services::store::append_history(
-        app,
+        app.as_ref(),
         run_history_record(update, record, verdict.incomplete),
         checkpoint_eligible,
     ) {
@@ -1840,8 +1848,8 @@ fn release_staging_dir(dir: staging::StagingDir, termination_unproven: bool) -> 
 /// raised before it is published: without that shared hold, a staging failure
 /// landing in the gap would publish `Failed`, persist a `Failed` record, and
 /// only then be overwritten as `Cancelled` on the card.
-fn finish_staging_exit(
-    app: &tauri::AppHandle,
+async fn finish_staging_exit(
+    app: &Option<tauri::AppHandle>,
     job_id: &str,
     profile_id: &str,
     error: String,
@@ -1854,7 +1862,7 @@ fn finish_staging_exit(
     if let Ok(mut running) = RUNNING_IMPORTS.lock() {
         running.remove(job_id);
     }
-    let update = finalize_job(
+    let mut update = finalize_job(
         ImportJob {
             id: job_id.to_string(),
             status: JobStatus::Failed,
@@ -1874,6 +1882,7 @@ fn finish_staging_exit(
         },
         Some(cancel),
     );
+    deliver_callback(&mut update, &record.request).await;
     // A run that never reached the sidecar did none of what it was asked to do,
     // so the receipt records the fault. `run_history_record` drops it again for
     // a cancelled run, which is the user's own decision rather than a fault.
@@ -1888,6 +1897,21 @@ fn finish_staging_exit(
     );
     if let Ok(mut finalizing) = FINALIZING_IMPORTS.lock() {
         finalizing.remove(job_id);
+    }
+}
+
+async fn deliver_callback(job: &mut ImportJob, input: &ImportInput) {
+    if input.extended.dry_run {
+        return;
+    }
+    if let Some(url) = input.extended.completion_webhook_url.as_deref() {
+        if let Err(error) = crate::services::import_actions::callback(url, job, input).await {
+            job.summary = Some(format!(
+                "{} {error}",
+                job.summary.take().unwrap_or_default()
+            ));
+            let _ = set_job(job.clone());
+        }
     }
 }
 
@@ -1928,7 +1952,50 @@ struct StartPlan {
 }
 
 fn plan_import_start(input: &ImportInput) -> Result<StartPlan, String> {
-    if input.source_paths.is_empty() {
+    use crate::services::import_source::ImportSource;
+    input.extended.validate()?;
+    if input.album_ids.len() > 1 {
+        return Err("Multiple-album imports are unavailable until duplicate asset membership can be verified.".into());
+    }
+    if matches!(
+        input.extended.source,
+        ImportSource::GooglePhotos | ImportSource::Immich
+    ) && (!input.album_ids.is_empty()
+        || input
+            .into_album
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty()))
+    {
+        return Err("Album targeting for Google Photos and server imports is unavailable until complete asset membership can be verified.".into());
+    }
+    if (!input.extended.share_user_ids.is_empty() || input.extended.public_link)
+        && input.album_ids.is_empty()
+        && input
+            .into_album
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+    {
+        return Err("Choose an album before enabling sharing.".into());
+    }
+    if input.extended.source != ImportSource::Folder
+        && (!input.keep_files || input.select_files.is_some())
+    {
+        return Err(
+            "Archive and server sources keep all originals and do not support a selected subset."
+                .into(),
+        );
+    }
+    if input.extended.source == ImportSource::Immich {
+        let source = input
+            .extended
+            .source_profile_id
+            .as_deref()
+            .ok_or("Select a source profile.")?;
+        if source == input.profile_id {
+            return Err("Source and destination profiles must differ.".into());
+        }
+    }
+    if input.source_paths.is_empty() && input.extended.source != ImportSource::Immich {
         return Err("At least one source path is required".to_string());
     }
 
@@ -1962,21 +2029,16 @@ fn plan_import_start(input: &ImportInput) -> Result<StartPlan, String> {
     let include_type = parse_include_type(input.include_type.as_deref())?;
     let include_extensions = normalize_extensions(&input.include_extensions);
     let exclude_extensions = normalize_extensions(&input.exclude_extensions);
-    // immich-go uploads into a single album per run (`--into-album`), so more
-    // than one id is not a request this command can honour. Only element 0 was
-    // ever read; refuse the rest rather than discard it silently.
-    if input.album_ids.len() > 1 {
-        return Err(format!(
-            "An import targets one album, but {} were selected.",
-            input.album_ids.len()
-        ));
-    }
     // Both the in-flight id and the resolution at finalization read this, so
     // they cannot disagree about whether a link is warranted.
     let album_link_name = album_link_target(input.organization, input.into_album.as_deref());
     // A selected album without a resolved name silently uploads to the wrong
     // place, which is worse than refusing to start the import.
-    if !input.album_ids.is_empty() && album_link_name.is_none() {
+    if !input.album_ids.is_empty()
+        && album_link_name.is_none()
+        && input.extended.source == ImportSource::Folder
+        && input.album_ids.len() == 1
+    {
         return Err("An album was selected but its name could not be resolved.".to_string());
     }
     let provisional_album_id = if album_link_name.is_some() {
@@ -2012,6 +2074,16 @@ fn plan_import_start(input: &ImportInput) -> Result<StartPlan, String> {
 
 #[tauri::command]
 pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<String, String> {
+    start_import(Some(app), input).await
+}
+
+pub async fn start_import(
+    app: Option<tauri::AppHandle>,
+    input: ImportInput,
+) -> Result<String, String> {
+    use crate::services::import_source::ImportSource;
+    let extended = input.extended.clone();
+    let folder_source = extended.source == ImportSource::Folder;
     let StartPlan {
         source_paths,
         select_files,
@@ -2038,6 +2110,21 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
     // missing key, for a request this command was always going to refuse.
     let profile = profile_store::get_profile(&input.profile_id)?;
     let api_key = keychain::require_api_key(&input.profile_id)?;
+    let source_credentials = if extended.source == ImportSource::Immich {
+        let source_id = extended
+            .source_profile_id
+            .as_deref()
+            .ok_or("Select a source profile.")?;
+        let source = profile_store::get_profile(source_id)?;
+        let url = url_resolver::resolve_server_url(&source).await;
+        let target = url_resolver::resolve_server_url(&profile).await;
+        if url == target {
+            return Err("Source and destination resolve to the same server.".into());
+        }
+        Some((url, keychain::require_api_key(source_id)?))
+    } else {
+        None
+    };
 
     let job_id = Uuid::new_v4().to_string();
     let log_path = logs::logs_dir()?.join(format!("run-{job_id}.log"));
@@ -2105,15 +2192,64 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let manifest_cancel = cancel_flag.clone();
         let manifest_progress = Arc::new(AtomicU64::new(0));
         let manifest_progress_for_walk = manifest_progress.clone();
+        // Hold the source claim until the blocking task ends, including after
+        // an abandoned join, so retries cannot pile up on a stalled filesystem.
+        let manifest_claim = if folder_source {
+            match media_scanner::acquire_scan_roots(
+                media_scanner::ScanPurpose::Stage,
+                &source_paths,
+            ) {
+                Ok(claim) => Some(claim),
+                Err(error) => {
+                    finish_staging_exit(
+                        &app_clone,
+                        &job_id_clone,
+                        &profile.id,
+                        format!("Could not inspect source capacity: {error}"),
+                        cancel_flag.as_ref(),
+                        RunRecord {
+                            started_at,
+                            source_paths: record_source_paths,
+                            request: history_request,
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let manifest_task = tauri::async_runtime::spawn_blocking(move || {
-            immutable_source_manifest(
+            let _manifest_roots = manifest_claim;
+            if !folder_source {
+                return Ok((HashSet::new(), None));
+            }
+            let manifest = immutable_source_manifest(
                 manifest_selection.as_deref(),
                 &manifest_sources,
                 manifest_cancel.as_ref(),
                 manifest_progress_for_walk.as_ref(),
-            )
+            )?;
+            // File inspection shares the walk's bounded join. A stuck metadata
+            // call cannot park the async import worker or its shutdown markers.
+            let mut bytes = Some(0u64);
+            for path in &manifest {
+                if manifest_cancel.load(Ordering::Relaxed) {
+                    return Err("Source inspection was cancelled.".into());
+                }
+                bytes = match (bytes, std::fs::metadata(path)) {
+                    (Some(total), Ok(meta)) => total.checked_add(meta.len()),
+                    _ => None,
+                };
+                manifest_progress_for_walk.fetch_add(1, Ordering::Relaxed);
+                if bytes.is_none() {
+                    break;
+                }
+            }
+            Ok((manifest, bytes))
         });
-        let (pre_sidecar_manifest, manifest_error) = bounded_source_manifest(
+        let (pre_sidecar_manifest, source_bytes, manifest_error) = bounded_source_manifest(
             manifest_task,
             manifest_progress.as_ref(),
             cancel_flag.as_ref(),
@@ -2149,7 +2285,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                             source_paths: record_source_paths,
                             request: history_request,
                         },
-                    );
+                    )
+                    .await;
                     return;
                 }
             };
@@ -2214,7 +2351,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                             source_paths: record_source_paths,
                             request: history_request,
                         },
-                    );
+                    )
+                    .await;
                     return;
                 }
             }
@@ -2224,6 +2362,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         let staged_import = staging_dir.is_some();
         let upload_paths: Vec<String> = match &staging_dir {
             Some(dir) => vec![dir.path().to_string_lossy().to_string()],
+            None if extended.source == ImportSource::Immich => vec![String::new()],
             None => source_paths.clone(),
         };
         // The paths immich-go is actually invoked against: the temp staging dir
@@ -2238,6 +2377,26 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // take up to a few seconds, so keep it off the IPC path that returns the
         // job id to the frontend.
         let server_url = url_resolver::resolve_server_url(&profile).await;
+        let client = ImmichClient::new(&server_url, &api_key_for_finalization);
+        let mut capacity_warning = None;
+        if folder_source {
+            match (source_bytes, client.storage_headroom().await) {
+                (Some(bytes), Ok(storage)) => {
+                    if storage.get("available_bytes").and_then(serde_json::Value::as_u64).is_some_and(|free| bytes > free) {
+                        finish_staging_exit(&app_clone, &job_id_clone, &profile.id,
+                            format!("Import requires {bytes} bytes, exceeding server headroom of {} bytes. No upload started.", storage["available_bytes"]),
+                            cancel_flag.as_ref(), RunRecord { started_at, source_paths: record_source_paths, request: history_request }).await;
+                        return;
+                    }
+                    if storage["available_bytes"].is_null() {
+                        capacity_warning = Some("Server capacity is unknown; the server did not report quota or disk headroom.".to_string());
+                    } else if !storage["disk_warning"].is_null() {
+                        capacity_warning = Some("Disk capacity is unavailable; only user quota could be checked.".to_string());
+                    }
+                }
+                _ => capacity_warning = Some("Capacity preflight is unavailable; the source size or server headroom could not be read.".to_string()),
+            }
+        }
         let request = UploadRequest {
             job_id: job_id_clone.clone(),
             server_url,
@@ -2260,6 +2419,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             include_type,
             include_extensions,
             exclude_extensions,
+            extended: extended.clone(),
+            source_credentials,
         };
         let mut tally = RunTally::new();
         let mut request = request;
@@ -2366,8 +2527,28 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 ),
             );
         }
-        let run =
+        let mut run =
             crate::services::stdout_parser::parse_run_progress(&log_contents, &invocation_roots);
+        let reconciliation =
+            if !extended.dry_run && matches!(outcome, RunOutcome::Exited { success: true }) {
+                Some(client.assets_for_device(&request.device_uuid).await)
+            } else {
+                None
+            };
+        let reconciled_assets = reconciliation.as_ref().and_then(|r| r.as_ref().ok());
+        if let Some(assets) = reconciled_assets {
+            run.progress.uploaded = assets.len().min(u32::MAX as usize) as u32;
+            run.progress.total = run.progress.total.max(
+                run.progress
+                    .uploaded
+                    .saturating_add(run.progress.duplicates),
+            );
+            // Archive paths are virtual members, not local paths. Their new-asset
+            // evidence comes from the device-scoped server response instead.
+            if !folder_source {
+                run.unresolved_file_events = 0;
+            }
+        }
         // A non-zero count here means some `file=` records in the run log did
         // not resolve against any invocation root. Resolution is now mandatory
         // for the uploaded/duplicate tallies and the checkpoint gate (see
@@ -2425,6 +2606,11 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
             }
             kept
         };
+        let completed_asset_paths = if folder_source {
+            completed_asset_paths
+        } else {
+            Vec::new()
+        };
         let (completed_asset_paths, unmanifested_paths) =
             retain_paths_in_manifest(completed_asset_paths, pre_sidecar_manifest.as_ref());
 
@@ -2447,7 +2633,7 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // asked to upload paths it never even started. `run_history_record`
         // drops the flag again for a cancelled run.
         let mut incomplete = spawn_error.is_some();
-        let update = if cancelled {
+        let mut update = if cancelled {
             ImportJob {
                 id: job_id_clone.clone(),
                 status: JobStatus::Cancelled,
@@ -2500,8 +2686,10 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 unmanifested_paths,
                 run.unresolved_file_events,
             );
-            let wipe_eligible = classified_wipe_eligible && evidence_complete;
-            checkpoint_eligible = eligible && evidence_complete;
+            let wipe_eligible =
+                classified_wipe_eligible && evidence_complete && folder_source && !extended.dry_run;
+            checkpoint_eligible =
+                eligible && evidence_complete && folder_source && !extended.dry_run;
             let failed = matches!(status, JobStatus::Failed);
             // The last few stderr lines. For a run that landed an asset and
             // then exited non-zero this is the ONLY account of what went wrong:
@@ -2655,6 +2843,55 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
                 album_id: resolved_album_id,
             }
         };
+        if extended.dry_run {
+            update.awaiting_wipe_confirmation = false;
+            update.pending_wipe_count = 0;
+            update.summary = Some(format!(
+                "Dry-run plan only. No upload or deletion requested. {}",
+                update.summary.unwrap_or_default()
+            ));
+        } else if !cancelled && matches!(outcome, RunOutcome::Exited { success: true }) {
+            let post_result = match reconciliation {
+                Some(Ok(assets))
+                    if !incomplete && update.progress.errors == 0 && update.error.is_none() =>
+                {
+                    crate::services::import_actions::apply(
+                        &client,
+                        &history_request,
+                        &assets,
+                        update.album_id.as_deref(),
+                        &request.server_url,
+                    )
+                    .await
+                }
+                Some(Ok(_)) => Ok(Vec::new()),
+                Some(Err(error)) => Err(format!("Server reconciliation unavailable: {error}")),
+                None => Ok(Vec::new()),
+            };
+            match post_result {
+                Ok(links) if !links.is_empty() => {
+                    update.summary = Some(format!(
+                        "{} Share links: {}",
+                        update.summary.unwrap_or_default(),
+                        links.join(" ")
+                    ));
+                }
+                Err(error) => {
+                    incomplete = true;
+                    checkpoint_eligible = false;
+                    update.error = Some(error);
+                    update.awaiting_wipe_confirmation = false;
+                    update.pending_wipe_count = 0;
+                    if let Ok(mut pending) = PENDING_WIPE.lock() {
+                        pending.remove(&job_id_clone);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(warning) = capacity_warning {
+            update.summary = Some(format!("{} {warning}", update.summary.unwrap_or_default()));
+        }
 
         for fe in &file_errors {
             let _ = logs::append_log("app.log", &import_error_log_line(&job_id_clone, fe));
@@ -2679,7 +2916,8 @@ pub async fn import_start(app: tauri::AppHandle, input: ImportInput) -> Result<S
         // No cancel flag here: `cancelled` above was already re-read from it
         // before the wipe payload was built, and the stored-`Cancelled` guard
         // inside `finalize_job` covers a cancel that lands later.
-        let update = finalize_job(update, None);
+        let mut update = finalize_job(update, None);
+        deliver_callback(&mut update, &history_request).await;
         persist_run_history(
             &app_clone,
             &update,
@@ -4115,6 +4353,7 @@ mod tests {
             include_type: None,
             include_extensions: Vec::new(),
             exclude_extensions: Vec::new(),
+            extended: Default::default(),
         };
         JOB_INPUTS.lock().unwrap().insert(job_id.clone(), input);
         let mut running_job = terminal_job(&job_id, false);
@@ -4438,6 +4677,7 @@ mod tests {
             include_type: None,
             include_extensions: Vec::new(),
             exclude_extensions: Vec::new(),
+            extended: Default::default(),
         }
     }
 
@@ -4955,6 +5195,33 @@ mod tests {
             album_link_target(Organization::SingleAlbum, Some("  ")),
             None
         );
+    }
+
+    #[test]
+    fn incomplete_album_assignment_is_refused_before_import_admission() {
+        use crate::services::import_source::ImportSource;
+        let mut input = replayable_input("p1");
+        input.album_ids = vec!["first".into(), "second".into()];
+        input.into_album = Some("First".into());
+        assert!(plan_import_start(&input)
+            .err()
+            .unwrap()
+            .contains("Multiple-album imports are unavailable"));
+        for source in [ImportSource::GooglePhotos, ImportSource::Immich] {
+            input.extended.source = source;
+            input.keep_files = true;
+            input.extended.source_profile_id = Some("p2".into());
+            input.album_ids = vec!["first".into()];
+            assert!(plan_import_start(&input)
+                .err()
+                .unwrap()
+                .contains("Album targeting"));
+            input.album_ids.clear();
+            assert!(plan_import_start(&input)
+                .err()
+                .unwrap()
+                .contains("Album targeting"));
+        }
     }
 
     /// Losing a selected album's name must stop before the plan silently turns
@@ -6343,13 +6610,13 @@ mod tests {
             while !release_for_walk.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Ok(HashSet::new())
+            Ok((HashSet::new(), None))
         });
         let progress = AtomicU64::new(0);
         let cancel = AtomicBool::new(false);
 
         let started = Instant::now();
-        let (manifest, error) = tauri::async_runtime::block_on(bounded_source_manifest(
+        let (manifest, bytes, error) = tauri::async_runtime::block_on(bounded_source_manifest(
             stuck,
             &progress,
             &cancel,
@@ -6359,6 +6626,7 @@ mod tests {
         release.store(true, Ordering::Relaxed);
 
         assert!(manifest.is_none(), "an abandoned walk proves nothing");
+        assert!(bytes.is_none(), "an abandoned walk proves no capacity");
         assert!(
             error.is_some_and(|error| error.contains("stopped responding")),
             "the reason must survive into the run's faults"

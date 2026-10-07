@@ -50,12 +50,14 @@ uuid = { version = "1", features = ["v4"] }
 sysinfo = "0.33"
 walkdir = "2"
 if-addrs = "0.13"
-tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "signal"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp", "gif", "bmp"] }
 kamadak-exif = "0.6"
 base64 = "0.22"
 fs4 = { version = "0.13.1", features = ["sync"] }
 trash = "5"
+semver = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.4", default-features = false, features = ["std"] }

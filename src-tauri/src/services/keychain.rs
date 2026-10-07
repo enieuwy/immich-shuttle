@@ -94,6 +94,9 @@ fn entry(profile_id: &str) -> Result<Entry, String> {
 }
 
 pub fn store_api_key(profile_id: &str, api_key: &str) -> Result<(), String> {
+    if std::env::var_os("IMMICH_SHUTTLE_API_KEYS_FILE").is_some() {
+        return Err("The explicit credentials file is read-only; edit that file instead.".into());
+    }
     let _guard = keychain_guard();
     store_api_key_in(&credential_store(), profile_id, api_key)
 }
@@ -160,6 +163,37 @@ fn undo_write<S: CredentialStore>(
 }
 
 pub fn get_api_key(profile_id: &str) -> Result<Option<String>, String> {
+    if let Some(path) = std::env::var_os("IMMICH_SHUTTLE_API_KEYS_FILE") {
+        use std::io::Read;
+        let file = std::fs::File::open(path).map_err(|_| "Could not open credentials file.")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if file
+                .metadata()
+                .map_err(|_| "Could not inspect credentials file.")?
+                .permissions()
+                .mode()
+                & 0o077
+                != 0
+            {
+                return Err("Credentials file must have owner-only permissions (0600).".into());
+            }
+        }
+        let mut raw = String::new();
+        file.take(65537)
+            .read_to_string(&mut raw)
+            .map_err(|_| "Could not read credentials file.")?;
+        if raw.len() > 65536 {
+            return Err("Credentials file exceeds 64 KiB.".into());
+        }
+        let keys: std::collections::HashMap<String, String> =
+            serde_json::from_str(&raw).map_err(|_| "Invalid credentials JSON.")?;
+        return Ok(keys
+            .get(profile_id)
+            .filter(|key| !key.trim().is_empty())
+            .cloned());
+    }
     let _guard = keychain_guard();
     credential_store()
         .get(profile_id)

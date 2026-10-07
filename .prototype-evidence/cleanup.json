@@ -1,0 +1,26 @@
+{
+  "removed": [
+    {
+      "path": "node_modules",
+      "allocated_kib_before": 180336,
+      "ownership": "Created by this session via npm ci --ignore-scripts or scripts/download-sidecar.sh",
+      "action": "removed"
+    },
+    {
+      "path": "src-tauri/binaries/immich-go-aarch64-apple-darwin",
+      "allocated_kib_before": 10080,
+      "ownership": "Created by this session via npm ci --ignore-scripts or scripts/download-sidecar.sh",
+      "action": "removed"
+    }
+  ],
+  "preserved": [
+    "all source files",
+    "all commits",
+    "all proof logs",
+    ".prototype-evidence/compose.yml"
+  ],
+  "containers_started_by_this_session": 0,
+  "docker_restart_attempted": false,
+  "shared_caches_touched": false,
+  "unresolved_cleanup": "No session-owned container, database, or Rust target directory exists in this worktree. Shared Docker recovery belongs to the supervisor."
+}

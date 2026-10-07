@@ -85,6 +85,20 @@ export interface ImportInput {
   include_extensions?: string[];
   /** immich-go --exclude-extensions. */
   exclude_extensions?: string[];
+  extended?: ImportExtensions;
+}
+
+export interface ImportExtensions {
+  source?: "folder" | "google_photos" | "icloud" | "immich";
+  source_profile_id?: string | null;
+  date_from_name?: boolean | null;
+  time_zone?: string | null;
+  clock_offset_minutes?: number;
+  dry_run?: boolean;
+  completion_webhook_url?: string | null;
+  share_user_ids?: string[];
+  share_role?: "viewer" | "editor" | null;
+  public_link?: boolean;
 }
 
 export interface FileError {

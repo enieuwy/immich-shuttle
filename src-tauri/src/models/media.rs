@@ -9,6 +9,25 @@ pub struct MediaFile {
     pub is_video: bool,
 }
 
+/// Optional EXIF values. Missing values remain absent, never inferred from mtime.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PreviewMetadata {
+    pub camera: Option<String>,
+    pub lens: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub gps_lat: Option<f64>,
+    pub gps_lon: Option<f64>,
+    pub iso: Option<u32>,
+    pub exposure: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewMetadataRow {
+    pub path: String,
+    pub metadata: Option<PreviewMetadata>,
+}
+
 // Retained as a test helper for the non-streaming scanner used in unit tests;
 // production scanning streams ScanProgress batches and returns ScanSummary.
 #[cfg(test)]

@@ -86,6 +86,8 @@ pub struct ImportInput {
     /// immich-go `--exclude-extensions`: skip files with these extensions.
     #[serde(default)]
     pub exclude_extensions: Vec<String>,
+    #[serde(default)]
+    pub extended: crate::services::import_source::ImportExtensions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

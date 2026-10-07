@@ -21,6 +21,30 @@
 - Immich-themed UI with a custom brand mark, light/dark/system themes, and at-a-glance storage capacity meters on removable devices
 - LAN/WAN URL resolution using TCP probe
 
+## Prototype checkpoint: not release-ready
+
+The `prototype/features-20261003` branch preserves unfinished feature work. Rust
+compilation, native UI checks, and real Immich import checks remain blocked.
+Frontend checks alone do not establish that these prototypes work.
+
+Landing review adds these safety limits:
+
+- The backend refuses multiple-album imports before upload. It also refuses
+  album targeting for Google Photos and server imports. Device-UUID lookup
+  cannot yet prove membership for existing duplicate assets.
+- History refuses requests whose migration options it cannot restore. This
+  includes dry runs, capture-date corrections, callbacks, and sharing options.
+  Review such requests in the migration panel instead of replaying them.
+- The migration panel refuses an inverted date range unless an explicit
+  preview selection replaces that range.
+- Video previews report the full length for HEAD requests. Large videos require
+  explicit byte-range GET requests; the buffered handler refuses oversized
+  requests without a range. Native-player compatibility remains unverified.
+- Source-size inspection runs within the existing bounded blocking task.
+  Completion callbacks include aggregate failure evidence and a success flag.
+
+Do not merge or distribute this checkpoint as a completed feature release.
+
 ## Installation
 
 Prebuilt binaries are published on [GitHub Releases](../../releases) for each tagged version:

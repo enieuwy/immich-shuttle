@@ -44,6 +44,9 @@ use sha1::{Digest, Sha1};
 
 /// Max thumbnail edge in pixels (aspect-preserving fit).
 pub const MAX_PX: u32 = 256;
+/// Maximum edge for inspection previews; native renderers never expose originals.
+pub const MAX_PREVIEW_PX: u32 = 2560;
+const MAX_PREVIEW_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ThumbResult {
@@ -407,6 +410,7 @@ fn thumbnail_with_source(
     path_str: &str,
     max: u32,
 ) -> (ThumbResult, ThumbnailOutcome, ThumbnailSource) {
+    let max = max.clamp(1, MAX_PREVIEW_PX);
     let path = Path::new(path_str);
     if !path.is_file() {
         return (
@@ -526,8 +530,27 @@ fn is_supported_format(ext: &str) -> bool {
 }
 
 fn to_result(path_str: &str, file: &Path) -> Result<ThumbResult, String> {
-    let (width, height) = image::image_dimensions(file).map_err(|e| e.to_string())?;
-    let bytes = fs::read(file).map_err(|e| e.to_string())?;
+    let source = fs::File::open(file).map_err(|e| e.to_string())?;
+    let len = source.metadata().map_err(|e| e.to_string())?.len();
+    if len > MAX_PREVIEW_OUTPUT_BYTES {
+        return Err("preview_output_too_large".to_string());
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    source
+        .take(MAX_PREVIEW_OUTPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_PREVIEW_OUTPUT_BYTES {
+        return Err("preview_output_too_large".to_string());
+    }
+    let (width, height) = image::ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_dimensions()
+        .map_err(|e| e.to_string())?;
+    if width == 0 || height == 0 || width > MAX_PREVIEW_PX || height > MAX_PREVIEW_PX {
+        return Err("preview_output_dimensions_exceed_limit".to_string());
+    }
     let mime = if file.extension().map(|e| e == "png").unwrap_or(false) {
         "image/png"
     } else {
@@ -1141,6 +1164,40 @@ mod tests {
         let (w, h) = image::image_dimensions(&out).unwrap();
         assert!(w <= 64 && h <= 64 && w > 0 && h > 0);
         let _ = fs::remove_file(&out);
+    }
+
+    #[test]
+    fn inspection_preview_keeps_framing_and_rejects_oversized_outputs() {
+        let dir = std::env::temp_dir().join(format!("inspection-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("source.png");
+        let out = dir.join("preview.jpg");
+        image::RgbImage::new(900, 600).save(&src).unwrap();
+        assert!(generate_with_image(&src, MAX_PREVIEW_PX, &out));
+        let result = to_result("source", &out).unwrap();
+        assert_eq!((result.width, result.height), (900, 600));
+        let data = result.data_url.unwrap();
+        let decoded = STANDARD.decode(data.split_once(',').unwrap().1).unwrap();
+        let image = image::load_from_memory(&decoded).unwrap();
+        assert_eq!((image.width(), image.height()), (900, 600));
+        let oversized = dir.join("oversized.png");
+        image::RgbImage::new(MAX_PREVIEW_PX + 1, 1)
+            .save(&oversized)
+            .unwrap();
+        assert_eq!(
+            to_result("source", &oversized).unwrap_err(),
+            "preview_output_dimensions_exceed_limit"
+        );
+        let oversized_bytes = dir.join("oversized.jpg");
+        fs::File::create(&oversized_bytes)
+            .unwrap()
+            .set_len(MAX_PREVIEW_OUTPUT_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            to_result("source", &oversized_bytes).unwrap_err(),
+            "preview_output_too_large"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

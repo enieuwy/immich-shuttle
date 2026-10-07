@@ -1986,6 +1986,7 @@ name = "immich-shuttle"
 version = "0.8.1"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "dirs",
  "fs4",
  "if-addrs",
@@ -1995,6 +1996,7 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "reqwest 0.12.28",
+ "semver",
  "serde",
  "serde_json",
  "sha1",
@@ -4998,6 +5000,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

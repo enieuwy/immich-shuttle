@@ -14,6 +14,7 @@
 
 <script lang="ts">
   import type { Action } from "svelte/action";
+  import { untrack } from "svelte";
   import {
     CheckCircle2,
     Circle,
@@ -24,6 +25,9 @@
     Calendar,
     CalendarRange,
   } from "@lucide/svelte";
+  import { Search } from "@lucide/svelte";
+  import PreviewLightbox from "./PreviewLightbox.svelte";
+  import { previewMetadata, type PreviewMetadata } from "$lib/previewApi";
 
   import type { CaptureDate, MediaFile, ThumbResult } from "$lib/types";
   import { selectionState } from "$lib/state/selection";
@@ -49,6 +53,14 @@
   let dates = $state(new Map<string, number | null>());
   let datesFetchedFor = "";
   let datesGeneration = 0;
+  let sessionToken = $state(0);
+  let inspectedPath = $state<string | null>(null);
+  let metadata = $state(new Map<string, PreviewMetadata | null>());
+  let metadataRequested = $state(false);
+  let metadataLoading = $state(false);
+  let metadataError = $state("");
+  let metadataFetchedFor = "";
+  const metadataPending = new Set<string>();
 
 
   $effect(() => {
@@ -63,11 +75,18 @@
     // queued chunks and use the generation below to drop the pending IPC result.
     loader.dispose();
     thumbs = new Map();
+    inspectedPath = null;
+    metadata = new Map();
+    metadataError = "";
+    metadataLoading = false;
+    metadataFetchedFor = "";
+    metadataPending.clear();
     if (files.length === 0) {
       dates = new Map();
       return;
     }
     const token = nextPreviewToken();
+    sessionToken = token;
     const datasetLoader = makeLoader(token);
     loader = datasetLoader;
     let disposed = false;
@@ -115,6 +134,70 @@
   let nameQuery = $state("");
   let minMbInput = $state("");
   let maxMbInput = $state("");
+  let extensions = $state(new Set<string>());
+  let cameraQuery = $state("");
+  let gpsFilter = $state<"all" | "with" | "without">("all");
+  const availableExtensions = $derived(
+    [...new Set(files.map((file) => file.extension.replace(/^\./, "").toLowerCase()))].sort(),
+  );
+  const availableCameras = $derived(
+    [...new Set([...metadata.values()].flatMap((row) => row?.camera ? [row.camera] : []))].sort(),
+  );
+
+  function toggleExtension(extension: string) {
+    const next = new Set(extensions);
+    if (next.has(extension)) next.delete(extension);
+    else next.add(extension);
+    extensions = next;
+  }
+
+  async function loadMetadata(paths: string[], token: number) {
+    const generation = datesGeneration;
+    const pending = paths.filter((path) => !metadata.has(path) && !metadataPending.has(path));
+    if (!pending.length) return;
+    for (const path of pending) metadataPending.add(path);
+    try {
+      const rows = await previewMetadata(pending, token);
+      if (generation !== datesGeneration || token !== sessionToken) return;
+      const next = new Map(metadata);
+      for (const row of rows) next.set(row.path, row.metadata);
+      metadata = next;
+    } catch (reason) {
+      if (generation === datesGeneration) {
+        metadataError = reason instanceof Error ? reason.message : String(reason);
+      }
+    } finally {
+      if (generation === datesGeneration) {
+        for (const path of pending) metadataPending.delete(path);
+      }
+    }
+  }
+
+  async function loadAllMetadata(dataset: MediaFile[], token: number) {
+    const key = `${token}:${dataset.map((file) => file.path).join("\n")}`;
+    if (!token || key === metadataFetchedFor) return;
+    metadataFetchedFor = key;
+    metadataLoading = true;
+    metadataError = "";
+    for (let i = 0; i < dataset.length; i += 32) {
+      if (token !== sessionToken) return;
+      await loadMetadata(dataset.slice(i, i + 32).map((file) => file.path), token);
+      if (metadataError) break;
+    }
+    if (token === sessionToken) metadataLoading = false;
+  }
+
+  $effect(() => {
+    const needed = metadataRequested || cameraQuery.trim() !== "" || gpsFilter !== "all";
+    const dataset = files;
+    const token = sessionToken;
+    if (needed) untrack(() => { void loadAllMetadata(dataset, token); });
+  });
+
+  function inspect(path: string) {
+    inspectedPath = path;
+    void loadMetadata([path], sessionToken);
+  }
 
   function mbToBytes(value: string): number | null {
     const mb = Number.parseFloat(value);
@@ -156,7 +239,10 @@
       nameQuery,
       minBytes,
       maxBytes,
-    }),
+      extensions,
+      cameraQuery,
+      gps: gpsFilter,
+    }, metadata),
   );
 
   const sortedFiles = $derived.by(() => {
@@ -194,6 +280,9 @@
       fromInput !== "" ||
       toInput !== "" ||
       nameQuery.trim() !== "" ||
+      extensions.size > 0 ||
+      cameraQuery.trim() !== "" ||
+      gpsFilter !== "all" ||
       // Numeric bind:value yields undefined when cleared, so key off the parsed
       // bounds, not the raw input, to avoid a stuck "active" state.
       minBytes !== null ||
@@ -406,6 +495,44 @@
             aria-label="Maximum size in MB"
           />
         </div>
+
+        <div class="flex flex-wrap items-center gap-1" aria-label="Extension filters">
+          <span class="text-xs text-muted-foreground">Extensions</span>
+          {#each availableExtensions as extension}
+            <Button variant={extensions.has(extension) ? "secondary" : "ghost"} size="sm"
+              aria-pressed={extensions.has(extension)} onclick={() => toggleExtension(extension)}>
+              {extension.toUpperCase()}
+            </Button>
+          {/each}
+          {#if extensions.size > 0}
+            <Button variant="ghost" size="sm" onclick={() => (extensions = new Set())}>All extensions</Button>
+          {/if}
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2">
+          <Input type="search" placeholder="Camera make or model…" class="h-8 w-[12rem]"
+            list="preview-camera-models" bind:value={cameraQuery} aria-label="Filter by camera" />
+          <datalist id="preview-camera-models">
+            {#each availableCameras as camera}<option value={camera}></option>{/each}
+          </datalist>
+          <label class="flex items-center gap-1 text-xs">
+            GPS
+            <select class="h-8 rounded-md border border-border bg-background px-2" bind:value={gpsFilter} aria-label="Filter by GPS">
+              <option value="all">All locations</option>
+              <option value="with">With GPS</option>
+              <option value="without">Without GPS</option>
+            </select>
+          </label>
+          <Button variant="ghost" size="sm" disabled={metadataLoading} onclick={() => {
+            metadataRequested = true;
+            metadataFetchedFor = "";
+            void loadAllMetadata(files, sessionToken);
+          }}>{metadataError ? "Retry metadata" : "Load metadata"}</Button>
+          {#if metadataLoading}
+            <span class="text-xs text-muted-foreground" role="status">Reading metadata: {metadata.size} of {files.length}</span>
+          {/if}
+          {#if metadataError}<span class="text-xs text-destructive" role="alert">{metadataError}</span>{/if}
+        </div>
       </div>
 
       <!-- Actions + count -->
@@ -459,6 +586,7 @@
           {#each sortedFiles as file (file.path)}
             {@const selected = $selectionState.selected.has(file.path)}
             {@const thumb = thumbs.get(file.path)}
+            <div class="group relative">
             <button
               type="button"
               use:observeTile={file.path}
@@ -466,7 +594,7 @@
               aria-pressed={selected}
               aria-label={`Select ${file.name}`}
               class={cn(
-                "group relative aspect-square overflow-hidden rounded-md border border-border bg-muted/40 text-left transition-shadow [content-visibility:auto] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                "relative block w-full aspect-square overflow-hidden rounded-md border border-border bg-muted/40 text-left transition-shadow [content-visibility:auto] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                 selected && "ring-2 ring-primary",
               )}
             >
@@ -515,9 +643,21 @@
                 {/if}
               </span>
             </button>
+              <button type="button" aria-label={`Inspect ${file.name}`} title={`Inspect ${file.name}`}
+                class="absolute left-1.5 top-1.5 rounded-md bg-black/70 p-1.5 text-white opacity-80 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                onclick={() => inspect(file.path)}>
+                <Search class="size-4" />
+              </button>
+            </div>
           {/each}
         </div>
       {/if}
     </div>
   </div>
+{/if}
+
+{#if inspectedPath}
+  <PreviewLightbox files={sortedFiles} path={inspectedPath} token={sessionToken}
+    metadata={metadata.get(inspectedPath)} metadataLoaded={metadata.has(inspectedPath)}
+    {metadataError} onNavigate={inspect} onClose={() => (inspectedPath = null)} />
 {/if}

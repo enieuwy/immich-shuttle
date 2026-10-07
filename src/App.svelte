@@ -13,6 +13,7 @@
   import LogViewer from "$lib/components/feedback/LogViewer.svelte";
   import ImportOptions from "$lib/components/import/ImportOptions.svelte";
   import ImportPreflight from "$lib/components/import/ImportPreflight.svelte";
+  import MigrationPanel from "$lib/components/import/MigrationPanel.svelte";
   import ImportQueue from "$lib/components/queue/ImportQueue.svelte";
   import HistoryPanel from "$lib/components/queue/HistoryPanel.svelte";
   import OnboardingOverlay from "$lib/components/onboarding/OnboardingOverlay.svelte";
@@ -326,6 +327,7 @@
     <div class="flex flex-col gap-5">
       <SourcePicker />
       <ImportOptions />
+      <MigrationPanel />
     </div>
     <div class="flex flex-col gap-5">
       <AlbumSelector />
@@ -376,7 +378,7 @@
 </AppLayout>
 
 <Dialog bind:open={showManager}>
-  <DialogContent class="max-w-md">
+  <DialogContent class="max-h-[85vh] max-w-xl overflow-y-auto">
     <DialogHeader>
       <DialogTitle>Manage Users</DialogTitle>
       <DialogDescription>Add or edit Immich user profiles.</DialogDescription>

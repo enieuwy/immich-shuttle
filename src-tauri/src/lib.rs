@@ -254,12 +254,16 @@ mod tests {
     }
 }
 
+mod cli;
 mod commands;
 mod models;
 mod services;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Some(code) = cli::try_run() {
+        std::process::exit(code);
+    }
     tauri::Builder::default()
         // MUST stay the first plugin: it decides whether this process is the
         // owner or a duplicate launch before any other setup runs.
@@ -292,6 +296,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            let lease = cli::acquire_instance().map_err(std::io::Error::other)?;
+            app.manage(lease);
             #[cfg(target_os = "macos")]
             install_application_termination_guard(app.handle());
             crate::services::device_detector::start_polling(app.handle().clone());
@@ -303,7 +309,17 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(prune_startup_artifacts);
             Ok(())
         })
+        .register_uri_scheme_protocol("preview-media", |_context, request| {
+            commands::preview::preview_media_response(request)
+        })
         .invoke_handler(tauri::generate_handler![
+            commands::profile_backup::profiles_export,
+            commands::profile_backup::profiles_backup_read,
+            commands::profile_backup::profiles_import,
+            commands::update_check::check_for_updates,
+            commands::update_check::open_project_releases,
+            commands::import_tools::import_storage,
+            commands::import_tools::import_register_library,
             commands::profiles::profiles_list,
             commands::profiles::discover_immich_servers,
             commands::profiles::profile_upsert,
@@ -331,6 +347,10 @@ pub fn run() {
             commands::import::scan_cancel,
             commands::import::forecast_cancel,
             commands::preview::preview_thumbnails,
+            commands::preview::preview_full_image,
+            commands::preview::preview_metadata,
+            commands::preview::preview_video,
+            commands::preview::preview_video_release,
             commands::preview::preview_dates,
             commands::preview::preview_cancel,
             commands::devices::devices_list_removable,
